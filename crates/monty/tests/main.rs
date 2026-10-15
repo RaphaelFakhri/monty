@@ -202,6 +202,51 @@ fn complete_external_reduce(mut progress: RunProgress) -> MontyObject {
     progress.into_complete().expect("expected Complete")
 }
 
+/// Nested caches around a host callable resume and store through ordinary frozen frames.
+#[test]
+fn external_function_in_cache_suspends() {
+    let code = "import functools\ncached = functools.cache(functools.cache(ext_fn))\n[cached(1), cached(1), cached(2)]";
+    let runner = MontyRun::new(
+        code.to_owned(),
+        "test.py",
+        vec!["ext_fn".to_owned()],
+        CompileOptions::default(),
+    )
+    .unwrap();
+    let progress = runner
+        .start(
+            vec![MontyObject::Function {
+                name: "ext_fn".to_owned(),
+                docstring: None,
+            }],
+            ResourceTracker::default(),
+            PrintWriter::Disabled,
+        )
+        .unwrap();
+    let bytes = dump("test.py", None, SessionRef::Running(&progress)).unwrap();
+    let Session::Running(restored) = Dump::load(&bytes).unwrap().state else {
+        panic!("expected running dump")
+    };
+    for mut progress in [progress, *restored] {
+        for arg in [1, 2] {
+            let RunProgress::FunctionCall(call) = progress else {
+                panic!("expected cache miss")
+            };
+            assert_eq!(call.function_name, "ext_fn");
+            assert_eq!(call.args, vec![MontyObject::Int(arg)]);
+            progress = call.resume(MontyObject::Int(arg * 10), PrintWriter::Disabled).unwrap();
+        }
+        assert_eq!(
+            progress.into_complete(),
+            Some(MontyObject::List(vec![
+                MontyObject::Int(10),
+                MontyObject::Int(10),
+                MontyObject::Int(20)
+            ]))
+        );
+    }
+}
+
 /// The frozen implementation is an interpreter detail and must not appear in
 /// tracebacks when a suspended callback fails in the host.
 #[test]

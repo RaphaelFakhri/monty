@@ -25,7 +25,7 @@ use crate::{
     os_dispatch::{PendingEffect, release_pending_effect},
     resource_checks::check_estimated_size,
     types::{
-        Dict, Instance, PyTrait, Type, bytes::call_bytes_method, construct_namedtuple, instance::class_name,
+        Dict, Instance, PyTrait, Type, bytes::call_bytes_method, construct_namedtuple, instance::class_name, lru_cache,
         partial::partial_call_args, str::call_str_method,
     },
     value::{EitherStr, VALUE_SIZE, Value},
@@ -594,6 +594,7 @@ impl VM<'_> {
 
         let (func_id, cells, defaults) = match self.heap.get(heap_id) {
             HeapData::Class(_) => return self.instantiate_class(heap_id, args),
+            HeapData::LruCache(_) => return lru_cache::call(heap_id, args, self),
             // Calling a host class type suspends to the host as a `__call__`
             // method call on the class's uuid; the host's own policy decides
             // whether construction is allowed.
@@ -798,18 +799,7 @@ impl VM<'_> {
             KwargsValues::Dict(kwargs_dict)
         };
 
-        Ok(
-            if copied_args.is_empty() && matches!(kwargs_values, KwargsValues::Empty) {
-                ArgValues::Empty
-            } else if copied_args.is_empty() {
-                ArgValues::Kwargs(kwargs_values)
-            } else {
-                ArgValues::ArgsKargs {
-                    args: copied_args,
-                    kwargs: kwargs_values,
-                }
-            },
-        )
+        Ok(ArgValues::from_parts(copied_args, kwargs_values))
     }
 
     /// Builds `ArgValues` from positional args only.
@@ -880,18 +870,7 @@ impl VM<'_> {
             KwargsValues::Dict(kwargs_dict)
         };
 
-        Ok(
-            if copied_args.is_empty() && matches!(kwargs_values, KwargsValues::Empty) {
-                ArgValues::Empty
-            } else if copied_args.is_empty() {
-                ArgValues::Kwargs(kwargs_values)
-            } else {
-                ArgValues::ArgsKargs {
-                    args: copied_args,
-                    kwargs: kwargs_values,
-                }
-            },
-        )
+        Ok(ArgValues::from_parts(copied_args, kwargs_values))
     }
 
     // ========================================================================
@@ -961,14 +940,12 @@ impl VM<'_> {
         CallResult::Value(Value::Ref(coroutine_id))
     }
 
-    /// Enters a frozen implementation after its native wrapper has prepared locals.
-    ///
-    /// The native wrapper owns argument validation and iterator setup, so this
-    /// path bypasses Python binding and starts with that iterator on the operand stack.
-    pub(crate) fn call_frozen_exact(
+    /// Transfers prepared arguments into a resumable frozen frame without Python binding.
+    /// Captured entry metadata optionally seeds an iterator for native-prepared loops.
+    pub(crate) fn call_frozen_exact<const N: usize>(
         &mut self,
         function: FrozenFunction,
-        args: [Value; 3],
+        args: [Value; N],
     ) -> Result<CallResult, RunError> {
         let call_offset = self.current_offset();
         let stack_base = self.stack.len();
@@ -978,11 +955,15 @@ impl VM<'_> {
         let locals_count = u16::try_from(namespace_size).expect("frozen function namespace exceeds u16");
         assert!(namespace_size >= args.len(), "frozen function has too few local slots");
 
-        let iterator_slot = usize::from(frozen.iterator_slot());
-        let iterator = args[iterator_slot].clone_with_heap(self.heap);
+        assert_eq!(func.signature.exact_positional_count(), Some(N));
+        let iterator = frozen
+            .iterator_slot()
+            .map(|slot| args[usize::from(slot)].clone_with_heap(self.heap));
         self.stack.extend(args);
         self.stack.resize_with(stack_base + namespace_size, || Value::Undefined);
-        self.stack.push(iterator);
+        if let Some(iterator) = iterator {
+            self.stack.push(iterator);
+        }
 
         let exc_stack_base = self.exception_stack.len();
         self.push_frame(CallFrame::new_frozen(

@@ -275,6 +275,10 @@ pub enum Type {
     /// reads `<class 'random.Random'>`.
     #[strum(serialize = "random.Random")]
     Random,
+    /// The wrapper returned by caching decorators. Monty exposes this type
+    /// through `type(f)`, but not as a `functools` module attribute.
+    #[strum(serialize = "functools._lru_cache_wrapper")]
+    LruCacheWrapper,
 }
 
 /// Writes the canonical static name of every non-[`Instance`](Type::Instance)

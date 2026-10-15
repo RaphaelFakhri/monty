@@ -1413,6 +1413,33 @@ pub enum StaticStrings {
     Functools,
     /// `functools.reduce()` function.
     Reduce,
+    /// `functools.cache()` function and private helper parameter.
+    Cache,
+    /// `functools.lru_cache()` function.
+    LruCache,
+    /// Cached callable introspection and management methods.
+    CacheInfo,
+    CacheClear,
+    CacheParameters,
+    /// The named tuple returned by `cache_info()`.
+    #[strum(serialize = "CacheInfo")]
+    CacheInfoName,
+    /// `CacheInfo` fields not shared with other APIs.
+    Hits,
+    Misses,
+    Currsize,
+    /// Whether argument types distinguish cache keys.
+    Typed,
+    /// Callable accepted by caching decorators.
+    UserFunction,
+    /// The uncached callable.
+    #[strum(serialize = "__wrapped__")]
+    DunderWrapped,
+    /// Private namespace passed to frozen implementations; not importable.
+    #[strum(serialize = "<monty-frozen-helpers>")]
+    FrozenHelpers,
+    /// Private cache insertion primitive.
+    Store,
     /// `initial` keyword argument of `functools.reduce()` and
     /// `itertools.accumulate()`.
     Initial,
