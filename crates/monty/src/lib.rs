@@ -18,6 +18,7 @@ mod hash;
 mod heap_data;
 mod identity;
 mod intern;
+mod logical_value;
 mod modules;
 mod name_map;
 mod namespace;

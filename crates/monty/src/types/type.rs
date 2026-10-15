@@ -453,6 +453,15 @@ impl Type {
         )
     }
 
+    /// Whether multiplication can fall back to CPython's sequence-repetition protocol.
+    #[must_use]
+    pub(crate) const fn has_sequence_repeat(self) -> bool {
+        matches!(
+            self,
+            Self::Str | Self::Bytes | Self::List | Self::Tuple | Self::NamedTuple | Self::Deque
+        )
+    }
+
     /// Returns whether this is one of Python's concrete iterator types.
     #[must_use]
     pub(crate) const fn is_iterator(self) -> bool {
