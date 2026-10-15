@@ -4,23 +4,28 @@ use num_bigint::BigInt;
 
 use crate::{
     args::{ArgValues, FromArgs, is_long_int},
-    builtins::{Builtins, object_setattr::builtin_object_setattr},
+    builtins::{Builtins, BuiltinsFunctions, object_setattr::builtin_object_setattr},
     bytecode::{CallResult, VM},
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
     heap::{DropWithContext, Heap, HeapData, HeapId},
     intern::{Interns, StaticStrings, StringId},
-    modules::{collections, itertools, itertools::ItertoolsFunctions},
+    modules::{
+        ModuleFunctions, collections,
+        hashlib::{self, Blake2Kind},
+        itertools,
+        itertools::ItertoolsFunctions,
+    },
     types::{
         Bytes, Deque, Dict, FrozenSet, GenericAlias, List, LongInt, Partial, Path, PyTrait, Random, Range, Set, Slice,
         Str, TimeZone, Tuple,
         bytes::{bytes_fromhex, bytes_repr},
-        date, datetime,
+        complex, date, datetime,
         dict::{DictKind, dict_fromkeys},
         instance::class_name,
         long_int::{INT_MAX_STR_DIGITS, bigint_to_f64_checked},
         path,
-        str::StringRepr,
+        str::{StringRepr, allocate_string},
         time,
         timedelta::{self, DAY_MICROSECONDS, MAX_TIMEDELTA_DAYS, MIN_TIMEDELTA_DAYS},
         timezone::{self, MAX_TIMEZONE_CONSTANT_SECONDS},
@@ -62,6 +67,7 @@ pub enum Type {
     Bool,
     Int,
     Float,
+    Complex,
     Range,
     Slice,
     /// The four `datetime` classes are qualified like `collections.deque`:
@@ -116,8 +122,8 @@ pub enum Type {
     /// `VM::instantiate_class`). It must NEVER be stored long-lived,
     /// serialized into snapshots/const pools, placed in `Builtins::Type` (the
     /// `type()` builtin returns the class object itself for instances), or
-    /// converted to `MontyObject` without resolving the name first (the public
-    /// boundary enum `MontyType` carries the resolved name as a `String`).
+    /// converted to `MontyType`, which has no class variant (a sandbox class
+    /// crosses the boundary as its own `ClassType` arena node).
     #[strum(disabled)]
     Instance(HeapId),
     /// Exception types render/parse via `ExcType`'s own strum name
@@ -166,7 +172,16 @@ pub enum Type {
     /// A regex match result from `re.match()` / `re.search()` etc. - displays as "re.Match"
     #[strum(serialize = "re.Match")]
     ReMatch,
-    // Serialized enum variants are append-only to preserve postcard discriminants.
+    /// An `os.DirEntry` from `os.scandir()`.
+    #[strum(serialize = "posix.DirEntry")]
+    DirEntry,
+    /// The iterator `os.scandir()` returns.
+    #[strum(serialize = "posix.ScandirIterator")]
+    ScandirIterator,
+    /// The iterator `os.walk()` and `Path.walk()` return; CPython's is a generator.
+    #[strum(serialize = "generator")]
+    WalkGenerator,
+    // Variants serialize by name into dumps: renaming one needs `#[serde(alias)]`.
     #[strum(serialize = "tuple_iterator")]
     TupleIterator,
     #[strum(serialize = "str_ascii_iterator")]
@@ -215,6 +230,9 @@ pub enum Type {
     /// private `dataclasses._DataclassParams` reports itself.
     #[strum(serialize = "_DataclassParams")]
     DataclassParams,
+    /// The type of `dataclasses.MISSING`, CPython's private `_MISSING_TYPE`.
+    #[strum(serialize = "dataclasses._MISSING_TYPE")]
+    MissingType,
     #[strum(serialize = "itertools.takewhile")]
     ItertoolsTakeWhile,
     #[strum(serialize = "itertools.dropwhile")]
@@ -279,6 +297,18 @@ pub enum Type {
     /// through `type(f)`, but not as a `functools` module attribute.
     #[strum(serialize = "functools._lru_cache_wrapper")]
     LruCacheWrapper,
+    /// The OpenSSL-backed `hashlib` hash object, `_hashlib.HASH`.
+    #[strum(serialize = "_hashlib.HASH")]
+    HashlibHash,
+    /// The `shake_128` / `shake_256` hash object, `_hashlib.HASHXOF`.
+    #[strum(serialize = "_hashlib.HASHXOF")]
+    HashlibHashXof,
+    /// `hashlib.blake2b`, a type in CPython and so callable here.
+    #[strum(serialize = "_blake2.blake2b")]
+    Blake2b,
+    /// `hashlib.blake2s`, a type in CPython and so callable here.
+    #[strum(serialize = "_blake2.blake2s")]
+    Blake2s,
 }
 
 /// Writes the canonical static name of every non-[`Instance`](Type::Instance)
@@ -360,6 +390,7 @@ impl Type {
             Self::Bool => Some("bool"),
             Self::Int => Some("int"),
             Self::Float => Some("float"),
+            Self::Complex => Some("complex"),
             Self::Str => Some("str"),
             Self::Bytes => Some("bytes"),
             Self::List => Some("list"),
@@ -390,6 +421,7 @@ impl Type {
             "bool" => Some(Self::Bool),
             "int" => Some(Self::Int),
             "float" => Some(Self::Float),
+            "complex" => Some(Self::Complex),
             "str" => Some(Self::Str),
             "bytes" => Some(Self::Bytes),
             "list" => Some(Self::List),
@@ -451,6 +483,8 @@ impl Type {
                 | Self::DictValueIterator
                 | Self::SetIterator
                 | Self::CallableIterator
+                | Self::ScandirIterator
+                | Self::WalkGenerator
                 | Self::ItertoolsCount
                 | Self::ItertoolsRepeat
                 | Self::ItertoolsPairwise
@@ -526,6 +560,7 @@ impl Type {
             Self::Slice => Some(11),
             Self::Iterator => Some(12),
             Self::Path => Some(13),
+            Self::Complex => Some(14),
             _ => None,
         }
     }
@@ -550,6 +585,7 @@ impl Type {
             11 => Some(Self::Slice),
             12 => Some(Self::Iterator),
             13 => Some(Self::Path),
+            14 => Some(Self::Complex),
             _ => None,
         }
     }
@@ -585,7 +621,10 @@ impl Type {
                 Err(ExcType::not_implemented("Counter.fromkeys() is undefined.  Use Counter(iterable) instead.").into())
             }
             (Self::Bytes, Some(StaticStrings::Fromhex)) => bytes_fromhex(args, vm).map(CallResult::Value),
-            (Self::Date, Some(StaticStrings::Today)) => date::class_today(vm.heap, args),
+            (Self::Complex, Some(StaticStrings::FromNumber)) => {
+                complex::class_from_number(vm, args).map(CallResult::Value)
+            }
+            (Self::Date, Some(StaticStrings::Today)) => date::class_today(vm, args),
             (Self::Path, Some(StaticStrings::Cwd)) => path::class_cwd(vm, args).map(CallResult::Value),
             (Self::Date, Some(StaticStrings::Fromisoformat)) => {
                 date::class_fromisoformat(vm.heap, args, vm.interns).map(CallResult::Value)
@@ -599,7 +638,7 @@ impl Type {
             }
             // `object.__setattr__(obj, name, value)` called directly, which is
             // how it is nearly always reached; `object.__setattr__` as a value
-            // is handled by `Value::py_getattr`.
+            // is handled by `class_getattr`.
             (Self::Object, _) if vm.interns.get_str(method_id) == "__setattr__" => {
                 builtin_object_setattr(vm, args).map(CallResult::Value)
             }
@@ -616,21 +655,54 @@ impl Type {
             }
             // The type's plain attributes (`list.__name__`); a missing name
             // raises the lookup's `type object 'list' has no attribute` error.
-            _ => match Value::Builtin(Builtins::Type(self)).py_getattr(&EitherStr::Interned(method_id), vm) {
-                Ok(CallResult::Value(value)) => {
+            _ => {
+                let attr = EitherStr::Interned(method_id);
+                if let Some(value) = self.class_getattr(&attr, vm) {
                     defer_drop!(value, vm);
                     vm.call_function(value, args)
-                }
-                Ok(other) => {
+                } else {
                     args.drop_with(vm.heap);
-                    Ok(other)
+                    Err(self.attribute_error(&attr, vm))
                 }
-                Err(err) => {
-                    args.drop_with(vm.heap);
-                    Err(err)
-                }
-            },
+            }
         }
+    }
+
+    /// Resolves an attribute read on a builtin type object itself — `list.__name__`,
+    /// `date.max`, `chain.from_iterable` — returning `None` when there is no such
+    /// member so the caller raises [`Self::attribute_error`].
+    pub(crate) fn class_getattr(self, attr: &EitherStr, vm: &mut VM<'_>) -> Option<Value> {
+        let is_dunder_name = attr.static_string(vm.interns).map_or_else(
+            || attr.as_str(vm.interns) == "__name__",
+            |ss| ss == StaticStrings::DunderName,
+        );
+        if is_dunder_name {
+            Some(allocate_string(self.dunder_name(vm.heap, vm.interns), vm.heap))
+        } else if let Some(constant) = self.class_constant(attr, vm) {
+            Some(constant)
+        } else if self == Self::ItertoolsChain && attr.static_string(vm.interns) == Some(StaticStrings::FromIterable) {
+            // `chain.from_iterable`, the one attribute an `itertools` type
+            // carries. Handed out as a value so it can be bound and called
+            // later, not only called in place.
+            Some(Value::ModuleFunction(ModuleFunctions::Itertools(
+                ItertoolsFunctions::ChainFromIterable,
+            )))
+        } else if self == Self::Object && attr.as_str(vm.interns) == "__setattr__" {
+            // `object.__setattr__` is the only member `object` carries: it
+            // exists so a class that hooks attribute writes has a way to
+            // perform one (see `limitations/classes.md`).
+            Some(Value::Builtin(Builtins::Function(BuiltinsFunctions::ObjectSetattr)))
+        } else {
+            None
+        }
+    }
+
+    /// The `AttributeError` for a name missing from this type object.
+    ///
+    /// CPython names the class rather than the metaclass here:
+    /// `type object 'list' has no attribute 'nonexistent'`.
+    pub(crate) fn attribute_error(self, attr: &EitherStr, vm: &VM<'_>) -> RunError {
+        ExcType::attribute_error_type(&self.name(vm.heap, vm.interns), attr.as_str(vm.interns))
     }
 
     /// Resolves a class-level constant on a builtin type object (`time.max`,
@@ -663,6 +735,11 @@ impl Type {
                 timedelta::allocate_micros(1, vm.heap)
             }
             (Self::TimeZone, StaticStrings::Utc) => vm.heap.get_timezone_utc(),
+            // The `_blake2` size limits, on the class and so on its instances.
+            (Self::Blake2b, StaticStrings::MaxDigestSize | StaticStrings::MaxKeySize) => Value::Int(64),
+            (Self::Blake2b, StaticStrings::SaltSize | StaticStrings::PersonSize) => Value::Int(16),
+            (Self::Blake2s, StaticStrings::MaxDigestSize | StaticStrings::MaxKeySize) => Value::Int(32),
+            (Self::Blake2s, StaticStrings::SaltSize | StaticStrings::PersonSize) => Value::Int(8),
             (Self::TimeZone, StaticStrings::Min) => timezone::allocate_offset(-MAX_TIMEZONE_CONSTANT_SECONDS, vm.heap),
             (Self::TimeZone, StaticStrings::Max) => timezone::allocate_offset(MAX_TIMEZONE_CONSTANT_SECONDS, vm.heap),
             _ => return None,
@@ -697,6 +774,8 @@ impl Type {
             Self::Path => Path::init(vm, args),
             Self::Partial => Partial::init(vm, args),
             Self::Random => Random::init(vm, args),
+            Self::Blake2b => hashlib::blake2_init(Blake2Kind::Blake2b, vm, args),
+            Self::Blake2s => hashlib::blake2_init(Blake2Kind::Blake2s, vm, args),
 
             // Every `itertools` name but `tee` is a type, as in CPython, so
             // `isinstance(x, itertools.count)` and `type(x) is count` hold.
@@ -722,6 +801,8 @@ impl Type {
             | Self::ItertoolsGrouper
             | Self::ItertoolsTee
             | Self::ItertoolsTeeDataObject => itertools::construct(self, vm, args),
+
+            Self::Complex => complex::init(vm, args),
 
             // Primitive types - inline implementation
             Self::Int => int_init(vm, args),

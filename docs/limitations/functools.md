@@ -40,7 +40,7 @@ These names are absent from the module namespace rather than stubbed, so they ar
 - **`partial` objects carry no dunder attributes.** `p.__call__` and `p.__doc__` both raise `AttributeError`, where
     CPython has a method-wrapper and the type's docstring respectively.
 - **A `partial` crossing the host boundary marshals as its `repr`.** Python and JavaScript hosts receive
-    `MontyObject::Repr("functools.partial(...)")` rather than a callable, since neither side can call back into a value
+    `MontyObject::repr("functools.partial(...)")` rather than a callable, since neither side can call back into a value
     that only exists inside the sandbox.
 
 ## Caching divergences
@@ -63,6 +63,7 @@ These names are absent from the module namespace rather than stubbed, so they ar
     Consequently recursive cached functions can reach the [recursion limit](resource_limits.md) earlier than CPython.
 - Eviction removes an entry by position without running user hashing or equality methods.
     CPython can compare colliding keys during eviction, so comparison side effects can differ.
+    The number of hash and equality calls during lookup and insertion can also differ.
 - An unhashable argument is diagnosed by hashing arguments again after hashing the complete key fails.
     A user `__hash__` can therefore run twice on a failing call.
     For nested unhashable values, the error can name the enclosing tuple instead of its unhashable element.

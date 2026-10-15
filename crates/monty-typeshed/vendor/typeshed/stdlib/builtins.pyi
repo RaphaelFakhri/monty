@@ -3,18 +3,20 @@ import sys
 import types
 from _collections_abc import dict_items, dict_keys, dict_values
 from collections.abc import Awaitable, Callable, Iterable, Iterator, MutableSet, Reversible, Set as AbstractSet, Sized
-from types import GenericAlias, TracebackType
+from types import CellType, CodeType, GenericAlias, TracebackType
 from typing import (
     Any,
     ClassVar,
     Final,
     Generic,
+    Mapping,
     MutableMapping,
     MutableSequence,
     Protocol,
     Sequence,
     SupportsAbs,
     SupportsBytes,
+    SupportsComplex,
     SupportsFloat,
     SupportsIndex,
     TypeVar,
@@ -343,6 +345,45 @@ class float:
     if sys.version_info >= (3, 14):
         @classmethod
         def from_number(cls, number: float | SupportsIndex | SupportsFloat, /) -> Self: ...
+
+@disjoint_base
+class complex:
+    @overload
+    def __new__(
+        cls,
+        real: complex | SupportsComplex | SupportsFloat | SupportsIndex = 0,
+        imag: complex | SupportsFloat | SupportsIndex = 0,
+    ) -> Self: ...
+    @overload
+    def __new__(cls, real: str | SupportsComplex | SupportsFloat | SupportsIndex | complex) -> Self: ...
+    @property
+    def real(self) -> float: ...
+    @property
+    def imag(self) -> float: ...
+    def conjugate(self) -> complex: ...
+    def __add__(self, value: complex, /) -> complex: ...
+    def __sub__(self, value: complex, /) -> complex: ...
+    def __mul__(self, value: complex, /) -> complex: ...
+    def __pow__(self, value: complex, mod: None = None, /) -> complex: ...
+    def __truediv__(self, value: complex, /) -> complex: ...
+    def __radd__(self, value: complex, /) -> complex: ...
+    def __rsub__(self, value: complex, /) -> complex: ...
+    def __rmul__(self, value: complex, /) -> complex: ...
+    def __rpow__(self, value: complex, mod: None = None, /) -> complex: ...
+    def __rtruediv__(self, value: complex, /) -> complex: ...
+    def __eq__(self, value: object, /) -> bool: ...
+    def __ne__(self, value: object, /) -> bool: ...
+    def __neg__(self) -> complex: ...
+    def __pos__(self) -> complex: ...
+    def __abs__(self) -> float: ...
+    def __hash__(self) -> int: ...
+    def __bool__(self) -> bool: ...
+    def __format__(self, format_spec: str, /) -> str: ...
+    if sys.version_info >= (3, 11):
+        def __complex__(self) -> complex: ...
+    if sys.version_info >= (3, 14):
+        @classmethod
+        def from_number(cls, number: complex | SupportsComplex | SupportsFloat | SupportsIndex, /) -> Self: ...
 
 @type_check_only
 class _FormatMapMapping(Protocol):
@@ -1040,6 +1081,47 @@ def divmod(x: SupportsDivMod[_T_contra, _T_co], y: _T_contra, /) -> _T_co: ...
 @overload
 def divmod(x: _T_contra, y: SupportsRDivMod[_T_contra, _T_co], /) -> _T_co: ...
 
+if sys.version_info >= (3, 13):
+    def eval(
+        source: str | ReadableBuffer | CodeType,
+        /,
+        globals: dict[str, Any] | None = None,
+        locals: Mapping[str, object] | None = None,
+    ) -> Any: ...
+else:
+    def eval(
+        source: str | ReadableBuffer | CodeType,
+        globals: dict[str, Any] | None = None,
+        locals: Mapping[str, object] | None = None,
+        /,
+    ) -> Any: ...
+
+if sys.version_info >= (3, 13):
+    def exec(
+        source: str | ReadableBuffer | CodeType,
+        /,
+        globals: dict[str, Any] | None = None,
+        locals: Mapping[str, object] | None = None,
+        *,
+        closure: tuple[CellType, ...] | None = None,
+    ) -> None: ...
+elif sys.version_info >= (3, 11):
+    def exec(
+        source: str | ReadableBuffer | CodeType,
+        globals: dict[str, Any] | None = None,
+        locals: Mapping[str, object] | None = None,
+        /,
+        *,
+        closure: tuple[CellType, ...] | None = None,
+    ) -> None: ...
+else:
+    def exec(
+        source: str | ReadableBuffer | CodeType,
+        globals: dict[str, Any] | None = None,
+        locals: Mapping[str, object] | None = None,
+        /,
+    ) -> None: ...
+
 exit: _sitebuiltins.Quitter
 
 def hash(obj: object, /) -> int: ...
@@ -1072,6 +1154,7 @@ def len(obj: Sized, /) -> int: ...
 
 license: _sitebuiltins._Printer
 
+def locals() -> dict[str, Any]: ...
 @overload
 def max(
     arg1: SupportsRichComparisonT, arg2: SupportsRichComparisonT, /, *_args: SupportsRichComparisonT, key: None = None

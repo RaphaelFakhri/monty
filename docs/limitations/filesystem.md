@@ -15,6 +15,11 @@ path `C:/Users/foo`. Path repr is always `PosixPath(...)`.
 Bytes paths are accepted but decoded as strict UTF-8 (no `surrogateescape`
 / PEP 383 round-tripping). See [open.md](open.md) for the full rationale.
 
+A host entry whose name is not valid UTF-8 (possible on Linux, not on macOS or Windows) is left out of
+`os.listdir`, `os.scandir`, `os.walk`, `Path.iterdir`, `Path.walk` and `Path.glob`.
+CPython lists it with `surrogateescape`, so `'\udcff'` stands for the byte `0xff` and opens the file.
+Monty's strings cannot hold such a name, and a lossy spelling (`'\ufffd'`) would name a different file or nothing.
+
 ## Mount modes
 
 Each mount is configured by the host as one of:
@@ -27,13 +32,44 @@ Each mount is configured by the host as one of:
     pool, the changes are discarded when the feed ends; each feed starts with
     a fresh overlay.
 
+### Overlapping mounts cannot both be registered
+
+A mount whose host directory is the same as, contains, or is contained by
+another mount's, or whose virtual path is already mounted, is refused with a
+`ValueError` naming both mounts — at registration, which via the pool means
+when the feed starts, since that is where the per-feed mount table is
+assembled. The bindings surface it as a `MontyRuntimeError` wrapping that
+`ValueError`, like any other feed-time failure.
+
+The access mode is checked against whichever mount the *virtual* path selects
+(longest prefix), so a host file reachable through two mounts would take the
+weaker mount's mode. In particular, mounting a directory read-write and a
+subdirectory of it read-only would **not** protect the subdirectory — every
+file in it would still be writable under the parent mount's spelling — so
+that configuration is rejected rather than half-honoured. To expose parts of
+a tree with different modes, mount disjoint directories.
+
+Disjoint host directories at nested virtual paths (`/data`, `/data/sub`)
+remain fine: each virtual path routes to exactly one mount. Two mounts on the
+*same* virtual path are refused because only one of them could ever be
+reached.
+A nested mount appears in its parent's listing only if the parent's host
+directory has an entry of that name; otherwise `os.listdir`, `os.scandir`,
+`os.walk`, `Path.walk`, `Path.rglob` and a `Path.glob` pattern that lists the
+parent do not reach it, though its own path still works, as does a pattern
+that names it literally (`glob('sub/*')`).
+
+The same-directory check uses the opened directory's identity on Unix, so a
+directory renamed between two mounts is still recognised; the nesting check is
+lexical over canonical paths, since an open directory cannot name its parent.
+
 ## Only regular files can be read, written, or opened
 
 Reading, writing, appending to, or `open()`ing a path that resolves to an
 existing **non-regular file** (FIFO/named pipe, socket, device node) raises
-`PermissionError`. CPython would block until a peer appears; mount I/O runs on
-the host thread driving the sandbox, so it must never block on
-sandbox-reachable input. Directories raise `IsADirectoryError` as in CPython.
+`PermissionError`. CPython can open these files and may block waiting for a peer.
+Mount I/O must not wait for a peer controlled by sandbox code.
+Directories raise `IsADirectoryError` as in CPython.
 Existence checks (`exists`, `is_file`, `is_dir`, `is_symlink`) and `stat()`
 still work on special files.
 
@@ -44,12 +80,12 @@ inode. The path is still stat-ed first, but only to phrase the error.
 
 ## Mount memory limits
 
-Each mount has a configurable `memory_usage_limit`, defaulting to 100 MB
-(100,000,000 bytes). Retained in-memory overlay entries and transient
+Each mount has a configurable `memory_usage_limit`, defaulting to
+[`DEFAULT_MEMORY_USAGE_LIMIT`](../api/rust/monty-fs.md#default_memory_usage_limit) bytes. Retained in-memory overlay entries and transient
 filesystem results share the budget. Host files are read incrementally up to
 the remaining budget without trusting file-size metadata; an operation that
 would exceed it raises
-`MemoryError: mount memory usage limit of 100 MB exceeded`. CPython has no
+`MemoryError: mount memory usage limit of <limit> exceeded`. CPython has no
 equivalent default limit.
 
 Consequences of the shared budget that have no CPython analogue:
@@ -62,6 +98,26 @@ Consequences of the shared budget that have no CPython analogue:
     the budget is exhausted.
 - The `monty` CLI's `-m` mounts always use the default limit; there is no CLI
     flag to change it.
+- Raising the budget above 256 MiB can hit the [message size cap](host-values.md#message-size):
+    a mounted read whose result is too large raises `RuntimeError` inside the sandbox.
+
+## Directory scans
+
+`os.scandir`, `os.walk`, `Path.walk`, `Path.glob` and `Path.rglob` read their subtree in one host call (see
+[pathlib.md](pathlib.md#glob-rglob-and-walk)).
+
+- Every entry a scan reads counts against the mount's memory limit, including entries excluded from a glob's matches,
+    so walking or globbing a tree with millions of entries raises `MemoryError` where CPython would stream it.
+- A glob also charges each directory it reaches at each wildcard part, so a pattern that returns to the same
+    directories many times (`'*/../' * 30 + '*'`) can raise `MemoryError` on a tree its single-part form reads.
+- A scan may examine at most 10,000,000 entries, counting each time a glob pattern revisits a directory, then raises
+    `RuntimeError: directory scan examined more than 10000000 entries`. CPython has no such cap; it bounds patterns
+    like `*/**/*/**/*` whose cost multiplies with every recursive part, and walks through symlink cycles.
+- Paths deeper than [64 components](#at-most-64-path-components) are not listed, so a walk stops there.
+- `OverlayMemory` never follows symlinks, so a scan there reports them as neither files nor directories.
+- A symlink whose target is missing or outside the mount is left out, as `iterdir()` leaves it out and the
+    predicates answer `False` for it, so `glob('*')` and a walk never list a dangling link, where CPython lists it
+    with `is_symlink()` alone.
 
 ## Write limits
 
@@ -213,7 +269,8 @@ the attempt fails with `ERROR_SHARING_VIOLATION`. Unix is unaffected. The
 window is the mount's lifetime, which for `pydantic_monty` and
 `@pydantic/monty` is the lifetime of the mount object, not one feed. Close it
 ([`MountDir.close()`][pydantic_monty.MountDir.close], or the `with` / `using` block) to release the directory
-before the host touches it (see [pool-architecture.md](pool-architecture.md)).
+before the host touches it.
+An in-flight feed retains its own reference until it ends.
 
 ### A mount follows its directory, not its path
 
@@ -285,6 +342,6 @@ escapes. That matches CPython, and reveals nothing about the target.
 
 `open()` and pathlib I/O do not keep an OS handle alive between calls; each
 `read`/`write` is a separate one-shot host operation. This is what makes
-subprocess dump/load safe (see [pool-architecture.md](pool-architecture.md)), and it means
+[snapshots](../snapshots.md) possible, and it means
 external processes can observe partial state between writes. See the design
 note in [open.md](open.md).

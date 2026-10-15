@@ -1,7 +1,7 @@
 # monty-fs
 
 Host-side filesystem mounts for [Monty](https://github.com/pydantic/monty), the
-sandboxed Python interpreter.
+Python sandbox.
 
 Provides `MountTable`, which maps virtual POSIX paths inside the sandbox
 (e.g. `/mnt/data`) to real host directories with configurable access modes
@@ -21,7 +21,7 @@ cannot reach outside it. `path_security.rs` is left with path policy alone —
 null-byte rejection and length limits, with lexical normalization delegated to
 `monty_types::normalize_virtual_path`.
 
-Each mount has a configurable aggregate memory budget that defaults to 100 MB.
+Each mount has a configurable aggregate memory budget that defaults to `DEFAULT_MEMORY_USAGE_LIMIT`.
 Retained in-memory overlay data and transient filesystem results share that
 budget; oversized operations return `MemoryError` before an unbounded read.
 

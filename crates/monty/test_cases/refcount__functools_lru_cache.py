@@ -42,10 +42,9 @@ dropped = functools.cache(wrapped)
 dropped((4, 5), 6)
 dropped = None
 
-# A re-entrant `__eq__` can insert the very key an in-flight store is about to
-# write, so the insertion collides and `Dict::set` hands back the old value —
-# whose reference the cache no longer holds. `shared` ends at 3: its binding and
-# the two entries the two-entry cache keeps.
+# A re-entrant `__eq__` can insert the key an in-flight store is about to write.
+# The outer store must release its unused result without leaking a reference.
+# `shared` ends at 3: its binding and the two entries the cache keeps.
 shared = ('s',)
 calls = []
 reentered = []
@@ -69,11 +68,9 @@ class Reentrant:
         return 3
 
     def __eq__(self, other):
-        # Making room happens between the store's own lookup and its insertion,
-        # so a comparison while the wrapped call for `Reentrant(2)` is in flight
-        # and the cache is one entry short belongs to that insertion's probe.
-        # Inserting the key it is about to write makes the insertion collide.
-        if calls and calls[-1] == 2 and colliding.cache_info().currsize == 1 and not reentered:
+        # The wrapped call has returned, so this comparison belongs to its store.
+        # Insert the same key before the outer probe finishes.
+        if calls and calls[-1] == 2 and not reentered:
             reentered.append(True)
             colliding(Reentrant(2))
         return self.v == other.v

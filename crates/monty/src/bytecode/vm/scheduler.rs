@@ -10,11 +10,12 @@ use std::{collections::VecDeque, mem};
 use ahash::AHashMap;
 use smallvec::{SmallVec, smallvec};
 
-use super::FrameFunction;
+use super::{FrameFunction, FrameNamespace};
 use crate::{
     asyncio::{Awaiter, CallId, TaskId},
     exception_private::RunResult,
     heap::{ContainsHeap, DropWithContext, Heap, HeapId, HeapReadOutput, HeapReader},
+    intern::StringId,
     value::Value,
 };
 
@@ -63,6 +64,9 @@ impl<C: ContainsHeap> DropWithContext<C> for Task {
     fn drop_with(mut self, heap: &mut C) {
         self.stack.drain(..).drop_with(heap);
         self.exception_stack.drain(..).drop_with(heap);
+        for frame in self.frames.drain(..) {
+            frame.namespace.drop_with(heap);
+        }
         self.state.drop_with(heap);
         if let Some(coro_id) = self.coroutine_id.take() {
             heap.heap_mut().dec_ref(coro_id);
@@ -77,7 +81,7 @@ impl<C: ContainsHeap> DropWithContext<C> for Task {
 ///
 /// Similar to `SerializedFrame` but used within the scheduler for task context.
 /// Cannot store `&Code` references, so it keeps a serializable frame identity.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SerializedTaskFrame {
     /// Which function's code this frame executes (`None` = module-level).
     pub function: Option<FrameFunction>,
@@ -94,8 +98,12 @@ pub(crate) struct SerializedTaskFrame {
     /// `CallFrame.call_offset`.
     pub call_offset: Option<u32>,
     /// Whether this frame is a class `__init__` (see `CallFrame.is_initializer`).
-    #[serde(default)]
     pub is_initializer: bool,
+    /// Frame namespace, owning its dict references (see `CallFrame.namespace`).
+    pub namespace: Option<Box<FrameNamespace>>,
+    /// The `from ... import` in progress, if the frame parked inside one.
+    #[serde(default)]
+    pub import_from_module: Option<StringId>,
 }
 
 impl Task {
@@ -170,6 +178,12 @@ impl Scheduler {
     /// Whether awaiting the current call can proceed without delaying other work.
     pub fn can_await_eagerly(&self) -> bool {
         self.ready_queue.is_empty() && self.pending_externals.is_empty()
+    }
+
+    /// Returns the main task, whose context is saved here whenever another
+    /// task is loaded; `None` once it has been cancelled.
+    pub fn main_task(&self) -> Option<&Task> {
+        self.tasks.get(&TaskId::default())
     }
 
     /// Returns a mutable reference to a task by ID.
@@ -387,14 +401,6 @@ impl Scheduler {
         self.tasks
             .get(&task_id)
             .is_some_and(|task| matches!(task.state, TaskState::Blocked(_)))
-    }
-
-    /// Returns true if a task with `task_id` currently exists in the
-    /// scheduler. Cancelled tasks are removed from the map, so this returning
-    /// `false` means the task is gone.
-    #[inline]
-    pub fn has_task(&self, task_id: TaskId) -> bool {
-        self.tasks.contains_key(&task_id)
     }
 
     /// Number of tasks the scheduler still holds.

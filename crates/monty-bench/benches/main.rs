@@ -1,19 +1,21 @@
 // Use codspeed-criterion-compat when running on CodSpeed (CI), real criterion otherwise (for flamegraphs)
 #[cfg(not(codspeed))]
 use std::ffi::CString;
-use std::time::Duration;
+use std::{fs, path::Path, time::Duration};
 
 #[cfg(codspeed)]
 use codspeed_criterion_compat::{Bencher, Criterion, black_box, criterion_group, criterion_main};
 #[cfg(not(codspeed))]
 use criterion::{Bencher, Criterion, black_box, criterion_group, criterion_main};
-use monty::{Dump, MontyRepl, MontyRun, SessionRef};
-use monty_types::{CompileOptions, MontyObject, PrintWriter, ResourceLimits, ResourceTracker};
+use monty::{Dump, MontyRepl, MontyRun, RunProgress, SessionRef};
+use monty_fs::{MountCallOutcome, MountMode, MountTable, OverlayState};
+use monty_types::{CompileOptions, ExtFunctionResult, MontyObject, PrintWriter, ResourceLimits, ResourceTracker};
 #[cfg(all(not(codspeed), unix))]
 use pprof::criterion::{Output, PProfProfiler};
 // CPython benchmarks are only run locally, not on CodSpeed CI (requires Python + pyo3 setup)
 #[cfg(not(codspeed))]
 use pyo3::prelude::*;
+use tempfile::TempDir;
 
 // The real worker allocator, so the interpreter benchmarks can price it:
 // `cargo bench -p monty-bench --bench main --features worker-alloc` against a
@@ -26,7 +28,7 @@ static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
 /// Runs a benchmark using the Monty interpreter.
 /// Parses once, then benchmarks repeated execution.
 fn run_monty(bench: &mut Bencher, code: &str, expected: i64) {
-    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+    let mut ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
     let r = ex.run_no_limits(vec![]).unwrap();
     let int_value: i64 = r.as_ref().try_into().unwrap();
     assert_eq!(int_value, expected);
@@ -41,14 +43,14 @@ fn run_monty(bench: &mut Bencher, code: &str, expected: i64) {
 /// Runs a benchmark using the Monty interpreter with a single string input bound to `DATA`.
 /// Parses once, then benchmarks repeated execution with the same input.
 fn run_monty_with_data(bench: &mut Bencher, code: &str, data: &str, expected: i64) {
-    let ex = MontyRun::new(
+    let mut ex = MontyRun::new(
         code.to_owned(),
         "test.py",
         vec!["DATA".to_owned()],
         CompileOptions::default(),
     )
     .unwrap();
-    let make_input = || vec![MontyObject::String(data.to_owned())];
+    let make_input = || vec![MontyObject::string(data.to_owned())];
     let r = ex.run_no_limits(make_input()).unwrap();
     let int_value: i64 = r.as_ref().try_into().unwrap();
     assert_eq!(int_value, expected);
@@ -60,15 +62,75 @@ fn run_monty_with_data(bench: &mut Bencher, code: &str, data: &str, expected: i6
     });
 }
 
+/// Runs a benchmark with `host_root` mounted at `/data` in `mode`, bound to
+/// `DATA`, answering every OS call from the mount as a host would.
+///
+/// Each iteration starts a clone of the parsed program, since `start` consumes it.
+fn run_monty_mounted(bench: &mut Bencher, code: &str, host_root: &Path, mode: MountMode, expected: i64) {
+    let ex = MontyRun::new(
+        code.to_owned(),
+        "test.py",
+        vec!["DATA".to_owned()],
+        CompileOptions::default(),
+    )
+    .unwrap();
+    let mut mounts = MountTable::new();
+    mounts.mount("/data", host_root, mode, None).unwrap();
+    let mut run = || {
+        let inputs = vec![MontyObject::string("/data".to_owned())];
+        let mut progress = ex
+            .clone()
+            .start(inputs, ResourceTracker::default(), PrintWriter::Stdout)
+            .unwrap();
+        loop {
+            progress = match progress {
+                RunProgress::Complete(value) => break i64::try_from(value.as_ref()).unwrap(),
+                RunProgress::OsCall(call) => call
+                    .resume_with(PrintWriter::Stdout, |call| match mounts.handle_os_call(call) {
+                        MountCallOutcome::Handled(Ok(value)) => value.into(),
+                        MountCallOutcome::Handled(Err(err)) => err.into_exception().into(),
+                        MountCallOutcome::NotHandled(call) => ExtFunctionResult::from(call.on_no_handler()),
+                    })
+                    .unwrap(),
+                _ => panic!("the scan benchmarks only suspend for OS calls"),
+            };
+        }
+    };
+    assert_eq!(run(), expected);
+    bench.iter(|| black_box(run()));
+}
+
+/// Builds the tree the directory-scan benchmarks read: 20 packages, each with
+/// `src/lib.rs` and 10 module directories of 5 `.rs` and 15 `.txt` files.
+///
+/// 4,020 files and 240 directories, of which 1,020 files match `**/*.rs`.
+fn scan_tree() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    for package in 0..20 {
+        let src = dir.path().join(format!("pkg{package}/src"));
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("lib.rs"), "").unwrap();
+        for module in 0..10 {
+            let module_dir = src.join(format!("mod{module}"));
+            fs::create_dir(&module_dir).unwrap();
+            for file in 0..20 {
+                let extension = if file < 5 { "rs" } else { "txt" };
+                fs::write(module_dir.join(format!("file{file}.{extension}")), "").unwrap();
+            }
+        }
+    }
+    dir
+}
+
 /// Runs a benchmark with production-shaped resource limits armed (generous
 /// budgets that never trip), measuring the amortized limit-checking path
 /// sandboxes actually run rather than the no-limits fast path.
 fn run_monty_limits(bench: &mut Bencher, code: &str, expected: i64) {
-    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+    let mut ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
     let limits = ResourceLimits::default()
-        .max_duration(Duration::from_mins(10))
+        .max_feed_duration(Duration::from_mins(10))
         .max_memory(1 << 40);
-    let run = |limits: &ResourceLimits| {
+    let mut run = |limits: &ResourceLimits| {
         let r = ex
             .run(vec![], ResourceTracker::new(limits.clone()), PrintWriter::Stdout)
             .unwrap();
@@ -481,11 +543,32 @@ for _ in range(1_000):
 r
 ";
 
+/// A recursive glob: every directory is listed.
+const GLOB_RECURSIVE: &str = "
+from pathlib import Path
+len(list(Path(DATA).glob('**/*.rs')))
+";
+
+/// A glob whose wildcards prune: only `src` directories below the top are listed.
+const GLOB_WILDCARD: &str = "
+from pathlib import Path
+len(list(Path(DATA).glob('*/src/*.rs')))
+";
+
+/// A top-down walk counting files.
+const WALK_FILES: &str = "
+import os
+count = 0
+for _, _, files in os.walk(DATA):
+    count += len(files)
+count
+";
+
 /// Benchmarks end-to-end execution (parsing + running) using Monty.
 /// This is different from other benchmarks as it includes parsing in the loop.
 fn end_to_end_monty(bench: &mut Bencher) {
     bench.iter(|| {
-        let ex = MontyRun::new(
+        let mut ex = MontyRun::new(
             black_box("1 + 2").to_owned(),
             "test.py",
             vec![],
@@ -508,6 +591,13 @@ fn parse_1k_assigns(bench: &mut Bencher) {
         let ex = MontyRun::new(black_box(code.clone()), "test.py", vec![], CompileOptions::default()).unwrap();
         black_box(ex);
     });
+}
+
+/// Clones a large module without function definitions, isolating module-code sharing
+/// from the independently cloned intern and name tables.
+fn clone_module(bench: &mut Bencher) {
+    let runner = MontyRun::new("x = 1\n".repeat(10_000), "test.py", vec![], CompileOptions::default()).unwrap();
+    bench.iter(|| black_box(runner.clone()));
 }
 
 /// Feeds a trivial snippet into a REPL session that has already run 2,000
@@ -554,7 +644,7 @@ fn session_with_state() -> MontyRepl {
 fn session_dump(bench: &mut Bencher) {
     let repl = session_with_state();
     bench.iter(|| {
-        let bytes = monty::dump("bench.py", None, SessionRef::Idle(black_box(&repl))).unwrap();
+        let bytes = monty::dump("bench.py", None, &[], SessionRef::Idle(black_box(&repl))).unwrap();
         black_box(bytes);
     });
 }
@@ -564,7 +654,7 @@ fn session_dump(bench: &mut Bencher) {
 /// side of the dump wire format — the cost hosts pay to resume a session.
 fn session_load(bench: &mut Bencher) {
     let repl = session_with_state();
-    let bytes = monty::dump("bench.py", None, SessionRef::Idle(&repl)).unwrap();
+    let bytes = monty::dump("bench.py", None, &[], SessionRef::Idle(&repl)).unwrap();
     bench.iter(|| {
         let dump = Dump::load(black_box(&bytes)).unwrap();
         black_box(dump);
@@ -607,6 +697,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 
     c.bench_function("end_to_end__monty", end_to_end_monty);
     c.bench_function("parse_1k_assigns__monty", parse_1k_assigns);
+    c.bench_function("clone_module__monty", clone_module);
     c.bench_function("repl_feed_after_2k_snippets__monty", repl_feed_after_2k_snippets);
     c.bench_function("session_dump__monty", session_dump);
     c.bench_function("session_load__monty", session_load);
@@ -713,6 +804,39 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("gc_collect__monty", |b| run_monty(b, GC_COLLECT, 0));
     #[cfg(not(codspeed))]
     c.bench_function("gc_collect__cpython", |b| run_cpython(b, GC_COLLECT, 0));
+
+    let tree = scan_tree();
+    #[cfg(not(codspeed))]
+    let host_root = tree.path().to_str().expect("temporary directories have UTF-8 paths");
+    c.bench_function("glob_recursive__monty", |b| {
+        run_monty_mounted(b, GLOB_RECURSIVE, tree.path(), MountMode::ReadOnly, 1_020);
+    });
+    c.bench_function("glob_recursive_overlay__monty", |b| {
+        let mode = MountMode::OverlayMemory(OverlayState::new());
+        run_monty_mounted(b, GLOB_RECURSIVE, tree.path(), mode, 1_020);
+    });
+    #[cfg(not(codspeed))]
+    c.bench_function("glob_recursive__cpython", |b| {
+        run_cpython_with_data(b, GLOB_RECURSIVE, host_root, 1_020);
+    });
+    c.bench_function("glob_wildcard__monty", |b| {
+        run_monty_mounted(b, GLOB_WILDCARD, tree.path(), MountMode::ReadOnly, 20);
+    });
+    c.bench_function("glob_wildcard_overlay__monty", |b| {
+        let mode = MountMode::OverlayMemory(OverlayState::new());
+        run_monty_mounted(b, GLOB_WILDCARD, tree.path(), mode, 20);
+    });
+    #[cfg(not(codspeed))]
+    c.bench_function("glob_wildcard__cpython", |b| {
+        run_cpython_with_data(b, GLOB_WILDCARD, host_root, 20);
+    });
+    c.bench_function("walk_files__monty", |b| {
+        run_monty_mounted(b, WALK_FILES, tree.path(), MountMode::ReadOnly, 4_020);
+    });
+    #[cfg(not(codspeed))]
+    c.bench_function("walk_files__cpython", |b| {
+        run_cpython_with_data(b, WALK_FILES, host_root, 4_020);
+    });
 }
 
 // Use pprof flamegraph profiler when running locally on Unix (not on CodSpeed or Windows)

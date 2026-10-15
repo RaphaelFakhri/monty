@@ -60,6 +60,9 @@ check-wasm-types: build-wasm ## Verify checked-in component declarations match t
 	git diff --exit-code -- crates/monty-js/ts/worker/component
 	@untracked=$$(git ls-files --others --exclude-standard -- crates/monty-js/ts/worker/component); \
 		test -z "$$untracked" || { echo "Untracked generated component declarations:"; echo "$$untracked"; exit 1; }
+	@# the published `dist` has to type-check for a strict consumer, and the
+	@# build cannot see that because it compiles from `ts`
+	cd crates/monty-js && npm run check:dist-types
 
 .PHONY: test-wasm
 test-wasm: install-js ## Test the wasm worker component from node, with no browser
@@ -145,7 +148,7 @@ lint: lint-rs lint-py lint-md ## Lint the code with ruff, clippy and mdformat
 
 .PHONY: test-no-features
 test-no-features: ## Run rust tests without any features enabled
-	cargo test -p monty -p monty-fs
+	cargo test -p monty -p monty-fs -p monty-types
 	cargo run -p monty-datatest
 
 .PHONY: test-memory-model-checks
@@ -178,6 +181,14 @@ test-type-checking: ## Run rust tests on monty-type-checking
 test-subprocess: ## Run subprocess protocol, child-mode, and worker-pool tests
 	cargo build -p monty-runtime
 	cargo test -p monty-proto -p monty-runtime -p monty-pool --features monty-pool/telemetry
+
+.PHONY: test-restore-policy
+test-restore-policy: ## Verify snapshot limits with tracker, protocol, and real-process regressions
+	cargo build -p monty-runtime
+	cargo test -p monty-types --test resource_limits
+	cargo test -p monty-proto --features worker --test dispatch restore_caps_idle_and_suspended_resource_limits
+	cargo test -p monty-pool --features telemetry --test pool_test restored_session_cannot_raise_the_destination_memory_budget
+	cargo test -p monty-pool --features telemetry --test pool_test a_load_reply_cannot_loosen_the_feed_backstop
 
 .PHONY: pytest
 pytest: ## Run Python tests with pytest
@@ -249,6 +260,10 @@ update-typeshed: ## Update vendored typeshed from upstream
 .PHONY: check-typeshed
 check-typeshed: ## Check vendored typeshed stubs are in sync with upstream
 	uv run crates/monty-typeshed/check.py
+
+.PHONY: check-publish
+check-publish: ## Package and verify-build every publishable crate as `cargo publish` would, without uploading
+	cargo publish --workspace --dry-run
 
 .PHONY: bench
 bench: ## Run benchmarks

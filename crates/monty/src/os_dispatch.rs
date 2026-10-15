@@ -21,9 +21,11 @@
 
 use std::{borrow::Cow, mem};
 
+use ahash::AHashSet;
 use monty_types::{
     ExcType, MkdirCallArgs, MontyObject, MontyPath, OsFunctionCall, PathBytesDataArgs, PathStringDataArgs,
     RenameCallArgs, ResourceTracker, normalize_virtual_path,
+    unstable::{self, MontyNode},
 };
 
 use crate::{
@@ -32,8 +34,16 @@ use crate::{
     exception_private::{ExcTypeExt, RunError, RunResult, SimpleException},
     heap::{ContainsHeap, DropWithContext, Heap, HeapData, HeapId},
     intern::{Interns, StaticStrings},
-    modules::random::RandomRetry,
-    types::{Path, file::FileName, random::RandomTarget},
+    modules::{
+        os::PathArgError,
+        os_path::{
+            StatField, expand_user_reply, expand_vars_reply, lexists_reply, realpath_strict_reply, resolved_path_reply,
+            samefile_first_reply, samefile_second_reply, stat_field_reply,
+        },
+        random::RandomRetry,
+        time::ClockReading,
+    },
+    types::{Path, dir_scan::ScanEffect, file::FileName, random::RandomTarget},
     value::Value,
     virtual_path::posix_join,
 };
@@ -63,6 +73,9 @@ pub(crate) enum PendingEffect {
     Pre(PreConversionEffect),
     /// Applies the converted value to VM state, possibly pinning a file.
     Post(PostConversionEffect),
+    /// Builds a walk, scandir or glob result from a `Path.scan` reply — or
+    /// from the `OSError` it answered with (see [`ScanEffect::absorbs`]).
+    Scan(ScanEffect),
 }
 
 impl PendingEffect {
@@ -72,10 +85,25 @@ impl PendingEffect {
     pub(crate) fn immediate_result_name(&self) -> Option<&'static str> {
         match self {
             Self::Pre(effect) => Some(effect.operation_name()),
+            Self::Scan(effect) => Some(effect.operation_name()),
             Self::Post(PostConversionEffect::OpenName { .. }) => Some("open"),
             Self::Post(PostConversionEffect::SeedRandom { .. }) => Some("os.urandom"),
+            // `time.sleep` blocks by definition, so a future would leave the
+            // sandbox running before the wait it asked for finished.
+            Self::Post(PostConversionEffect::DiscardResult) => Some("time.sleep"),
+            // The reading still has to become a `struct_time` or a string, which
+            // a future defers past the point the sandbox needs it.
+            Self::Post(PostConversionEffect::ClockReading { .. }) => Some("time.time"),
+            // The load answers a `ForIter` or `next()` that is waiting for the
+            // buffer; a future would land on the stack where the file is expected.
+            Self::Post(PostConversionEffect::BufferLoad { .. } | PostConversionEffect::FileNext { .. }) => {
+                Some("file iteration")
+            }
             // A future strands these instead: the awaited value is the raw host reply.
             Self::Post(PostConversionEffect::BufferStore { .. } | PostConversionEffect::WritePosition { .. }) => None,
+            // `asyncio.sleep` wants the future: `resume_with_result` moves the
+            // result onto the pending awaitable instead.
+            Self::Post(PostConversionEffect::SleepResult { .. }) => None,
         }
     }
 
@@ -85,6 +113,7 @@ impl PendingEffect {
         match self {
             Self::Pre(_) => {}
             Self::Post(effect) => effect.release(heap),
+            Self::Scan(effect) => effect.release(heap),
         }
     }
 }
@@ -98,6 +127,12 @@ impl From<PreConversionEffect> for PendingEffect {
 impl From<PostConversionEffect> for PendingEffect {
     fn from(effect: PostConversionEffect) -> Self {
         Self::Post(effect)
+    }
+}
+
+impl From<ScanEffect> for PendingEffect {
+    fn from(effect: ScanEffect) -> Self {
+        Self::Scan(effect)
     }
 }
 
@@ -122,22 +157,78 @@ pub(crate) enum PreConversionEffect {
     /// `os.urandom(size)`: the reply must be `bytes` of exactly `size`, so a
     /// handler cannot hand the sandbox more than it asked (and preflighted) for.
     UrandomLength { size: usize },
+    /// `os.path.getsize` and friends: keep one field of a `Path.stat` reply.
+    StatField(StatField),
+    /// `os.path.realpath`: the `Path.resolve` reply arrives as a path; the
+    /// function returns `str`. Under `strict` the reply is then checked with
+    /// `Path.exists` ([`RealpathStrict`](Self::RealpathStrict)).
+    ResolvedPath { strict: bool },
+    /// `os.path.realpath(strict=True)`: a `False` from `Path.exists` on the
+    /// resolved path is `FileNotFoundError`; `True` yields the path.
+    RealpathStrict { resolved: String },
+    /// `os.path.lexists`: a `False` from `Path.exists` is not final — a
+    /// dangling symlink exists too — so `Path.is_symlink` decides next.
+    Lexists { path: String },
+    /// `os.path.samefile`: the first `Path.stat` reply is in; stat `second`
+    /// next. `second` is already extracted so its converter error is raised
+    /// only now, after the first stat succeeded, in CPython's order.
+    SamefileFirst {
+        first: String,
+        second: Result<String, PathArgError>,
+    },
+    /// `os.path.samefile`: both stats are in; compare them. The identity is
+    /// `(st_ino, st_dev)` as decimal text, an equality key that fits any int.
+    SamefileSecond {
+        first: String,
+        first_identity: (String, String),
+        second: String,
+    },
+    /// `os.path.expanduser`: splice the `os.getenv('HOME')` reply in front of
+    /// `tail`, the path after its leading `~`; `None` leaves the path as written.
+    ExpandUser {
+        #[serde(with = "serde_bytes")]
+        tail: Vec<u8>,
+        /// Whether the argument was `bytes`, so the result is too.
+        is_bytes: bool,
+    },
+    /// `os.path.expandvars`: substitute `$var` / `${var}` in `path` from the
+    /// `os.environ` reply.
+    ExpandVars {
+        #[serde(with = "serde_bytes")]
+        path: Vec<u8>,
+        /// Whether the argument was `bytes`, so the result is too.
+        is_bytes: bool,
+    },
 }
 
 impl PreConversionEffect {
-    /// Applies the effect to the host's reply, yielding the object the VM
-    /// converts and pushes; `Chdir` adopts the directory as a side effect.
-    pub(crate) fn reshape(self, obj: MontyObject, vm: &mut VM<'_>) -> Result<MontyObject, RunError> {
-        match self {
-            Self::ListdirNames => listdir_names(obj),
-            Self::IterdirPaths { path } => iterdir_paths(obj, &path, &vm.heap.tracker),
-            Self::UrandomLength { size } => urandom_reply(obj, size),
+    /// Applies the effect to the host's reply, yielding the value the VM
+    /// imports and pushes, or the next call of a multi-step operation;
+    /// `Chdir` adopts the directory as a side effect.
+    pub(crate) fn reshape(self, value: MontyObject, vm: &mut VM<'_>) -> Result<Reshaped, RunError> {
+        let reply = match self {
+            Self::ListdirNames => listdir_names(value),
+            Self::IterdirPaths { path } => iterdir_paths(value, &path, &vm.heap.tracker),
+            Self::UrandomLength { size } => urandom_reply(value, size),
             Self::Chdir { path, spelled } => {
-                check_chdir_stat(&obj, &spelled)?;
+                check_chdir_stat(&value, &spelled)?;
                 vm.env.cwd = Cow::Owned(normalize_virtual_path(&path).into_owned());
-                Ok(MontyObject::None)
+                Ok(MontyObject::none())
             }
-        }
+            Self::StatField(field) => stat_field_reply(&value, field),
+            Self::ResolvedPath { strict } => return resolved_path_reply(&value, strict),
+            Self::RealpathStrict { resolved } => realpath_strict_reply(&value, resolved),
+            Self::Lexists { path } => return lexists_reply(&value, path),
+            Self::SamefileFirst { first, second } => return samefile_first_reply(&value, first, second),
+            Self::SamefileSecond {
+                first,
+                first_identity,
+                second,
+            } => samefile_second_reply(&value, &first, &first_identity, &second, &vm.env.cwd),
+            Self::ExpandUser { tail, is_bytes } => expand_user_reply(&value, &tail, is_bytes),
+            Self::ExpandVars { path, is_bytes } => expand_vars_reply(&value, &path, is_bytes, &vm.heap.tracker),
+        };
+        reply.map(Reshaped::Value)
     }
 
     /// The Python operation this effect completes, for error messages.
@@ -147,19 +238,83 @@ impl PreConversionEffect {
             Self::Chdir { .. } => "os.chdir",
             Self::IterdirPaths { .. } => "Path.iterdir",
             Self::UrandomLength { .. } => "os.urandom",
+            Self::StatField(field) => field.function(),
+            Self::ResolvedPath { .. } | Self::RealpathStrict { .. } => "os.path.realpath",
+            Self::Lexists { .. } => "os.path.lexists",
+            Self::SamefileFirst { .. } | Self::SamefileSecond { .. } => "os.path.samefile",
+            Self::ExpandUser { .. } => "os.path.expanduser",
+            Self::ExpandVars { .. } => "os.path.expandvars",
         }
     }
 }
 
+/// What a [`PreConversionEffect`] makes of the host's reply: the value the
+/// VM pushes, or the next call of an operation that needs several (the
+/// VM suspends again instead of resuming Python, as if the function had
+/// yielded it itself).
+pub(crate) enum Reshaped {
+    /// The operation is complete; push this.
+    Value(MontyObject),
+    /// Suspend again with this call, `effect` armed for its reply.
+    Call {
+        call: OsFunctionCall,
+        effect: Option<PendingEffect>,
+    },
+}
+
+/// A `Path.stat` reply's field by name, so a host's stat result is accepted
+/// whatever its field order; `None` for anything but a named tuple with it.
+pub(crate) fn stat_result_field<'a>(value: &'a MontyObject, name: &str) -> Option<&'a MontyNode> {
+    match unstable::root_node(value) {
+        MontyNode::NamedTuple {
+            field_names, values, ..
+        } => field_names
+            .iter()
+            .position(|field| field == name)
+            .and_then(|index| values.get(index))
+            .map(|id| unstable::node(unstable::child(value.as_ref(), *id))),
+        _ => None,
+    }
+}
+
+/// A `Path.exists` / `Path.is_symlink` reply as a bool, refusing anything else.
+pub(crate) fn bool_reply(value: &MontyObject, operation: &str) -> Result<bool, RunError> {
+    match unstable::root_node(value) {
+        MontyNode::Bool(answer) => Ok(*answer),
+        _ => Err(invalid_reply(operation, "a bool", value)),
+    }
+}
+
+/// The `RuntimeError` for a host reply of the wrong shape: `invalid return
+/// type: {operation} requires the host to return {expected}, got {type}`.
+pub(crate) fn invalid_reply(operation: &str, expected: &str, value: &MontyObject) -> RunError {
+    SimpleException::new_msg(
+        ExcType::RuntimeError,
+        format!(
+            "invalid return type: {operation} requires the host to return {expected}, got {}",
+            value.as_ref().type_name()
+        ),
+    )
+    .into()
+}
+
 /// Applies the converted host value to VM state. The file variants and
 /// `SeedRandom`'s instance target own a reference to their heap object across
-/// the host yield (see `inc_ref_for_pending_oscall`), released exactly once —
-/// on apply, or via [`Self::release`] when the effect is discarded.
+/// the host yield (see `inc_ref_for_pending_oscall`) and `SleepResult` owns its
+/// value; each is released exactly once — on apply, or via [`Self::release`]
+/// when the effect is discarded.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum PostConversionEffect {
     /// Store a full-file read result into the file buffer, then compute the
     /// pending read/seek slice (see `types/file.rs`).
     BufferStore { file_id: HeapId },
+    /// Store a full-file read result into the file buffer and push nothing:
+    /// the `ForIter` that found the file unloaded re-dispatches against it.
+    BufferLoad { file_id: HeapId },
+    /// Store a full-file read result into the file buffer, then answer
+    /// `next(file, default)`: the first line, `default` at EOF, or
+    /// `StopIteration`. Owns `default`'s reference across the yield.
+    FileNext { file_id: HeapId, default: Option<Value> },
     /// Advance the file's logical position by the successful write result.
     WritePosition {
         /// File whose position is updated.
@@ -169,9 +324,18 @@ pub(crate) enum PostConversionEffect {
         previous_position: u64,
         /// Known file length before dispatch, restored on host exception.
         previous_length: u64,
+        /// Length of the text as passed to `write()` when newline translation
+        /// lengthened the payload: CPython reports that, not what reached the file.
+        #[serde(default)]
+        text_length: Option<u64>,
     },
-    /// Preserve `open()`'s filename while the returned handle supplies the I/O target.
-    OpenName { name: FileName },
+    /// Preserve `open()`'s filename while the returned handle supplies the I/O target,
+    /// and apply the `newline` argument, whose value CPython validates after the open.
+    OpenName {
+        name: FileName,
+        #[serde(default)]
+        newline: Option<String>,
+    },
     /// Seed a `random` generator from the host's `os.urandom` reply, then
     /// answer `None` (`seed()`) or re-run the draw that found it unseeded
     /// (`retry`, which owns the call's arguments across the yield).
@@ -179,16 +343,36 @@ pub(crate) enum PostConversionEffect {
         target: RandomTarget,
         retry: Option<RandomRetry>,
     },
+    /// Drop the host's answer and evaluate to `None` (`time.sleep`, whose
+    /// CPython return value is always `None`).
+    DiscardResult,
+    /// Turn the host's `time.time` answer into what the `time` function that
+    /// asked for it returns — a `struct_time`, a formatted string or
+    /// nanoseconds. Holds no heap reference, so nothing to release.
+    ClockReading { reading: ClockReading },
+    /// Drop the host's answer and produce `result` from an awaitable, so
+    /// `asyncio.sleep(delay, result)` is awaitable whether the host answered
+    /// immediately (a settled awaitable) or with a future (the pending
+    /// awaitable takes `result` over; see `ExternalFuture::sleep_result`).
+    /// Owns `result`'s reference; released by [`release_pending_effect`].
+    SleepResult { result: Value },
 }
 
 impl PostConversionEffect {
     /// Releases what the effect held across the yield: the pinned heap object
-    /// (a file handle, or a `random.Random` instance) and any stashed
-    /// arguments. The single place that knows which variants carry a refcount.
+    /// (a file handle, or a `random.Random` instance), any stashed arguments
+    /// and a sleep's result. The single place that knows which variants carry a refcount.
     pub(crate) fn release(self, heap: &mut impl ContainsHeap) {
         match self {
-            Self::BufferStore { file_id } | Self::WritePosition { file_id, .. } => heap.heap_mut().dec_ref(file_id),
-            Self::OpenName { .. } => {}
+            Self::BufferStore { file_id } | Self::BufferLoad { file_id } | Self::WritePosition { file_id, .. } => {
+                heap.heap_mut().dec_ref(file_id);
+            }
+            Self::FileNext { file_id, default } => {
+                heap.heap_mut().dec_ref(file_id);
+                default.drop_with(heap);
+            }
+            Self::OpenName { .. } | Self::DiscardResult | Self::ClockReading { .. } => {}
+            Self::SleepResult { result } => result.drop_with(heap),
             Self::SeedRandom { target, retry } => {
                 if let RandomTarget::Instance(id) = target {
                     heap.heap_mut().dec_ref(id);
@@ -199,8 +383,8 @@ impl PostConversionEffect {
     }
 }
 
-/// Releases an effect that will never be resumed, dropping the heap pin and
-/// any arguments it carried (see `inc_ref_for_pending_oscall`).
+/// Releases an effect that will never be resumed, dropping the heap pin,
+/// arguments or sleep result it carried (see `inc_ref_for_pending_oscall`).
 ///
 /// Reached via the owner's `drop_with`, or `Drop for VM` once the effect is
 /// armed and no owning value remains.
@@ -225,42 +409,21 @@ pub(crate) fn resolve_call_paths(call: &mut OsFunctionCall, cwd: &str) {
 
 /// Checks a host `Path.stat` reply for `os.chdir` — the resume half of
 /// [`PreConversionEffect::Chdir`], run on the raw [`MontyObject`] before heap
-/// conversion like [`listdir_names`].
+/// import like [`listdir_names`].
 ///
 /// A directory `st_mode` passes and the caller normalizes and adopts the path (`os.chdir`
 /// returns `None`); a file raises `NotADirectoryError` naming `spelled`, the
 /// path as the caller wrote it. Hosts that answered `Path.stat` with
 /// something other than a stat result get the same `RuntimeError` shape as
 /// `os.listdir`.
-pub(crate) fn check_chdir_stat(obj: &MontyObject, spelled: &str) -> Result<(), RunError> {
+pub(crate) fn check_chdir_stat(value: &MontyObject, spelled: &str) -> Result<(), RunError> {
     const S_IFMT: i64 = 0o170_000;
     const S_IFDIR: i64 = 0o040_000;
-    // Located by name so a host's stat result is accepted whatever its field
-    // order, and anything without an integer `st_mode` is refused.
-    let st_mode = match obj {
-        MontyObject::NamedTuple {
-            field_names, values, ..
-        } => field_names
-            .iter()
-            .position(|name| name == "st_mode")
-            .and_then(|index| values.get(index))
-            .and_then(|mode| match mode {
-                MontyObject::Int(mode) => Some(*mode),
-                _ => None,
-            }),
-        _ => None,
-    };
-    match st_mode {
-        Some(mode) if mode & S_IFMT == S_IFDIR => Ok(()),
-        Some(_) => Err(ExcType::not_a_directory_error(spelled)),
-        None => Err(SimpleException::new_msg(
-            ExcType::RuntimeError,
-            format!(
-                "invalid return type: os.chdir requires the host to return a stat result, got {}",
-                obj.type_name()
-            ),
-        )
-        .into()),
+    // Anything without an integer `st_mode` is refused.
+    match stat_result_field(value, "st_mode") {
+        Some(MontyNode::Int(mode)) if mode & S_IFMT == S_IFDIR => Ok(()),
+        Some(MontyNode::Int(_)) => Err(ExcType::not_a_directory_error(spelled)),
+        _ => Err(invalid_reply("os.chdir", "a stat result", value)),
     }
 }
 
@@ -268,21 +431,21 @@ pub(crate) fn check_chdir_stat(obj: &MontyObject, spelled: &str) -> Result<(), R
 /// of bare entry names `os.listdir` returns — the resume half of
 /// [`PreConversionEffect::ListdirNames`].
 ///
-/// Runs on the raw [`MontyObject`] before heap conversion (see `VM::resume`),
+/// Runs on the raw [`MontyObject`] before heap import (see `VM::resume`),
 /// so it needs no refcount handling; entries are renamed in place with no new
 /// allocations. Virtual paths are always POSIX, so the name is the substring
 /// after the last `/`. Hosts answering the `Path.iterdir` callback themselves
 /// may return `str` entries instead of paths — both work.
-pub(crate) fn listdir_names(obj: MontyObject) -> Result<MontyObject, RunError> {
-    directory_entries(obj, None)
+pub(crate) fn listdir_names(value: MontyObject) -> Result<MontyObject, RunError> {
+    directory_entries(value, None)
 }
 
 /// Accepts an `os.urandom` reply only as `bytes` of the requested length.
-fn urandom_reply(obj: MontyObject, size: usize) -> Result<MontyObject, RunError> {
-    match &obj {
-        MontyObject::Bytes(bytes) if bytes.len() == size => Ok(obj),
-        MontyObject::Bytes(bytes) => Err(urandom_reply_error(Ok(bytes.len()), size)),
-        other => Err(urandom_reply_error(Err(other.type_name()), size)),
+fn urandom_reply(value: MontyObject, size: usize) -> Result<MontyObject, RunError> {
+    match unstable::root_node(&value) {
+        MontyNode::Bytes(bytes) if bytes.len() == size => Ok(value),
+        MontyNode::Bytes(bytes) => Err(urandom_reply_error(Ok(bytes.len()), size)),
+        _ => Err(urandom_reply_error(Err(value.as_ref().type_name()), size)),
     }
 }
 
@@ -302,13 +465,17 @@ pub(crate) fn urandom_reply_error(actual: Result<usize, &str>, expected: usize) 
 ///
 /// The joins repeat the receiver once per host entry, so their total is
 /// preflighted against `tracker` in one shot before any is built.
-pub(crate) fn iterdir_paths(obj: MontyObject, path: &str, tracker: &ResourceTracker) -> Result<MontyObject, RunError> {
-    directory_entries(obj, Some((path, tracker)))
+pub(crate) fn iterdir_paths(
+    value: MontyObject,
+    path: &str,
+    tracker: &ResourceTracker,
+) -> Result<MontyObject, RunError> {
+    directory_entries(value, Some((path, tracker)))
 }
 
 /// Reduces host paths to entry names, joining them onto the `Path.iterdir()`
 /// receiver when one is given (with the tracker its joins are charged to).
-fn directory_entries(obj: MontyObject, receiver: Option<(&str, &ResourceTracker)>) -> Result<MontyObject, RunError> {
+fn directory_entries(value: MontyObject, receiver: Option<(&str, &ResourceTracker)>) -> Result<MontyObject, RunError> {
     let invalid = |type_name: &str| -> RunError {
         let operation = if receiver.is_some() {
             "Path.iterdir"
@@ -321,33 +488,42 @@ fn directory_entries(obj: MontyObject, receiver: Option<(&str, &ResourceTracker)
         )
         .into()
     };
-    let MontyObject::List(mut items) = obj else {
-        return Err(invalid(obj.type_name()));
+    let MontyNode::List(ids) = unstable::root_node(&value) else {
+        return Err(invalid(value.as_ref().type_name()));
     };
+    let ids = ids.clone();
+    let (mut graph, root) = unstable::into_graph_parts(value);
     let directory = match receiver {
         Some((path, tracker)) => {
             // Each joined path adds the receiver and a separator on top of the entry.
-            tracker.check_allocation(items.len().saturating_mul(path.len() + 1))?;
+            tracker.check_allocation(ids.len().saturating_mul(path.len() + 1))?;
             Some(Path::new(path.to_owned()))
         }
         None => None,
     };
-    for item in &mut items {
-        match item {
-            MontyObject::Path(entry) | MontyObject::String(entry) => {
-                if let Some(sep) = entry.rfind('/') {
-                    entry.drain(..=sep);
-                }
-                *item = if let Some(directory) = &directory {
-                    MontyObject::Path(directory.joinpath(entry))
-                } else {
-                    MontyObject::String(mem::take(entry))
-                };
-            }
-            other => return Err(invalid(other.type_name())),
+    // An entry the host listed twice is one shared node: rewrite it once.
+    let mut seen = AHashSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            continue;
         }
+        if !matches!(graph.node(id), MontyNode::Path(_) | MontyNode::String(_)) {
+            return Err(invalid(graph.type_name(id)));
+        }
+        let node = graph.node_mut(id);
+        let (MontyNode::Path(entry) | MontyNode::String(entry)) = node else {
+            unreachable!("checked above");
+        };
+        if let Some(sep) = entry.rfind('/') {
+            entry.drain(..=sep);
+        }
+        *node = if let Some(directory) = &directory {
+            MontyNode::Path(directory.joinpath(entry))
+        } else {
+            MontyNode::String(mem::take(entry))
+        };
     }
-    Ok(MontyObject::List(items))
+    Ok(unstable::object_from_graph(graph, root).expect("root unchanged"))
 }
 
 // =============================================================================
@@ -450,9 +626,16 @@ fn extract_str_data(
     interns: &Interns,
 ) -> RunResult<PathStringDataArgs> {
     let data = arg_or_missing_data(method, args, heap)?;
-    let data_str = value_to_owned_string(&data, heap, interns);
+    // Only `str`: a path-like is not text, so CPython refuses `Path` and `DirEntry` here.
+    let data_str = data.to_str_heap(heap, interns).ok().map(str::to_owned);
 
-    let py_type = data.py_type_name_heap(heap, interns);
+    // CPython names the type by its `__name__`: no module (`DirEntry`, not
+    // `posix.DirEntry`), but a class's own name (`Point` for a named tuple).
+    let type_name = data.py_type_name_heap(heap, interns);
+    let py_type = type_name
+        .rsplit_once('.')
+        .map_or(&*type_name, |(_, name)| name)
+        .to_owned();
     data.drop_with(heap);
 
     match data_str {
@@ -554,15 +737,22 @@ fn arg_or_missing_data(method: &'static str, args: ArgValues, heap: &mut Heap) -
     args.get_one_arg(method, heap)
 }
 
-/// Owned `String` if `value` is a `str` or `Path`, else `None`. Caller drops
+/// Owned `String` if `value` is a `str`, `Path` or `DirEntry`, else `None`. Caller drops
 /// the source value afterwards. Also used by the `os` module's path-taking
 /// functions (`modules/os.rs`).
 pub(crate) fn value_to_owned_string(value: &Value, heap: &Heap, interns: &Interns) -> Option<String> {
+    value_as_path_str(value, heap, interns).map(str::to_owned)
+}
+
+/// The text of a `str`, `Path` or `DirEntry` `value`, borrowed, else `None`:
+/// what [`value_to_owned_string`] copies, for sizing the copy first.
+pub(crate) fn value_as_path_str<'a>(value: &Value, heap: &'a Heap, interns: &'a Interns) -> Option<&'a str> {
     match value {
-        Value::InternString(id) => Some(interns.get_str(*id).to_owned()),
+        Value::InternString(id) => Some(interns.get_str(*id)),
         Value::Ref(id) => match heap.get(*id) {
-            HeapData::Str(s) => Some(s.as_str().to_owned()),
-            HeapData::Path(p) => Some(p.as_str().to_owned()),
+            HeapData::Str(s) => Some(s.as_str()),
+            HeapData::Path(p) => Some(p.as_str()),
+            HeapData::DirScan(scan) => scan.fspath(),
             _ => None,
         },
         _ => None,
@@ -570,7 +760,7 @@ pub(crate) fn value_to_owned_string(value: &Value, heap: &Heap, interns: &Intern
 }
 
 /// Owned `Vec<u8>` if `value` is a `bytes` (interned or heap), else `None`.
-fn value_to_owned_bytes(value: &Value, heap: &Heap, interns: &Interns) -> Option<Vec<u8>> {
+pub(crate) fn value_to_owned_bytes(value: &Value, heap: &Heap, interns: &Interns) -> Option<Vec<u8>> {
     match value {
         Value::InternBytes(id) => Some(interns.get_bytes(*id).to_owned()),
         Value::Ref(id) => match heap.get(*id) {

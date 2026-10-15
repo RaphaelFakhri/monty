@@ -9,9 +9,19 @@
 // external future so other sandbox tasks keep executing, and results are
 // delivered when the worker reports everything is blocked (`resolveFutures`).
 
+import { context as ContextAPI, type Context } from '@opentelemetry/api'
+
 import type { NativeSession } from '../native-addon.js'
-import { bindPrintCallback, runWithCallbackContext } from './callbackContext.js'
-import { AttrNotExposed, attributeErrorMessage, InstanceStore, prepare, restore } from './classInstance.js'
+import { bindPrintCallback, getCallbackContext, runWithCallbackContext } from './callbackContext.js'
+import {
+  AttrNotExposed,
+  attributeErrorMessage,
+  HostModuleValue,
+  InstanceStore,
+  prepare,
+  restore,
+  type WalkMemo,
+} from './classInstance.js'
 import {
   MontyCrashedError,
   MontyError,
@@ -19,20 +29,23 @@ import {
   MontyTypingError,
   notCallableMessage,
   ProtocolError,
+  type SourceRange,
 } from './errors.js'
 import { PYTHON_EXC_NAMES } from './errors.js'
+import { checkModuleName, ExternalModule, kindOf } from './externalModule.js'
 import { mountsToNative } from './mount.js'
 import type { MountDir } from './mountDir.js'
-import type {
-  FunctionCallTurn,
-  LoadedTurn,
-  NameLookupTurn,
-  NativeFutureResult,
-  NativeTurn,
-  OkTurn,
-  NotMountedTurn,
-  OsCallTurn,
-  ResolveFuturesTurn,
+import {
+  type FunctionCallTurn,
+  type LoadedTurn,
+  type NameLookupTurn,
+  type NativeFutureResult,
+  type NativeTurn,
+  type OkTurn,
+  type NotMountedTurn,
+  type OsCallTurn,
+  type ResolveFuturesTurn,
+  osCallAcceptsFuture,
 } from './native.js'
 import { CollectString, CollectStreams } from './print.js'
 
@@ -95,11 +108,9 @@ export interface FeedOptions {
 }
 
 /**
- * Options for [`MontySession.feedStart`]. Like [`FeedOptions`], but
- * `externalLookup` (and `os`) are *not* dispatched during the initial drive —
- * external calls and name lookups are surfaced as snapshots. They are captured
- * so [`snapshot.resumeAuto()`](FunctionSnapshot#resumeAuto) can answer each
- * suspension from them, letting a caller iterate to completion by hand.
+ * Options for [`MontySession.feedStart`]. External calls, imports and lookups return snapshots.
+ * [`snapshot.resumeAuto()`](FunctionSnapshot#resumeAuto) uses the captured `externalLookup`
+ * and `os`, and the session's `externalModules`, to answer each suspension.
  */
 export interface FeedStartOptions {
   /** Values bound as globals before the snippet runs. */
@@ -158,12 +169,15 @@ interface PendingFuture {
 }
 
 /**
- * One worker process dedicated to one REPL session; created by
+ * One worker dedicated to one REPL session; created by
  * [`Monty.checkout`]. Session state (globals, functions) persists across
  * `feedRun` calls. Close it (or `await using`) to return the worker to the
  * pool.
  */
 export class MontySession {
+  /** Stable worker identity within its pool, retained during turns and after session close. */
+  readonly workerId: number | undefined
+
   private readonly native: NativeSession
   /** Set once the session is unusable: crashed worker or protocol error. */
   private broken: Error | null = null
@@ -176,9 +190,14 @@ export class MontySession {
    *  calls, lazy lookups and returns route back to the original object. */
   private readonly instances = new InstanceStore()
 
-  /** @internal — sessions are created by `Monty.checkout`. */
-  constructor(native: NativeSession) {
+  /** @internal — sessions are created by `Monty.checkout`, which validates the modules first. */
+  constructor(
+    native: NativeSession,
+    /** The checkout's `externalModules`, answering every feed's imports. */
+    private readonly modules: HostModules = new HostModules(undefined),
+  ) {
     this.native = native
+    this.workerId = native.workerId ?? undefined
   }
 
   /**
@@ -194,9 +213,8 @@ export class MontySession {
     this.driven = true
     const printTarget = new PrintTarget(options.printCallback)
     const onPrint = bindPrintCallback(printTarget.write.bind(printTarget))
-    // A fresh answerer (and its pending-future map) per feed, so promises the
-    // worker never asks about again cannot accumulate across feeds.
-    const answerer = new TurnAnswerer(this.native, this.instances, options.externalLookup, options.os)
+    // Discard pending futures between feeds.
+    const answerer = new TurnAnswerer(this.native, this.instances, options.externalLookup, this.modules, options.os)
     let turn = (await this.native.feed(
       code,
       prepareInputs(options.inputs, this.instances),
@@ -365,11 +383,10 @@ export class MontySession {
     return err
   }
 
-  /** Builds the per-feed snapshot driver (print target, answerer, poison). The
-   *  captured `externalLookup` / `os` back `snapshot.resumeAuto()`. */
-  private newDriver(options: FeedStartOptions): SnapshotDriver {
+  /** Captures the feed's handlers for `snapshot.resumeAuto()`. */
+  private newDriver(options: FeedStartOptions | LoadSnapshotOptions): SnapshotDriver {
     const printTarget = new PrintTarget(options.printCallback)
-    const answerer = new TurnAnswerer(this.native, this.instances, options.externalLookup, options.os)
+    const answerer = new TurnAnswerer(this.native, this.instances, options.externalLookup, this.modules, options.os)
     return new SnapshotDriver(this.native, this.instances, printTarget, answerer, (err) => this.poison(err))
   }
 
@@ -470,11 +487,11 @@ export class MontySession {
 class TurnAnswerer {
   /** Pending async external calls, by call id. */
   readonly futures = new Map<number, PendingFuture>()
-
   constructor(
     private readonly native: NativeSession,
     private readonly instances: InstanceStore,
     readonly externalLookup: Record<string, unknown> | undefined,
+    readonly modules: HostModules,
     readonly os: OsCallback | undefined,
   ) {}
 
@@ -531,17 +548,22 @@ class TurnAnswerer {
   }
 
   /** Calls the matching external function and resumes with its result. */
-  private answerFunctionCall(call: FunctionCallTurn, onPrint: PrintCallback): Promise<object> {
+  private async answerFunctionCall(call: FunctionCallTurn, onPrint: PrintCallback): Promise<object> {
     if (call.objectId !== undefined && call.objectId !== null) {
       return this.answerMethodCall(call, call.objectId, onPrint)
     }
-    // Own keys only, as in the nameLookup branch: an inherited callable (e.g.
-    // `Object.prototype.toString`) must never be dispatched as a host function.
-    const externalLookup = this.externalLookup
-    if (externalLookup === undefined || !Object.prototype.hasOwnProperty.call(externalLookup, call.functionName)) {
+    let resolved: { value: unknown } | undefined
+    try {
+      resolved = await this.hostEntry(call.functionName)
+    } catch (err) {
+      // Raise getter errors at the sandbox call.
+      const { excType, message } = jsErrorParts(err)
+      return this.native.resumeError(excType, message, onPrint)
+    }
+    if (resolved === undefined) {
       return this.native.resumeNotFound(onPrint)
     }
-    const entry = externalLookup[call.functionName]
+    const entry = resolved.value
     if (typeof entry !== 'function') {
       // A cached function proxy whose entry was later replaced by a plain
       // value: raise what CPython would for calling that value, matching the
@@ -551,20 +573,113 @@ class TurnAnswerer {
     const fn = entry as ExternalFunction
     let returned: unknown
     try {
-      const args = restoreValues(call.args, this.instances)
-      returned = fn(...(buildCallArgs(args, restoreKwargPairs(call.kwargs, this.instances)) as never[]))
+      const [args, kwargs] = restoreCallArgs(call, this.instances)
+      returned = fn(...(buildCallArgs(args, kwargs) as never[]))
     } catch (err) {
       const { excType, message } = jsErrorParts(err)
       return this.native.resumeError(excType, message, onPrint)
     }
-    if (isThenable(returned)) {
-      if (call.allowEagerAwait) {
-        return this.answerEagerCoroutine(call.callId, returned, onPrint)
-      }
-      this.registerFuture(call.callId, Promise.resolve(returned))
-      return this.native.resumeFuture(onPrint)
+    return isThenable(returned)
+      ? this.answerAwaitedCall(call, returned, onPrint)
+      : this.resumeWithValue(returned, onPrint)
+  }
+
+  /**
+   * Resolves an own property of `externalLookup` or a dotted module path.
+   * Inherited callables must never run. Box the result so this async return
+   * cannot invoke a plain value's `then` method.
+   */
+  private async hostEntry(functionName: string): Promise<{ value: unknown } | undefined> {
+    const dot = functionName.lastIndexOf('.')
+    if (dot < 0) {
+      return boxed(ownEntry(this.externalLookup, functionName))
     }
-    return this.resumeWithValue(returned, onPrint)
+    const [top, ...rest] = functionName.slice(0, dot).split('.')
+    let resolved = await this.module(top as string)
+    for (const part of rest) {
+      if (resolved === undefined) break
+      resolved = submodule(resolved, part)
+    }
+    if (resolved === undefined) {
+      return undefined
+    }
+    // a module holds no `_` name, so a forged private name finds nothing
+    const attr = functionName.slice(dot + 1)
+    const entry = ownEntry(resolved.attrs, attr)
+    // Preserve the receiver of `module.attr(...)`.
+    return boxed(typeof entry === 'function' ? (entry as ExternalFunction).bind(resolved.receiver) : entry)
+  }
+
+  /**
+   * Resolves a module, caching each factory's result for the session.
+   * Await only real Promises. Invalid results raise TypeError at the requesting
+   * import, call or stub request (see [`HostModules.install`]).
+   */
+  private async module(name: string): Promise<ExternalModule | undefined> {
+    const resolved = this.modules.resolved.get(name)
+    if (resolved !== undefined) {
+      return resolved
+    }
+    const entry = this.modules.entry(name)
+    if (entry === undefined) {
+      return undefined
+    }
+    if (entry instanceof ExternalModule) {
+      return entry
+    }
+    const returned = (entry as () => unknown)()
+    return this.modules.install(name, returned instanceof Promise ? await returned : returned)
+  }
+
+  /**
+   * Returns the host module, or not-found for the sandbox to raise `ModuleNotFoundError`.
+   */
+  private async answerImport(call: OsCallTurn, onPrint: PrintCallback): Promise<object> {
+    const [args] = restoreCallArgs(call, this.instances)
+    const name = args[0]
+    if (typeof name !== 'string') {
+      return this.native.resumeNotFound(onPrint)
+    }
+    let value: unknown
+    try {
+      // Raise factory and getter errors at the sandbox import.
+      const entry = await this.module(name)
+      if (entry === undefined) {
+        return this.native.resumeNotFound(onPrint)
+      }
+      value = moduleValue(name, entry)
+    } catch (err) {
+      const { excType, message } = jsErrorParts(err)
+      return this.native.resumeError(excType, message, onPrint)
+    }
+    return this.resumeWithValue(value, onPrint)
+  }
+
+  /**
+   * Returns requested modules' `.pyi` stubs and their submodules by dotted path,
+   * using `null` for missing stubs. Run factories concurrently and reuse their
+   * results for the session's imports.
+   */
+  private async answerImportStubs(call: OsCallTurn, onPrint: PrintCallback): Promise<object> {
+    const [args] = restoreCallArgs(call, this.instances)
+    const names = args[0]
+    if (!Array.isArray(names) || !names.every((name) => typeof name === 'string')) {
+      return this.native.resumeNotFound(onPrint)
+    }
+    // a null prototype: a module named `__proto__` must land as an own key
+    const stubs: Record<string, string | null> = Object.create(null) as Record<string, string | null>
+    try {
+      const entries = await Promise.all((names as string[]).map((name) => this.module(name)))
+      for (const [index, entry] of entries.entries()) {
+        if (entry !== undefined) {
+          collectStubs(names[index] as string, entry, stubs)
+        }
+      }
+    } catch (err) {
+      const { excType, message } = jsErrorParts(err)
+      return this.native.resumeError(excType, message, onPrint)
+    }
+    return this.resumeWithValue(stubs, onPrint)
   }
 
   /**
@@ -595,9 +710,8 @@ class TurnAnswerer {
     }
     let returned: unknown
     try {
-      const args = restoreValues(call.args, this.instances)
-      const kwargs = kwargsToRecord(restoreKwargPairs(call.kwargs, this.instances))
-      returned = wrapper.callMethod(call.functionName, args, kwargs)
+      const [args, kwargs] = restoreCallArgs(call, this.instances)
+      returned = wrapper.callMethod(call.functionName, args, kwargsToRecord(kwargs))
     } catch (err) {
       if (err instanceof AttrNotExposed) {
         return this.native.resumeError('AttributeError', err.message, onPrint)
@@ -605,14 +719,9 @@ class TurnAnswerer {
       const { excType, message } = jsErrorParts(err)
       return this.native.resumeError(excType, message, onPrint)
     }
-    if (isThenable(returned)) {
-      if (call.allowEagerAwait) {
-        return this.answerEagerCoroutine(call.callId, returned, onPrint)
-      }
-      this.registerFuture(call.callId, Promise.resolve(returned))
-      return this.native.resumeFuture(onPrint)
-    }
-    return this.resumeWithValue(returned, onPrint)
+    return isThenable(returned)
+      ? this.answerAwaitedCall(call, returned, onPrint)
+      : this.resumeWithValue(returned, onPrint)
   }
 
   /**
@@ -663,10 +772,23 @@ class TurnAnswerer {
   }
 
   /**
-   * Answers an OS call: the feed's mounts get first refusal, then the `os`
-   * callback, then the sandbox's own no-handler default.
+   * Handles imports and sleeps locally; other calls try mounts, `os`, then the sandbox default.
    */
   async answerOsCall(call: OsCallTurn, onPrint: PrintCallback): Promise<object> {
+    if (call.functionName === IMPORT_CALL) {
+      return this.answerImport(call, onPrint)
+    }
+    if (call.functionName === IMPORT_STUBS_CALL) {
+      return this.answerImportStubs(call, onPrint)
+    }
+    const wait = this.systemSleepFor(call)
+    if (wait !== null) {
+      if (osCallAcceptsFuture(call.functionName)) {
+        return await this.answerAwaitedCall(call, wait, onPrint)
+      }
+      await wait
+      return await this.resumeWithValue(null, onPrint)
+    }
     const mounted = (await this.native.resumeFromMounts(onPrint)) as NativeTurn | NotMountedTurn
     if (mounted.kind !== 'notMounted') {
       return mounted
@@ -676,9 +798,14 @@ class TurnAnswerer {
     }
     let returned: unknown
     try {
-      const args = restoreValues(call.args, this.instances)
-      returned = this.os(call.functionName, args, kwargsToRecord(restoreKwargPairs(call.kwargs, this.instances)))
+      const [args, kwargs] = restoreCallArgs(call, this.instances)
+      returned = this.os(call.functionName, args, kwargsToRecord(kwargs))
       if (isThenable(returned)) {
+        if (osCallAcceptsFuture(call.functionName)) {
+          return await this.answerAwaitedCall(call, returned, onPrint)
+        }
+        // The sandbox does not await any other OS call, so a future would be
+        // an error: the wait happens here and only this session is held up.
         returned = await returned
       }
     } catch (err) {
@@ -689,6 +816,30 @@ class TurnAnswerer {
       return await this.native.resumeNotHandled(onPrint)
     }
     return await this.resumeWithValue(returned, onPrint)
+  }
+
+  /**
+   * Uses the call's sleep marker, so restored sessions need no local copy of their sleep policy.
+   */
+  private systemSleepFor(call: OsCallTurn): Promise<void> | null {
+    return call.systemSleepSecs === undefined ? null : sleepMs(call.systemSleepSecs * 1000)
+  }
+
+  /**
+   * Answers a call the sandbox awaits with the promise a host callback
+   * returned: settled here when the sandbox has nothing else to run, otherwise
+   * registered as a future so its other tasks run meanwhile.
+   */
+  private answerAwaitedCall(
+    call: { callId: number; allowEagerAwait?: boolean },
+    promise: PromiseLike<unknown>,
+    onPrint: PrintCallback,
+  ): Promise<object> {
+    if (call.allowEagerAwait) {
+      return this.answerEagerCoroutine(call.callId, promise, onPrint)
+    }
+    this.registerFuture(call.callId, Promise.resolve(promise))
+    return this.native.resumeFuture(onPrint)
   }
 
   /** Settles an eligible coroutine at its call suspension, including conversion errors. */
@@ -770,6 +921,7 @@ class TurnAnswerer {
 class PrintTarget {
   private readonly callback: PrintCallback | undefined
   private failure: unknown = null
+  private failed = false
 
   constructor(input: PrintTargetInput | undefined) {
     // Collectors adapt once to a function so the drive loop / native path stay typed as PrintCallback.
@@ -781,11 +933,15 @@ class PrintTarget {
   }
 
   write(stream: 'stdout' | 'stderr', text: string): void {
-    if (this.failure !== null) {
+    if (this.failed) {
       return
     }
     if (this.callback === undefined) {
-      ;(stream === 'stdout' ? process.stdout : process.stderr).write(text)
+      if (typeof process !== 'undefined' && process.stdout && process.stderr) {
+        ;(stream === 'stdout' ? process.stdout : process.stderr).write(text)
+      } else {
+        ;(stream === 'stdout' ? console.log : console.error)(text)
+      }
       return
     }
     try {
@@ -794,13 +950,14 @@ class PrintTarget {
       // Captured and re-thrown at the turn boundary: this function is called
       // from the native binding's threadsafe-function bridge, where a throw
       // would be an unhandled error rather than failing the feed.
+      this.failed = true
       this.failure = err
     }
   }
 
   /** Print failures take precedence over the turn's own outcome. */
   throwIfFailed(): void {
-    if (this.failure !== null) {
+    if (this.failed) {
       throw this.failure
     }
   }
@@ -813,6 +970,9 @@ class PrintTarget {
  * produces, so they all answer the same worker with the same print sink.
  */
 class SnapshotDriver {
+  /** Captured before the first feed/load await and shared by the snapshot chain, never serialized. */
+  readonly traceBaseContext = ContextAPI.active()
+
   /** Exposed so the session's first turn can stream prints through it. */
   get onPrint(): PrintCallback {
     return bindPrintCallback(this.printTarget.write.bind(this.printTarget))
@@ -943,14 +1103,38 @@ class SnapshotDriver {
   }
 }
 
-/** Marks a snapshot single-use: each may be resumed at most once. */
+/** Shares tracing context access and the single-resume check across snapshot kinds. */
 class SingleUse {
   private used = false
+
+  /** Retains the suspension's telemetry parent until the snapshot is resumed. */
+  protected constructor(
+    private readonly callbackSpanKey: string | undefined,
+    private readonly traceBaseContext: Context,
+  ) {}
+
+  /**
+   * Returns the suspension's OTel context without activating it or resuming execution.
+   * Preserves context entries captured at `feedStart` / `loadSnapshot`; without Monty tracing,
+   * returns that captured context unchanged. Access after resume throws; previously returned
+   * contexts remain usable but do not keep the suspension span open.
+   */
+  traceContext(): Context {
+    this.ensureUnused()
+    return getCallbackContext(this.callbackSpanKey, this.traceBaseContext)
+  }
+
+  /** Consumes the snapshot's single resume, independently of its tracing context. */
   protected claim(): void {
+    this.ensureUnused()
+    this.used = true
+  }
+
+  /** Rejects operations on a suspension the caller has already answered. */
+  private ensureUnused(): void {
     if (this.used) {
       throw new Error('snapshot has already been resumed')
     }
-    this.used = true
   }
 }
 
@@ -973,6 +1157,8 @@ export class FunctionSnapshot extends SingleUse {
    *  instance, or a class type (a classmethod, or `__call__` construction).
    *  The receiver is not in `args`; `null` for plain external calls. */
   readonly objectId: string | null
+  /** Where the call expression is in the source. */
+  readonly position: SourceRange
 
   /** @internal */
   constructor(
@@ -980,13 +1166,15 @@ export class FunctionSnapshot extends SingleUse {
     private readonly turn: FunctionCallTurn | OsCallTurn,
     isOsFunction: boolean,
   ) {
-    super()
+    super(turn.callbackSpanKey, driver.traceBaseContext)
+    this.position = turn.position
     this.functionName = turn.functionName
-    this.args = restoreValues(turn.args, driver.instances)
-    this.kwargs = kwargsToRecord(restoreKwargPairs(turn.kwargs, driver.instances))
+    const [args, kwargs] = restoreCallArgs(turn, driver.instances)
+    this.args = args
+    this.kwargs = kwargsToRecord(kwargs)
     this.callId = turn.callId
     this.isOsFunction = isOsFunction
-    this.allowEagerAwait = turn.kind === 'functionCall' && (turn.allowEagerAwait ?? false)
+    this.allowEagerAwait = turn.allowEagerAwait ?? false
     this.objectId = 'objectId' in turn ? (turn.objectId ?? null) : null
   }
 
@@ -1049,13 +1237,16 @@ export class NameLookupSnapshot extends SingleUse {
    *  instance, or a class type): the receiver's store uuid. `null` for
    *  plain name lookups. */
   readonly objectId: string | null
+  /** Where the name (or attribute access) is in the source. */
+  readonly position: SourceRange
 
   /** @internal */
   constructor(
     private readonly driver: SnapshotDriver,
     private readonly turn: NameLookupTurn,
   ) {
-    super()
+    super(turn.callbackSpanKey, driver.traceBaseContext)
+    this.position = turn.position
     this.variableName = turn.name
     this.objectId = turn.objectId ?? null
   }
@@ -1096,13 +1287,16 @@ export class NameLookupSnapshot extends SingleUse {
 /** A paused execution where every sandbox task is blocked on external futures. */
 export class FutureSnapshot extends SingleUse {
   readonly pendingCallIds: number[]
+  /** Where the main task's blocked `await` is in the source. */
+  readonly position: SourceRange
 
   /** @internal */
   constructor(
     private readonly driver: SnapshotDriver,
     private readonly turn: ResolveFuturesTurn,
   ) {
-    super()
+    super(turn.callbackSpanKey, driver.traceBaseContext)
+    this.position = turn.position
     this.pendingCallIds = turn.pendingCallIds
   }
 
@@ -1149,6 +1343,123 @@ export class MontyComplete {
   constructor(readonly output: unknown) {}
 }
 
+/** The OS call the sandbox makes for an `import` it cannot resolve itself. */
+const IMPORT_CALL = 'import'
+
+/** The OS call a type-checked feed makes for the stubs of the host modules it imports. */
+const IMPORT_STUBS_CALL = 'import_stubs'
+
+/** Modules keyed by import name, read when a snippet first imports one: invalid identifiers, keywords
+ *  and sandbox-provided names throw there. Factories run at most once per session and may return a Promise. */
+export type ExternalModules = Record<string, ExternalModule | (() => ExternalModule | Promise<ExternalModule>)>
+
+/**
+ * A session's modules and cached factory results. The checkout's record is read
+ * live and an entry is validated when a snippet first reaches it, so the host may
+ * add modules during the session.
+ * @internal
+ */
+export class HostModules {
+  /** Factory results cached for this session. */
+  readonly resolved = new Map<string, ExternalModule>()
+
+  /** The checkout's record, kept by reference so later additions are importable. */
+  private readonly entries: ExternalModules
+
+  constructor(entries: ExternalModules | undefined) {
+    const proto = entries !== undefined && typeof entries === 'object' ? Object.getPrototypeOf(entries) : undefined
+    if (entries !== undefined && proto !== Object.prototype && proto !== null) {
+      throw new TypeError(
+        `externalModules must be a plain object of module name to ExternalModule, got ${kindOf(entries)}`,
+      )
+    }
+    this.entries = entries ?? {}
+  }
+
+  /** Checks and caches a factory result. */
+  install(name: string, returned: unknown): ExternalModule {
+    if (!(returned instanceof ExternalModule)) {
+      throw new TypeError(`externalModules.${name}() returned ${kindOf(returned)}, not an ExternalModule`)
+    }
+    this.resolved.set(name, returned)
+    return returned
+  }
+
+  /**
+   * The top-level entry for `name` (own keys only), validated now that a snippet
+   * reaches it: a module name the sandbox does not provide, mapped to an
+   * `ExternalModule` or a factory.
+   */
+  entry(name: string): ExternalModules[string] | undefined {
+    // an own key holding `undefined` is a bad entry, not an absent one
+    if (!Object.prototype.hasOwnProperty.call(this.entries, name)) {
+      return undefined
+    }
+    const entry = this.entries[name] as unknown
+    checkModuleName(`externalModules.${name}`, name)
+    if (!(entry instanceof ExternalModule) && typeof entry !== 'function') {
+      throw new TypeError(`externalModules.${name} must be an ExternalModule or a function returning one`)
+    }
+    return entry as ExternalModules[string]
+  }
+}
+
+/** `value` wrapped so an async return cannot await it; `undefined` stays absent. */
+function boxed(value: unknown): { value: unknown } | undefined {
+  return value === undefined ? undefined : { value }
+}
+
+function ownEntry(record: unknown, key: string): unknown {
+  return record !== null && typeof record === 'object' && Object.prototype.hasOwnProperty.call(record, key)
+    ? (record as Record<string, unknown>)[key]
+    : undefined
+}
+
+/** The submodule `name` of `module`: the `ExternalModule` under that key, if any. */
+function submodule(module: ExternalModule, name: string): ExternalModule | undefined {
+  const value = ownEntry(module.attrs, name)
+  return value instanceof ExternalModule ? value : undefined
+}
+
+/** A module's attributes in order (all public: the module never holds a `_` name). */
+function publicAttrs(module: ExternalModule): [string, unknown][] {
+  return Object.keys(module.attrs).map((key) => [key, module.attrs[key]])
+}
+
+/** Collects stubs by dotted path, using `null` for modules without stubs. */
+function collectStubs(path: string, entry: ExternalModule, stubs: Record<string, string | null>): void {
+  stubs[path] = entry.stubs ?? null
+  for (const [key, value] of publicAttrs(entry)) {
+    if (value instanceof ExternalModule) {
+      collectStubs(`${path}.${key}`, value, stubs)
+    }
+  }
+}
+
+/**
+ * The module value an import binds: the module's public attrs, with functions
+ * as host functions named by their dotted path (which [`TurnAnswerer.hostEntry`]
+ * resolves back through the module) and nested modules as submodules.
+ */
+function moduleValue(path: string, entry: ExternalModule): HostModuleValue {
+  const attrs = publicAttrs(entry).map(([key, value]): [string, unknown] => {
+    const sent =
+      value instanceof ExternalModule
+        ? moduleValue(`${path}.${key}`, value)
+        : typeof value === 'function'
+          ? namedHostFunction(`${path}.${key}`, value as ExternalFunction)
+          : value
+    return [key, sent]
+  })
+  return new HostModuleValue(path, entry.id, attrs)
+}
+
+function namedHostFunction(name: string, fn: ExternalFunction): ExternalFunction {
+  const proxy: ExternalFunction = (...args: unknown[]) => fn(...(args as never[]))
+  Object.defineProperty(proxy, 'name', { value: name })
+  return proxy
+}
+
 /** Positional args, with kwargs appended as an object when present. */
 function buildCallArgs(args: unknown[], kwargs: [unknown, unknown][]): unknown[] {
   if (kwargs.length === 0) {
@@ -1157,7 +1468,8 @@ function buildCallArgs(args: unknown[], kwargs: [unknown, unknown][]): unknown[]
   return [...args, kwargsToRecord(kwargs)]
 }
 
-/** Prepares each input value for the wire (feed's `inputs` record). */
+/** Prepares each input value for the wire (feed's `inputs` record) with one
+ *  memo, so an object passed under two names is one sandbox object. */
 function prepareInputs(
   inputs: Record<string, unknown> | undefined,
   store: InstanceStore,
@@ -1168,22 +1480,25 @@ function prepareInputs(
   // null prototype so an exotic input name (e.g. `__proto__`) stays a plain
   // property of the rebuilt record
   const prepared: Record<string, unknown> = Object.create(null)
+  const memo: WalkMemo = new Map()
   let changed = false
   for (const [name, value] of Object.entries(inputs)) {
-    prepared[name] = prepare(value, store)
+    prepared[name] = prepare(value, store, memo)
     changed ||= prepared[name] !== value
   }
   return changed ? prepared : inputs
 }
 
-/** Restores each element of a sandbox-produced args array. */
-function restoreValues(values: unknown[], store: InstanceStore): unknown[] {
-  return values.map((value) => restore(value, store))
-}
-
-/** Restores the values of sandbox-produced `[key, value]` kwarg pairs. */
-function restoreKwargPairs(pairs: [unknown, unknown][], store: InstanceStore): [unknown, unknown][] {
-  return pairs.map(([key, value]): [unknown, unknown] => [key, restore(value, store)])
+/** Restores a call's args and the values of its `[key, value]` kwarg pairs
+ *  with one memo, so an object the sandbox passed twice is one host object. */
+function restoreCallArgs(
+  call: { args: unknown[]; kwargs: [unknown, unknown][] },
+  store: InstanceStore,
+): [unknown[], [unknown, unknown][]] {
+  const memo: WalkMemo = new Map()
+  const args = call.args.map((value) => restore(value, store, memo))
+  const kwargs = call.kwargs.map(([key, value]): [unknown, unknown] => [key, restore(value, store, memo)])
+  return [args, kwargs]
 }
 
 /**
@@ -1231,4 +1546,18 @@ function bytesForNative(bytes: Uint8Array): Buffer {
 
 function bufferFrom(bytes: Uint8Array): Buffer {
   return (typeof Buffer === 'undefined' ? bytes : Buffer.from(bytes)) as Buffer
+}
+
+/**
+ * Resolves after `ms` milliseconds. `setTimeout` takes a signed 32-bit
+ * millisecond count, so a longer wait is chained rather than cut short.
+ */
+async function sleepMs(ms: number): Promise<void> {
+  const MAX_TIMEOUT_MS = 2 ** 31 - 1
+  let left = ms
+  while (left > MAX_TIMEOUT_MS) {
+    await new Promise<void>((resolve) => setTimeout(resolve, MAX_TIMEOUT_MS))
+    left -= MAX_TIMEOUT_MS
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, left))
 }

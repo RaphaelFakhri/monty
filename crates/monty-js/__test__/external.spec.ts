@@ -549,3 +549,18 @@ test('externalLookup unconvertible value rejects the turn', async () => {
   const error = await t.throwsAsync(() => run('x', { externalLookup: { x: Symbol('nope') } }))
   t.is(error?.message, 'Cannot convert JS Symbol to Monty value')
 })
+
+test('a non-callable lookup value with a then is never awaited', async () => {
+  // Async lookup resolution must not invoke a plain value's `then` method.
+  let thenRan = false
+  const value = {
+    then: () => {
+      thenRan = true
+    },
+  }
+  await t.throwsAsync(run('value()', { externalLookup: { value } }), {
+    instanceOf: MontyRuntimeError,
+    message: /^TypeError: /,
+  })
+  t.false(thenRan)
+})

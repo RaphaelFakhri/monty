@@ -6,14 +6,15 @@ Python.
 
 ## Implemented builtin functions
 
-`abs`, `all`, `any`, `bin`, `chr`, `divmod`, `enumerate`, `filter`,
+`abs`, `all`, `any`, `bin`, `chr`, `divmod`, `enumerate`, `eval`, `exec`, `filter`,
 `format`, `getattr`, `hasattr`, `hash`, `hex`, `id`, `isinstance`, `iter`, `len`,
-`map`, `max`, `min`, `next`, `oct`, `open`, `ord`, `pow`, `print`, `repr`,
+`locals`, `map`, `max`, `min`, `next`, `oct`, `open`, `ord`, `pow`, `print`, `repr`,
 `reversed`, `round`, `setattr`, `sorted`, `sum`, `type`, `zip`.
+`eval`, `exec` and `locals` are described in [eval_exec.md](eval_exec.md).
 
 ## Implemented type constructors (also builtins)
 
-`bool`, `bytes`, `dict`, `float`, `frozenset`, `int`, `list`, `range`,
+`bool`, `bytes`, `complex`, `dict`, `float`, `frozenset`, `int`, `list`, `range`,
 `set`, `slice`, `str`, `tuple`. Exception classes (`ValueError`,
 `TypeError`, etc.) are also names in the builtin namespace.
 
@@ -21,14 +22,12 @@ Python.
 
 These raise `NameError`:
 
-- **Code execution**: `eval`, `exec`, `compile`, `__import__`. Deliberate:
-    sandboxed code must not be able to compile new code at runtime.
-- **Namespace introspection**: `globals`, `locals`, `vars`, `dir`.
+- **Code objects and imports**: `compile`, `__import__`.
+- **Namespace introspection**: `globals`, `vars`, `dir`.
 - **Interactive**: `input`, `breakpoint`, `help`.
 - **Decorators / descriptors**: `classmethod`, `staticmethod`, `property`,
     `super`. (`@property` on functions is not recognized; use a method.)
-- **Construction / coercion**: `bytearray`, `complex`, `memoryview`,
-    `object`, `ascii`.
+- **Construction / coercion**: `bytearray`, `memoryview`, `object`, `ascii`.
 - **Other**: `callable`, `delattr`, `issubclass`, `aiter`, `anext`.
 
 `super()` is the biggest practical omission: with no class inheritance either
@@ -43,9 +42,9 @@ These raise `NameError`:
     `AttributeError`, so `[1].append`, `'a'.upper`, `{}.get`, `dict.fromkeys`
     and `list.__class_getitem__` cannot be assigned, passed as a callback or
     reached through `getattr`. Call them directly (`list.__class_getitem__(int)`).
-- **`hash(x)`** — Monty hashes `str`, `bytes`, `float` and every container with
-    its own algorithm, so the values differ from CPython's. Only `bool` and
-    small `int` agree: an `int` hashes to itself, which is what CPython does
+- **`hash(x)`** — Monty hashes `str`, `bytes`, `float`, `complex` and every container with
+    its own algorithm, so the values differ from CPython's. Only `bool`,
+    small `int`, and a `float` or `complex` equal to one of them agree: an `int` hashes to itself, which is what CPython does
     while `abs(x) < 2**61 - 1`, but CPython reduces modulo `2**61 - 1` from
     there up (`hash(2**62)` is `2` in CPython, `4611686018427387904` in Monty)
     and Monty hashes an `int` too large for an `i64` differently again. Monty's
@@ -53,15 +52,15 @@ These raise `NameError`:
     no hash randomisation), but never persist one or compare one against a
     CPython hash. `sys.hash_info` is not exposed, so the parameters CPython
     publishes are unavailable (see [sys.md](sys.md)).
-- **`repr` of a dict being mutated by its own elements** — Monty iterates the
-    live entries like CPython, but deletion compacts Monty's dense entry storage
-    where CPython leaves a tombstone in place: a key deleted from inside a user
-    `__repr__` running *during that dict's repr* shifts later entries down, so
-    the entry after the deleted one can be skipped from the output where CPython
-    would still print it. Insertions during repr match CPython (appended and
-    printed), as do list (live length, mid-repr pops truncate / appends extend),
-    `set`, `collections.deque` and `collections.Counter` (all snapshot, like
-    CPython).
+- **a set iterated while it is mutated may yield a newly added element** —
+    Monty's sets keep insertion order, so an element added during iteration is
+    appended after the cursor and gets yielded. CPython places it by hash, which
+    can put it behind the cursor and out of that walk's reach. Both engines raise
+    `RuntimeError: Set changed size during iteration` when the size changes; this
+    is only about which walk sees a same-size replacement.
+    Monty also stops a set walk once it has yielded the set's starting length,
+    where CPython keeps going: replacing each element as it is visited yields
+    every replacement in CPython but only the original elements in Monty.
 - **copying a dict or rebuilding a set re-hashes the keys** — CPython copies the
     hash table, so `d.copy()`, `dict(d)`, `{**d}`, `defaultdict.copy()`,
     `Counter.copy()`, `set(s)` and `frozenset(s)` never call a key's `__hash__`.
@@ -79,8 +78,8 @@ These raise `NameError`:
     re-compares the other candidates from scratch — extra `__eq__` calls CPython
     would not make (CPython restarts and re-compares too, but only after a resize
     or when that entry's own slot changed). An `__eq__` that adds a colliding key
-    on *every* comparison never finishes in either engine; under `max_duration`
-    Monty raises `TimeoutError`. No mutation pattern can panic or corrupt either
+    on *every* comparison never finishes in either engine; under a duration
+    limit Monty raises `TimeoutError`. No mutation pattern can panic or corrupt either
     engine.
 - **Set algebra under a mutating `__eq__`** — `-`, `&`, `^` and their method
     forms walk one of the two sets while user `__eq__` code can run. Monty
@@ -148,6 +147,8 @@ These raise `NameError`:
     all work. A count above `i64` (`bytes(2**70)`) raises the same shape of `TypeError`
     (`cannot convert 'int' object to bytes`), not CPython's
     `OverflowError: cannot fit 'int' into an index-sized integer`.
+- **`slice`** — `start`, `stop` and `step` are readable, but `slice.indices(length)` is not implemented and
+    raises `AttributeError: 'slice' object has no attribute 'indices'`.
 - **`isinstance(obj, T)`** — `T` must be a built-in type (`int`, `str`,
     `list`, ...), a built-in exception class, a sandbox-defined class (see
     [classes.md](classes.md)), a `|` union of those (see [typing.md](typing.md)),
@@ -158,9 +159,8 @@ These raise `NameError`:
     rejects negative exponents with `ValueError` instead of computing a modular
     inverse. Non-modular exponents whose result cannot be materialized raise
     `OverflowError` (see [resource_limits.md](resource_limits.md)).
-- **`pow(base, exp)` and `**` with a negative float base and a fractional
-    exponent** — gives `nan` where CPython returns a `complex` (Monty has no
-    complex type). Overflow raises `OverflowError` like CPython, always worded
+- **`pow(base, exp)` and `**` with float operands and a real result** — overflow raises
+    `OverflowError` like CPython, always worded
     `(34, 'Numerical result out of range')` (glibc's `strerror(ERANGE)`; CPython
     on macOS and Windows says `(34, 'Result too large')`), and `exc.args` is that
     text as one string rather than CPython's `(34, '...')` tuple.
@@ -174,7 +174,7 @@ These raise `NameError`:
 - **`print`** — writes via the host print callback. `file=`, `flush=` are
     not honoured; `sep=` and `end=` are.
 - **Identity of host-supplied callables** — host functions passed in as inputs
-    (`MontyObject::Function`) lose their host object identity at the sandbox
+    (`MontyObject::function(...)`) lose their host object identity at the sandbox
     boundary. Live external functions are identified by lookup name, so distinct
     host callables with the same name share `is`, equality, `id()`, and `hash()`
     results. Once the last sandbox reference is dropped, a later conversion of

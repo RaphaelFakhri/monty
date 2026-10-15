@@ -9,16 +9,18 @@
 use std::mem;
 
 use monty_types::{
-    ExcType, InvalidInputError, MontyException, MontyObject, MontyUuid, OsFunctionCall, PrintWriter, ResourceTracker,
+    CallArgs, ExcType, InvalidInputError, MontyException, MontyObject, MontyUuid, OsFunctionCall, PrintWriter,
+    ResourceTracker, SourceRange,
 };
 
 use crate::{
     asyncio::CallId,
     bytecode::{FrameExit, PendingLookupEffect, VM, VMSnapshot},
-    exception_private::{ExcTypeExt, RunError, RunResult, SimpleException},
+    exception_private::{ExcTypeExt, ExceptionRaise, RunError, RunResult, SimpleException},
     heap::{DropWithContext, Heap, HeapReader},
+    intern::StringId,
     object_bridge::MontyObjectExt,
-    os_dispatch::{PendingEffect, release_pending_effect},
+    os_dispatch::{PendingEffect, PostConversionEffect, release_pending_effect},
     run::Executor,
     value::Value,
 };
@@ -114,10 +116,8 @@ impl RunProgress {
 pub struct FunctionCall {
     /// The name of the function or method being called.
     pub function_name: String,
-    /// The positional arguments passed to the function.
-    pub args: Vec<MontyObject>,
-    /// The keyword arguments passed to the function (key, value pairs).
-    pub kwargs: Vec<(MontyObject, MontyObject)>,
+    /// The arguments: one arena holding every positional and keyword value.
+    pub args: CallArgs,
     /// Unique identifier for this call (used for async correlation).
     pub call_id: u32,
     /// Uuid of the routed receiver — an instance, or a class type (a
@@ -126,6 +126,8 @@ pub struct FunctionCall {
     pub object_id: Option<MontyUuid>,
     /// The host may await a coroutine and answer with [`Self::resume_eager`].
     pub allow_eager_await: bool,
+    /// Where the call expression is in the source.
+    pub position: SourceRange,
     /// Internal execution snapshot.
     snapshot: Snapshot,
 }
@@ -134,20 +136,20 @@ impl FunctionCall {
     /// Creates a new `FunctionCall` from its parts.
     fn new(
         function_name: String,
-        args: Vec<MontyObject>,
-        kwargs: Vec<(MontyObject, MontyObject)>,
+        args: CallArgs,
         call_id: u32,
         object_id: Option<MontyUuid>,
         allow_eager_await: bool,
+        position: SourceRange,
         snapshot: Snapshot,
     ) -> Self {
         Self {
             function_name,
             args,
-            kwargs,
             call_id,
             object_id,
             allow_eager_await,
+            position,
             snapshot,
         }
     }
@@ -178,7 +180,7 @@ impl FunctionCall {
         result: impl Into<ExtFunctionResult>,
         print: PrintWriter<'_>,
     ) -> Result<RunProgress, MontyException> {
-        self.snapshot.run(result, print)
+        self.snapshot.run(result.into(), print)
     }
 
     /// Resumes execution by pushing an `ExternalFuture` instead of a concrete value.
@@ -237,16 +239,29 @@ pub struct OsCall {
     pub function_call: OsFunctionCall,
     /// Unique identifier for this call (used for async correlation).
     pub call_id: u32,
+    /// The host may await its wait and answer with [`Self::resume_eager`].
+    /// Only ever true for `asyncio.sleep`, the one call a future may answer.
+    pub allow_eager_await: bool,
+    /// Where the call expression is in the source.
+    pub position: SourceRange,
     /// Internal execution snapshot.
     snapshot: Snapshot,
 }
 
 impl OsCall {
     /// Creates a new `OsCall` from its parts.
-    fn new(function_call: OsFunctionCall, call_id: u32, snapshot: Snapshot) -> Self {
+    fn new(
+        function_call: OsFunctionCall,
+        call_id: u32,
+        allow_eager_await: bool,
+        position: SourceRange,
+        snapshot: Snapshot,
+    ) -> Self {
         Self {
             function_call,
             call_id,
+            allow_eager_await,
+            position,
             snapshot,
         }
     }
@@ -277,6 +292,22 @@ impl OsCall {
     ) -> Result<RunProgress, MontyException> {
         let result = handler(self.function_call);
         self.snapshot.run(result, print)
+    }
+
+    /// Resumes with the wait already performed, as [`FunctionCall::resume_eager`]
+    /// does for a settled coroutine: the `await` that follows finds the sleep
+    /// settled without a `ResolveFutures` round trip. Only use when
+    /// [`Self::allow_eager_await`] is true.
+    pub fn resume_eager(
+        self,
+        result: Result<MontyObject, MontyException>,
+        print: PrintWriter<'_>,
+    ) -> Result<RunProgress, MontyException> {
+        self.snapshot.run_inner(
+            result.map_or_else(ExtFunctionResult::Error, ExtFunctionResult::Return),
+            Some(self.call_id),
+            print,
+        )
     }
 
     /// Ends the feed by raising `exc` uncatchably at the suspended call.
@@ -353,6 +384,8 @@ impl LookupScope {
 pub struct NameLookup {
     /// The name being looked up.
     pub name: String,
+    /// Where the name (or attribute access) is in the source.
+    pub position: SourceRange,
     /// Where the resolved value lands (namespace slot or instance attribute).
     scope: LookupScope,
     /// Internal execution snapshot.
@@ -361,8 +394,13 @@ pub struct NameLookup {
 
 impl NameLookup {
     /// Creates a new `NameLookup` from its parts.
-    fn new(name: String, scope: LookupScope, snapshot: Snapshot) -> Self {
-        Self { name, scope, snapshot }
+    fn new(name: String, position: SourceRange, scope: LookupScope, snapshot: Snapshot) -> Self {
+        Self {
+            name,
+            position,
+            scope,
+            snapshot,
+        }
     }
 
     /// Host identity of the receiver for a lazy attribute lookup; `None` for
@@ -404,22 +442,22 @@ impl NameLookup {
 
         let Snapshot {
             mut heap,
-            executor,
+            mut executor,
             vm_state: snapshot_vm_state,
         } = self.snapshot;
         let scope = self.scope;
         let name = self.name;
 
+        heap.tracker.on_turn_start();
         let (converted, vm_state) =
-            HeapReader::with(&mut heap, &mut (&executor, print), |reader, (executor, print)| {
+            HeapReader::with(&mut heap, &mut (&mut executor, print), |reader, (executor, print)| {
                 // Restore the VM first, then convert inside its lifetime
                 let mut vm = VM::restore(
                     snapshot_vm_state,
-                    &executor.module_code,
+                    &mut executor.tables,
+                    &executor.program,
                     reader,
-                    &executor.interns,
                     print.reborrow(),
-                    executor.vm_env(),
                 );
 
                 // Resolve the name lookup result with the VM alive
@@ -492,7 +530,7 @@ pub(crate) fn resume_lookup(
     let value = match (answer, effect) {
         (LookupAnswer::Error(err), effect) => {
             effect.drop_with(vm);
-            return vm.resume_with_exception(err);
+            return vm.resume_with_exception(import_from_error(err, name, vm));
         }
         (LookupAnswer::Value(value), Some(effect)) => effect.apply(Some(value), vm),
         (LookupAnswer::Undefined, Some(effect)) => effect.apply(None, vm),
@@ -516,10 +554,31 @@ pub(crate) fn resume_lookup(
             }
             value
         }
-        (LookupAnswer::Undefined, None) => return vm.resume_with_exception(undefined_lookup_error(scope, name)),
+        (LookupAnswer::Undefined, None) => {
+            return vm.resume_with_exception(import_from_error(undefined_lookup_error(scope, name), name, vm));
+        }
     };
     vm.push(value);
     vm.run_external()
+}
+
+/// Converts missing import attributes to `ImportError` for `from` imports or
+/// `ModuleNotFoundError` for dotted modules, matching synchronous loads.
+/// Other errors and non-import lookups pass through unchanged.
+fn import_from_error(err: RunError, name: &str, vm: &VM<'_>) -> RunError {
+    let RunError::Exc(exc) = &err else {
+        return err;
+    };
+    if exc.exc.exc_type() != ExcType::AttributeError {
+        return err;
+    }
+    if let Some(module) = vm.suspended_import_from() {
+        ExcType::cannot_import_name(name, vm.interns.get_str(module))
+    } else if let Some(path) = vm.suspended_submodule() {
+        ExcType::module_not_found_error(vm.interns.get_str(path), None)
+    } else {
+        err
+    }
 }
 
 /// Answers every lookup exit no host will serve — the non-iterative paths —
@@ -601,16 +660,25 @@ pub struct ResolveFutures {
     heap: Heap,
     /// The pending call_ids that this snapshot is waiting on.
     pending_call_ids: Vec<u32>,
+    /// Where the main task's blocked `await` is in the source.
+    position: SourceRange,
 }
 
 impl ResolveFutures {
     /// Creates a new `ResolveFutures` from its parts.
-    fn new(executor: Executor, vm_state: VMSnapshot, heap: Heap, pending_call_ids: Vec<u32>) -> Self {
+    fn new(
+        executor: Executor,
+        vm_state: VMSnapshot,
+        heap: Heap,
+        pending_call_ids: Vec<u32>,
+        position: SourceRange,
+    ) -> Self {
         Self {
             executor,
             vm_state,
             heap,
             pending_call_ids,
+            position,
         }
     }
 
@@ -618,6 +686,12 @@ impl ResolveFutures {
     #[must_use]
     pub fn pending_call_ids(&self) -> &[u32] {
         &self.pending_call_ids
+    }
+
+    /// Returns where the main task's blocked `await` is in the source.
+    #[must_use]
+    pub fn position(&self) -> &SourceRange {
+        &self.position
     }
 
     /// Returns the resource tracker while execution is suspended.
@@ -648,26 +722,26 @@ impl ResolveFutures {
     #[must_use]
     pub fn __force_gc_for_tests(self) -> Self {
         let Self {
-            executor,
+            mut executor,
             vm_state,
             mut heap,
             pending_call_ids,
+            position,
         } = self;
 
-        let vm_state = HeapReader::with(&mut heap, &mut &executor, |reader, executor| {
+        let vm_state = HeapReader::with(&mut heap, &mut executor, |reader, executor| {
             let mut vm = VM::restore(
                 vm_state,
-                &executor.module_code,
+                &mut executor.tables,
+                &executor.program,
                 reader,
-                &executor.interns,
                 PrintWriter::Stdout,
-                executor.vm_env(),
             );
             vm.__force_gc_for_tests();
             vm.snapshot()
         });
 
-        Self::new(executor, vm_state, heap, pending_call_ids)
+        Self::new(executor, vm_state, heap, pending_call_ids, position)
     }
 
     /// Number of tasks still live while this snapshot is suspended.
@@ -703,10 +777,11 @@ impl ResolveFutures {
         print: PrintWriter<'_>,
     ) -> Result<RunProgress, MontyException> {
         let Self {
-            executor,
+            mut executor,
             vm_state,
             mut heap,
             pending_call_ids,
+            ..
         } = self;
 
         // Validate that all provided call_ids are in the pending set before restoring VM.
@@ -715,16 +790,16 @@ impl ResolveFutures {
             .find(|(call_id, _)| !pending_call_ids.contains(call_id))
             .map(|(call_id, _)| *call_id);
 
+        heap.tracker.on_turn_start();
         let (converted, vm_state) =
-            HeapReader::with(&mut heap, &mut (&executor, print), |reader, (executor, print)| {
+            HeapReader::with(&mut heap, &mut (&mut executor, print), |reader, (executor, print)| {
                 // Restore the VM from the snapshot (must happen before any error return to clean up properly).
                 let mut vm = VM::restore(
                     vm_state,
-                    &executor.module_code,
+                    &mut executor.tables,
+                    &executor.program,
                     reader,
-                    &executor.interns,
                     print.reborrow(),
-                    executor.vm_env(),
                 );
 
                 // Now check for invalid call_ids after VM is restored.
@@ -783,20 +858,20 @@ impl Snapshot {
         print: PrintWriter<'_>,
     ) -> Result<RunProgress, MontyException> {
         let Self {
-            executor,
+            mut executor,
             vm_state,
             mut heap,
         } = self;
 
+        heap.tracker.on_turn_start();
         let (converted, vm_state) =
-            HeapReader::with(&mut heap, &mut (&executor, print), |reader, (executor, print)| {
+            HeapReader::with(&mut heap, &mut (&mut executor, print), |reader, (executor, print)| {
                 let mut vm = VM::restore(
                     vm_state,
-                    &executor.module_code,
+                    &mut executor.tables,
+                    &executor.program,
                     reader,
-                    &executor.interns,
                     print.reborrow(),
-                    executor.vm_env(),
                 );
 
                 let vm_result = resume_with_result(&mut vm, ext_result, eager_call_id);
@@ -838,61 +913,107 @@ pub(crate) fn resume_with_result(
     result: ExtFunctionResult,
     eager_call_id: Option<u32>,
 ) -> Result<FrameExit, RunError> {
-    if let Some(call_id) = eager_call_id {
-        vm.add_pending_call(CallId::new(call_id));
-        vm.apply_future_results(vec![(call_id, result)])?;
-        vm.run_external()
-    } else {
-        match result {
-            ExtFunctionResult::Return(obj) => vm.resume(obj),
-            ExtFunctionResult::Error(exc) => vm.resume_with_exception(exc.into()),
-            ExtFunctionResult::Future(raw_call_id) => {
-                if let Some(name) = vm
-                    .pending_effect
-                    .as_ref()
-                    .and_then(PendingEffect::immediate_result_name)
-                {
-                    vm.resume_with_exception(
-                        SimpleException::new_msg(
-                            ExcType::RuntimeError,
-                            format!("{name} cannot be answered with a future"),
-                        )
-                        .into(),
+    if let Some(module_id) = vm.suspended_import() {
+        return resume_import(vm, module_id, result, eager_call_id);
+    }
+    // An eager answer and a future both register the call's future; the
+    // eager one settles it in the same step.
+    let future_call_id = match (&result, eager_call_id) {
+        (_, Some(call_id)) => Some(call_id),
+        (ExtFunctionResult::Future(call_id), None) => Some(*call_id),
+        _ => None,
+    };
+    match (result, future_call_id) {
+        (result, Some(call_id)) => {
+            if let Some(name) = vm
+                .pending_effect
+                .as_ref()
+                .and_then(PendingEffect::immediate_result_name)
+            {
+                return vm.resume_with_exception(
+                    SimpleException::new_msg(
+                        ExcType::RuntimeError,
+                        format!("{name} cannot be answered with a future"),
                     )
-                } else {
-                    vm.add_pending_call(CallId::new(raw_call_id));
-                    vm.run_external()
+                    .into(),
+                );
+            }
+            // `asyncio.sleep` hands its result to the awaitable; no other
+            // effect survives a future answer.
+            match vm.pending_effect.take() {
+                Some(PendingEffect::Post(PostConversionEffect::SleepResult { result })) => {
+                    vm.add_pending_sleep(CallId::new(call_id), result);
+                }
+                effect => {
+                    release_pending_effect(effect, vm.heap);
+                    vm.add_pending_call(CallId::new(call_id));
                 }
             }
-            ExtFunctionResult::NotFound(function_name) => {
-                vm.resume_with_exception(ExtFunctionResult::not_found_exc(&function_name))
+            if eager_call_id.is_some() {
+                vm.apply_future_results(vec![(call_id, result)])?;
             }
+            vm.run_external()
+        }
+        (ExtFunctionResult::Return(obj), None) => vm.resume(obj),
+        (ExtFunctionResult::Error(exc), None) => vm.resume_with_exception(exc.into()),
+        (ExtFunctionResult::NotFound(function_name), None) => {
+            vm.resume_with_exception(ExtFunctionResult::not_found_exc(&function_name))
+        }
+        (ExtFunctionResult::Future(_), None) => unreachable!("a future answer always carries its call id"),
+    }
+}
+
+/// Resumes an import with the host's module value or raises its exception without carets.
+/// `NotFound` raises `ModuleNotFoundError`; futures are rejected because imports cannot await.
+fn resume_import(
+    vm: &mut VM<'_>,
+    module_id: StringId,
+    result: ExtFunctionResult,
+    eager_call_id: Option<u32>,
+) -> Result<FrameExit, RunError> {
+    match (result, eager_call_id) {
+        (ExtFunctionResult::Return(obj), None) => vm.resume(obj),
+        (ExtFunctionResult::Error(exc), None) => {
+            let mut raise = ExceptionRaise::from(exc);
+            raise.hide_caret = true;
+            vm.resume_with_exception(RunError::Exc(raise))
+        }
+        (ExtFunctionResult::NotFound(_), None) => {
+            vm.resume_with_exception(ExcType::module_not_found_error(vm.interns.get_str(module_id), None))
+        }
+        (ExtFunctionResult::Future(_), _) | (_, Some(_)) => {
+            let message = format!(
+                "import of '{}' cannot be answered with a future",
+                vm.interns.get_str(module_id)
+            );
+            vm.resume_with_exception(SimpleException::new_msg(ExcType::RuntimeError, message).into())
         }
     }
 }
 
 /// Restores the VM and aborts uncatchably, rolling back any armed OS effect.
 fn abort_restored(
-    executor: Executor,
+    mut executor: Executor,
     vm_state: VMSnapshot,
     mut heap: Heap,
     exc: MontyException,
     print: PrintWriter<'_>,
 ) -> Result<RunProgress, MontyException> {
-    let (converted, vm_state) = HeapReader::with(&mut heap, &mut (&executor, print), |reader, (executor, print)| {
-        let mut vm = VM::restore(
-            vm_state,
-            &executor.module_code,
-            reader,
-            &executor.interns,
-            print.reborrow(),
-            executor.vm_env(),
-        );
-        let vm_result = vm.abort(exc);
-        let converted = convert_frame_exit(vm_result, &mut vm);
-        let vm_state = check_snapshot_from_converted(&converted, vm);
-        (converted, vm_state)
-    });
+    heap.tracker.on_turn_start();
+    let (converted, vm_state) =
+        HeapReader::with(&mut heap, &mut (&mut executor, print), |reader, (executor, print)| {
+            let mut vm = VM::restore(
+                vm_state,
+                &mut executor.tables,
+                &executor.program,
+                reader,
+                print.reborrow(),
+            );
+            let vm_result = vm.abort(exc);
+            let converted = convert_frame_exit(vm_result, &mut vm);
+            let vm_state = check_snapshot_from_converted(&converted, vm);
+            (converted, vm_state)
+        });
     build_run_progress(converted, vm_state, executor, heap)
 }
 
@@ -927,21 +1048,33 @@ pub(crate) enum ConvertedExit {
     /// set; construction of a host class is a `__call__` method call).
     FunctionCall {
         function_name: String,
-        args: Vec<MontyObject>,
-        kwargs: Vec<(MontyObject, MontyObject)>,
+        args: CallArgs,
         call_id: u32,
         object_id: Option<MontyUuid>,
         allow_eager_await: bool,
+        /// The call expression.
+        position: SourceRange,
     },
     /// OS-level operation.
     OsCall {
         function_call: OsFunctionCall,
         call_id: u32,
+        /// See [`OsCall::allow_eager_await`].
+        allow_eager_await: bool,
+        position: SourceRange,
     },
     /// All async tasks are blocked waiting for external futures.
-    ResolveFutures(Vec<u32>),
+    ResolveFutures {
+        pending_call_ids: Vec<u32>,
+        /// The main task's blocked `await`.
+        position: SourceRange,
+    },
     /// Unresolved name lookup or lazy instance attribute lookup.
-    NameLookup { name: String, scope: LookupScope },
+    NameLookup {
+        name: String,
+        scope: LookupScope,
+        position: SourceRange,
+    },
     /// Runtime error.
     Error(RunError),
 }
@@ -959,30 +1092,33 @@ impl ConvertedExit {
 /// while the VM (and its heap/interns) are still accessible.
 pub(crate) fn convert_frame_exit(result: RunResult<FrameExit>, vm: &mut VM<'_>) -> ConvertedExit {
     // An effect still armed on arrival belongs to an OS call that was answered
-    // without consuming it — a host may reply `ExtFunctionResult::Future`,
-    // whose resume never takes it. It can never apply to whatever suspends
-    // next, so release it here rather than let it reshape an unrelated result
-    // (or leak its file pin when the next OS call overwrites the slot).
+    // without consuming it — an eager `resume_with_resolved_futures` never
+    // takes it. It can never apply to whatever suspends next, so release it
+    // here rather than let it reshape an unrelated result (or leak what it
+    // holds when the next OS call overwrites the slot).
     // Arming for *this* exit happens below, after the slot is clear.
     release_pending_effect(vm.pending_effect.take(), vm.heap);
     vm.pending_lookup_effect.take().drop_with(vm.heap);
+    // `instruction_ip` still names the opcode that suspended, so the current
+    // position is the suspending expression for every exit but `ResolveFutures`.
     match result {
-        Ok(FrameExit::Return(value)) => ConvertedExit::Complete(MontyObject::new(value, vm)),
+        Ok(FrameExit::Return(value)) => ConvertedExit::Complete(MontyObject::export(value, vm)),
         Ok(FrameExit::ExternalCall {
             function_name,
             args,
             call_id,
             ..
         }) => {
+            let position = vm.suspension_position();
             let name = function_name.into_string(vm.interns);
-            let (args_py, kwargs_py) = args.into_py_objects(vm);
+            let args = args.into_call_args(vm);
             ConvertedExit::FunctionCall {
                 function_name: name,
-                args: args_py,
-                kwargs: kwargs_py,
+                args,
                 call_id: call_id.raw(),
                 object_id: None,
                 allow_eager_await: vm.allow_eager_await(),
+                position,
             }
         }
         Ok(FrameExit::OsCall {
@@ -990,12 +1126,17 @@ pub(crate) fn convert_frame_exit(result: RunResult<FrameExit>, vm: &mut VM<'_>) 
             call_id,
             effect,
         }) => {
+            let position = vm.suspension_position();
             // The point of no return: the call is the host's, so a matching
             // `resume` is guaranteed. Every other destination drops it.
             vm.pending_effect = effect;
+            // Only a call a future may answer can be answered eagerly.
+            let allow_eager_await = OsFunctionCall::accepts_future(function_call.name()) && vm.allow_eager_await();
             ConvertedExit::OsCall {
                 function_call,
                 call_id: call_id.raw(),
+                allow_eager_await,
+                position,
             }
         }
         Ok(FrameExit::MethodCall {
@@ -1004,25 +1145,28 @@ pub(crate) fn convert_frame_exit(result: RunResult<FrameExit>, vm: &mut VM<'_>) 
             call_id,
             object_id,
         }) => {
+            let position = vm.suspension_position();
             let name = method_name.into_string(vm.interns);
-            let (args_py, kwargs_py) = args.into_py_objects(vm);
+            let args = args.into_call_args(vm);
             ConvertedExit::FunctionCall {
                 function_name: name,
-                args: args_py,
-                kwargs: kwargs_py,
+                args,
                 call_id: call_id.raw(),
                 object_id: Some(object_id),
                 allow_eager_await: vm.allow_eager_await(),
+                position,
             }
         }
-        Ok(FrameExit::ResolveFutures(pending_call_ids)) => {
-            ConvertedExit::ResolveFutures(pending_call_ids.iter().map(|id| id.raw()).collect())
-        }
+        Ok(FrameExit::ResolveFutures(pending_call_ids)) => ConvertedExit::ResolveFutures {
+            pending_call_ids: pending_call_ids.iter().map(|id| id.raw()).collect(),
+            position: vm.main_task_position(),
+        },
         Ok(FrameExit::NameLookup {
             name_id,
             namespace_slot,
             is_global,
         }) => {
+            let position = vm.suspension_position();
             let name = vm.interns.get_str(name_id).to_owned();
             ConvertedExit::NameLookup {
                 name,
@@ -1030,6 +1174,7 @@ pub(crate) fn convert_frame_exit(result: RunResult<FrameExit>, vm: &mut VM<'_>) 
                     namespace_slot,
                     is_global,
                 },
+                position,
             }
         }
         Ok(FrameExit::AttrLookup {
@@ -1039,6 +1184,7 @@ pub(crate) fn convert_frame_exit(result: RunResult<FrameExit>, vm: &mut VM<'_>) 
             type_object,
             effect,
         }) => {
+            let position = vm.suspension_position();
             // The lookup is the host's now, so a `resume` is guaranteed to
             // consume the effect (or the next `convert_frame_exit` releases it).
             vm.pending_lookup_effect = effect;
@@ -1049,6 +1195,7 @@ pub(crate) fn convert_frame_exit(result: RunResult<FrameExit>, vm: &mut VM<'_>) 
                     class_name,
                     type_object,
                 },
+                position,
             }
         }
         Err(err) => ConvertedExit::Error(err),
@@ -1092,33 +1239,49 @@ pub(crate) fn build_run_progress(
         ConvertedExit::FunctionCall {
             function_name,
             args,
-            kwargs,
             call_id,
             object_id,
             allow_eager_await,
+            position,
         } => Ok(RunProgress::FunctionCall(FunctionCall::new(
             function_name,
             args,
-            kwargs,
             call_id,
             object_id,
             allow_eager_await,
+            position,
             new_snapshot!(),
         ))),
-        ConvertedExit::OsCall { function_call, call_id } => Ok(RunProgress::OsCall(OsCall::new(
+        ConvertedExit::OsCall {
             function_call,
             call_id,
+            allow_eager_await,
+            position,
+        } => Ok(RunProgress::OsCall(OsCall::new(
+            function_call,
+            call_id,
+            allow_eager_await,
+            position,
             new_snapshot!(),
         ))),
-        ConvertedExit::ResolveFutures(pending_call_ids) => Ok(RunProgress::ResolveFutures(ResolveFutures::new(
+        ConvertedExit::ResolveFutures {
+            pending_call_ids,
+            position,
+        } => Ok(RunProgress::ResolveFutures(ResolveFutures::new(
             executor,
             vm_state.expect("snapshot should exist for ResolveFutures"),
             heap,
             pending_call_ids,
+            position,
         ))),
-        ConvertedExit::NameLookup { name, scope } => {
-            Ok(RunProgress::NameLookup(NameLookup::new(name, scope, new_snapshot!())))
+        ConvertedExit::NameLookup { name, scope, position } => Ok(RunProgress::NameLookup(NameLookup::new(
+            name,
+            position,
+            scope,
+            new_snapshot!(),
+        ))),
+        ConvertedExit::Error(err) => {
+            Err(err.into_python_exception(&executor.tables.interns, |_| Some(&*executor.program.code)))
         }
-        ConvertedExit::Error(err) => Err(err.into_python_exception(&executor.interns, |_| Some(&*executor.code))),
     }
 }

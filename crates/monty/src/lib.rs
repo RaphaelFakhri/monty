@@ -34,6 +34,7 @@ mod run;
 mod run_progress;
 mod sorting;
 mod source_map;
+mod source_nesting;
 mod str_format;
 mod string_builder;
 mod stringize;
@@ -43,12 +44,22 @@ mod virtual_path;
 
 #[cfg(feature = "ref-count-return")]
 pub use crate::run::RefCountOutput;
+/// The import names of every module the sandbox provides itself; see `SANDBOX_MODULE_NAMES` in `monty_types`.
+#[must_use]
+pub fn builtin_module_names() -> Vec<&'static str> {
+    modules::StandardLib::names().collect()
+}
+
 pub use crate::{
-    dump_format::{DUMP_VERSION, Dump, DumpError, Session, SessionRef, dump},
+    dump_format::{
+        DUMP_VERSION, Dump, DumpDecodeError, DumpEncodeError, DumpError, MIN_SUPPORTED_DUMP_VERSION, Session,
+        SessionRef, dump,
+    },
     repl::{
-        MontyRepl, ReplContinuationMode, ReplFunctionCall, ReplNameLookup, ReplOsCall, ReplProgress,
+        CheckedSource, MontyRepl, ReplContinuationMode, ReplFunctionCall, ReplNameLookup, ReplOsCall, ReplProgress,
         ReplResolveFutures, ReplStartError, detect_repl_continuation_mode,
     },
     run::MontyRun,
     run_progress::{FunctionCall, NameLookup, OsCall, ResolveFutures, RunProgress},
+    source_nesting::source_within_nesting_bound,
 };

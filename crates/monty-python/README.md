@@ -1,6 +1,6 @@
 # pydantic-monty-client
 
-Python client for the Monty sandboxed Python interpreter.
+Python client for the Monty sandbox.
 
 Most users want [`pydantic-monty`](https://pypi.org/project/pydantic-monty/)
 instead, which pulls in this package plus
@@ -42,6 +42,13 @@ if __name__ == '__main__':
 
 Host objects and classes cross the boundary through the `ClassInstance` / `ClassType` wrappers; see the
 `pydantic-monty` README.
+`external_modules` on `checkout()` maps import names to entries for every feed of the session, each either an
+`ExternalModule` or a zero-argument factory returning one; the mapping is read live and each entry validated at its
+first import, and a factory runs once, when a feed first needs it, and may be async under `AsyncMonty`.
+An `ExternalModule` copies its `attrs` dict at construction and imports as a `module` object: callables become host
+functions, nested `ExternalModule` values become importable submodules, and other values are converted normally.
+Its `id` identifies the module when it crosses back out of the sandbox.
+The optional `.pyi` source in `stubs` is requested at the first type-checked import and retained for the session.
 
 This requires the `pydantic-monty-runtime` package, which is generally
 installed as part of the `pydantic-monty` meta-package.
@@ -80,6 +87,66 @@ if __name__ == '__main__':
     asyncio.run(main())
 ```
 
+## Where a snapshot stopped
+
+Every snapshot exposes `position`, a `SourceRange` with `filename`, `start` and `end` locating the suspending
+expression: the call of a `FunctionSnapshot`, the name of a `NameLookupSnapshot`, and the `await` the main task is
+blocked on for a `FutureSnapshot`.
+`start` and `end` are UTF-8 byte offsets into the source, `end` exclusive, so slice the encoded source rather than the
+string; `filename` is the traceback filename of the source (`<python-input-N>` for the session's N-th feed, `<string>`
+inside `eval()` / `exec()`).
+
+```python
+from pydantic_monty import FunctionSnapshot, Monty
+
+with Monty() as pool:
+    with pool.checkout() as session:
+        code = 'x = 1\ny = greet(x)'
+        snapshot = session.feed_start(code)
+        assert isinstance(snapshot, FunctionSnapshot)
+        position = snapshot.position
+        print(position.start, position.end)
+        #> 10 18
+        print(code.encode()[position.start : position.end].decode())
+        #> greet(x)
+```
+
+## Tracing snapshot handlers
+
+All sync and async snapshot types provide `snapshot.trace_context()` for manual handlers.
+It returns a standard OpenTelemetry `Context`, not a context manager, and requires `opentelemetry-api` to be installed.
+Use OTel's `attach` / `detach` to activate it, including across `await` in the same task:
+
+```python
+from opentelemetry import context
+
+from pydantic_monty import FunctionSnapshot, Monty, MontyComplete
+
+with Monty() as pool:
+    with pool.checkout() as session:
+        snapshot = session.feed_start('greet(name)', inputs={'name': 'Ada'})
+        assert isinstance(snapshot, FunctionSnapshot)
+        token = context.attach(snapshot.trace_context())
+        try:
+            greeting = f'hello {snapshot.args[0]}'
+        finally:
+            context.detach(token)
+        result = snapshot.resume({'return_value': greeting})
+        assert isinstance(result, MontyComplete)
+        print(result.output)
+        #> hello Ada
+```
+
+The returned context preserves baggage and other entries captured at `feed_start` / `load_snapshot`, with the
+suspension's span when Monty tracing is enabled.
+Without Monty tracing it returns the captured context unchanged.
+Context is not serialized: restoring captures the restoring caller's context instead.
+The method does not activate the context or resume execution.
+It raises `ImportError` without `opentelemetry-api`, or `RuntimeError` after resume.
+Previously returned contexts remain usable but do not keep the suspension span open.
+`resume_auto()` already activates the suspension span around callbacks.
+See the [snapshot documentation](https://pydantic.dev/docs/monty/concepts/snapshots/).
+
 ## Restoring snapshots
 
 `session.load_session()` and `session.load_snapshot()` require unmodified snapshots from a trusted, compatible Monty producer.
@@ -100,7 +167,18 @@ Setting `cwd` does not grant filesystem access; provide `mount=` or `os=` to han
 
 `OSAccess(max_urandom_bytes=...)` sets the largest `os.urandom()` request the default handler serves, 1 MiB by default.
 Larger requests raise `MemoryError` before allocating.
-Zero rejects every nonempty request, including the 2496 bytes an unseeded `random` generator requests.
+Unseeded `random` generators request host entropy only under `os_policy={'random_start': 'call_host'}`.
+Otherwise they use worker OS entropy or the configured seed.
+
+By default, `date.today()`, `datetime.now()` and the `time` module's clocks read the worker's clock.
+`time.process_time()` reports `0.0` unless `os_policy={'process_time': 'elapsed'}` opts into the session's
+execution time.
+The pool handles `time.sleep()` and `asyncio.sleep()`, capped per call by `sleep_system_max`.
+Setting `datetime` or `sleep` to `'call_host'` in `checkout(os_policy=...)` routes those calls to `os=`.
+Every `time` module clock then reaches `AbstractOS.time(caller)` as the one OS function `time.time`, with `caller`
+naming the function that asked (`'time.monotonic'`, `'time.localtime'`, ...).
+A subclass that overrides `def time(self)` without the `caller` parameter raises `TypeError` on any clock read.
+`OSAccess` answers from the host process and caps each wait at `max_sleep`.
 
 A `random.Random` instance or the `random.Random` class returned from the sandbox converts to its repr string.
 Return the generated values or `rng.getstate()` instead.

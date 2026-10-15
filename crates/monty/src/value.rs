@@ -2,12 +2,12 @@ use std::{
     borrow::Cow,
     cmp::Ordering,
     fmt::{self, Write},
-    mem::{self, discriminant},
+    mem,
     str::FromStr,
 };
 
 use num_bigint::{BigInt, Sign};
-use num_traits::{FromPrimitive, ToPrimitive};
+use num_traits::ToPrimitive;
 use serde::de::Error as _;
 use smallvec::smallvec;
 
@@ -18,17 +18,17 @@ use crate::{
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
     expressions::CmpOperator,
     fstring::FormatFloat,
-    hash::{HashValue, hash_one, hash_python_long_int},
+    hash::{HashValue, hash_f64, hash_named, hash_one, identity_hash},
     heap::{ContainsHeap, DropWithContext, Heap, HeapData, HeapId, HeapReadOutput},
     heap_data::heap_subscript,
     identity::Identity,
     intern::{BytesId, FunctionId, Interns, LongIntId, StaticStrings, StringId},
-    modules::{ModuleFunctions, itertools::ItertoolsFunctions},
+    modules::ModuleFunctions,
     percent_format::{copy_bytes_template, percent_format, percent_format_bytes},
     resource_checks::check_pow_size,
     types::{
-        Bytes, BytesIterator, CmpOrder, GenericAlias, LazyHeapSet, LongInt, Property, PyTrait, StringIterator, Type,
-        Union,
+        Bytes, BytesIterator, CmpOrder, Complex, GenericAlias, LazyHeapSet, LongInt, Property, PyTrait, StringIterator,
+        Type, Union,
         bytes::{bytes_contains, bytes_repr_fmt, concat_bytes, get_byte_at_index, repeat_bytes},
         host_class_type,
         instance::{instance_dataclass_eq, instance_getattr, instance_str, instance_user_eq},
@@ -60,37 +60,53 @@ use crate::{
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Value {
     // Immediate values (stored inline, no heap allocation)
+    #[serde(rename = "U")]
     Undefined,
+    #[serde(rename = "E")]
     Ellipsis,
+    #[serde(rename = "N")]
     NotImplemented,
+    #[serde(rename = "O")]
     None,
+    #[serde(rename = "B")]
     Bool(bool),
+    #[serde(rename = "I")]
     Int(i64),
+    #[serde(rename = "F")]
     Float(f64),
     /// An interned string literal. The StringId references the string in the Interns table.
     /// To get the actual string content, use `interns.get(string_id)`.
+    #[serde(rename = "T")]
     InternString(StringId),
     /// An interned bytes literal. The BytesId references the bytes in the Interns table.
     /// To get the actual bytes content, use `interns.get_bytes(bytes_id)`.
+    #[serde(rename = "R")]
     InternBytes(BytesId),
     /// An interned long integer literal. The `LongIntId` references the `BigInt` in the Interns table.
     /// Used for integer literals exceeding i64 range. Converted to heap-allocated `LongInt` on load.
+    #[serde(rename = "L")]
     InternLongInt(LongIntId),
     /// A builtin function or exception type
+    #[serde(rename = "A")]
     Builtin(Builtins),
     /// A function from a module (not a global builtin).
     /// Module functions require importing a module to access (e.g., `asyncio.gather`).
+    #[serde(rename = "M")]
     ModuleFunction(ModuleFunctions),
     /// A function defined in the module (not a closure, doesn't capture any variables)
+    #[serde(rename = "D")]
     DefFunction(FunctionId),
     /// A marker value representing special objects like sys.stdout/stderr.
     /// These exist but have minimal functionality in the sandboxed environment.
+    #[serde(rename = "K")]
     Marker(Marker),
     /// A property descriptor that computes its value when accessed.
     /// When retrieved via `py_getattr`, the property's getter is invoked.
+    #[serde(rename = "P")]
     Property(Property),
 
     // Heap-allocated values (stored in arena)
+    #[serde(rename = "C")]
     Ref(HeapId),
 
     /// Sentinel value indicating this Value was properly cleaned up via `drop_with`.
@@ -98,6 +114,7 @@ pub(crate) enum Value {
     /// correctness - if a `Ref` variant is dropped without calling `drop_with`, the
     /// Drop impl will panic.
     #[cfg(feature = "memory-model-checks")]
+    #[serde(rename = "G")]
     Dereferenced,
 }
 
@@ -397,6 +414,9 @@ impl<'h> PyTrait<'h> for Value {
                 (HeapReadOutput::Str(a), HeapReadOutput::Str(b)) => {
                     Ok(CmpOrder::Ordered(a.get(vm.heap).as_str().cmp(b.get(vm.heap).as_str())))
                 }
+                (HeapReadOutput::Bytes(a), HeapReadOutput::Bytes(b)) => Ok(CmpOrder::Ordered(
+                    a.get(vm.heap).as_slice().cmp(b.get(vm.heap).as_slice()),
+                )),
                 (HeapReadOutput::Tuple(a), HeapReadOutput::Tuple(b)) => a.py_cmp(&b, vm),
                 // A namedtuple orders like the tuple it subclasses, including
                 // against a plain tuple in either direction. Both sides are
@@ -439,6 +459,13 @@ impl<'h> PyTrait<'h> for Value {
             }
             (Self::InternBytes(b1), Self::InternBytes(b2)) => {
                 Ok(CmpOrder::Ordered(interns.get_bytes(*b1).cmp(interns.get_bytes(*b2))))
+            }
+            // Cross-type bytes comparisons: interned vs heap-allocated
+            (Self::InternBytes(b1), Self::Ref(id2)) if let HeapData::Bytes(b2) = vm.heap.get(*id2) => {
+                Ok(CmpOrder::Ordered(interns.get_bytes(*b1).cmp(b2.as_slice())))
+            }
+            (Self::Ref(id1), Self::InternBytes(b2)) if let HeapData::Bytes(b1) = vm.heap.get(*id1) => {
+                Ok(CmpOrder::Ordered(b1.as_slice().cmp(interns.get_bytes(*b2))))
             }
             _ => Ok(CmpOrder::Incomparable),
         }
@@ -661,20 +688,18 @@ impl<'h> PyTrait<'h> for Value {
 
     /// One-sided implementation of Python `+`.
     fn py_add_impl(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
+        if let (Some(a), Some(b)) = (immediate_int(self), immediate_int(other)) {
+            let result = match a.checked_add(b) {
+                Some(result) => Self::Int(result),
+                None => wide_i128_into_value(i128::from(a) + i128::from(b), vm.heap),
+            };
+            return Ok(Some(result));
+        }
+        if let (Some(a), Some(b)) = (immediate_float(self), immediate_float(other)) {
+            return Ok(Some(Self::Float(a + b)));
+        }
         let interns = vm.interns;
         match (self, other) {
-            // Int + Int with overflow detection
-            (Self::Int(a), Self::Int(b)) => {
-                if let Some(result) = a.checked_add(*b) {
-                    Ok(Some(Self::Int(result)))
-                } else {
-                    Ok(Some(wide_i128_into_value(i128::from(*a) + i128::from(*b), vm.heap)))
-                }
-            }
-            (Self::Float(v1), Self::Float(v2)) => Ok(Some(Self::Float(v1 + v2))),
-            // Int + Float and Float + Int
-            (Self::Int(a), Self::Float(b)) => Ok(Some(Self::Float(*a as f64 + b))),
-            (Self::Float(a), Self::Int(b)) => Ok(Some(Self::Float(a + *b as f64))),
             (Self::InternString(s1), Self::InternString(s2)) => Ok(Some(concat_allocate_str(
                 interns.get_str(*s1),
                 interns.get_str(*s2),
@@ -709,20 +734,17 @@ impl<'h> PyTrait<'h> for Value {
 
     /// One-sided implementation of Python `-`.
     fn py_sub_impl(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
+        if let (Some(a), Some(b)) = (immediate_int(self), immediate_int(other)) {
+            let result = match a.checked_sub(b) {
+                Some(result) => Self::Int(result),
+                None => wide_i128_into_value(i128::from(a) - i128::from(b), vm.heap),
+            };
+            return Ok(Some(result));
+        }
+        if let (Some(a), Some(b)) = (immediate_float(self), immediate_float(other)) {
+            return Ok(Some(Self::Float(a - b)));
+        }
         match (self, other) {
-            // Int - Int with overflow detection
-            (Self::Int(a), Self::Int(b)) => {
-                if let Some(result) = a.checked_sub(*b) {
-                    Ok(Some(Self::Int(result)))
-                } else {
-                    Ok(Some(wide_i128_into_value(i128::from(*a) - i128::from(*b), vm.heap)))
-                }
-            }
-            // Float - Float
-            (Self::Float(a), Self::Float(b)) => Ok(Some(Self::Float(a - b))),
-            // Int - Float and Float - Int
-            (Self::Int(a), Self::Float(b)) => Ok(Some(Self::Float(*a as f64 - b))),
-            (Self::Float(a), Self::Int(b)) => Ok(Some(Self::Float(a - *b as f64))),
             (Self::Ref(id), _) => vm.heap.read(*id).py_sub_impl(other, vm),
             _ => Ok(None),
         }
@@ -933,12 +955,12 @@ impl<'h> PyTrait<'h> for Value {
                 if *b == 0.0 {
                     Err(ExcType::zero_division().into())
                 } else {
-                    Ok(Some(Self::Float((f64::from(*a) / b).floor())))
+                    Ok(Some(Self::Float(py_float_divmod(f64::from(*a), *b).0)))
                 }
             }
             (Self::Float(a), Self::Bool(b)) => {
                 if *b {
-                    Ok(Some(Self::Float(a.floor()))) // a // 1.0 = floor(a)
+                    Ok(Some(Self::Float(py_float_divmod(*a, 1.0).0)))
                 } else {
                     Err(ExcType::zero_division().into())
                 }
@@ -966,40 +988,25 @@ impl<'h> PyTrait<'h> for Value {
 
     /// One-sided implementation of Python `%`.
     fn py_mod_impl(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
+        if let (Some(a), Some(b)) = (immediate_int(self), immediate_int(other)) {
+            if b == 0 {
+                return Err(ExcType::zero_division().into());
+            }
+            let result = match a.checked_rem(b) {
+                Some(r) if r != 0 && (a < 0) != (b < 0) => r + b,
+                Some(r) => r,
+                // i64::MIN % -1 overflows, but its remainder is zero.
+                None => 0,
+            };
+            return Ok(Some(Self::Int(result)));
+        }
+        if let (Some(a), Some(b)) = (immediate_float(self), immediate_float(other)) {
+            if b == 0.0 {
+                return Err(ExcType::zero_division().into());
+            }
+            return Ok(Some(Self::Float(py_float_mod(a, b))));
+        }
         match (self, other) {
-            (Self::Int(a), Self::Int(b)) => {
-                if *b == 0 {
-                    Err(ExcType::zero_division().into())
-                } else if let Some(r) = a.checked_rem(*b) {
-                    // Python modulo: result has the same sign as divisor (b)
-                    let result = if r != 0 && (*a < 0) != (*b < 0) { r + *b } else { r };
-                    Ok(Some(Self::Int(result)))
-                } else {
-                    // Overflow - i64::MIN % -1 is 0
-                    Ok(Some(Self::Int(0)))
-                }
-            }
-            (Self::Float(v1), Self::Float(v2)) => {
-                if *v2 == 0.0 {
-                    Err(ExcType::zero_division().into())
-                } else {
-                    Ok(Some(Self::Float(py_float_mod(*v1, *v2))))
-                }
-            }
-            (Self::Float(v1), Self::Int(v2)) => {
-                if *v2 == 0 {
-                    Err(ExcType::zero_division().into())
-                } else {
-                    Ok(Some(Self::Float(py_float_mod(*v1, *v2 as f64))))
-                }
-            }
-            (Self::Int(v1), Self::Float(v2)) => {
-                if *v2 == 0.0 {
-                    Err(ExcType::zero_division().into())
-                } else {
-                    Ok(Some(Self::Float(py_float_mod(*v1 as f64, *v2))))
-                }
-            }
             // `str % args` and `bytes % args` are printf-style formatting; heap values reach it via `HeapRead`.
             (Self::InternString(id), _) => {
                 let template = copy_format_template(vm.interns.get_str(*id), &vm.heap.tracker)?;
@@ -1081,28 +1088,20 @@ impl<'h> PyTrait<'h> for Value {
                         }
                     } else {
                         // Negative exponent: CPython hands off to `float_pow`
-                        Ok(Some(Self::Float(float_pow(*base as f64, *exp as f64)?)))
+                        Ok(Some(float_pow_value(*base as f64, *exp as f64, vm.heap)?))
                     }
                 }
-                (Self::Float(base), Self::Float(exp)) => Ok(Some(Self::Float(float_pow(*base, *exp)?))),
-                (Self::Int(base), Self::Float(exp)) => Ok(Some(Self::Float(float_pow(*base as f64, *exp)?))),
-                (Self::Float(base), Self::Int(exp)) => Ok(Some(Self::Float(float_pow(*base, *exp as f64)?))),
+                (Self::Float(base), Self::Float(exp)) => Ok(Some(float_pow_value(*base, *exp, vm.heap)?)),
+                (Self::Int(base), Self::Float(exp)) => Ok(Some(float_pow_value(*base as f64, *exp, vm.heap)?)),
+                (Self::Float(base), Self::Int(exp)) => Ok(Some(float_pow_value(*base, *exp as f64, vm.heap)?)),
                 // Bool power operations (True=1, False=0)
                 (Self::Bool(base), Self::Int(exp)) => {
                     let base_int = i64::from(*base);
                     if *exp >= 0 {
-                        // Positive exponent: 1**n=1, 0**n=0 (for n>0), 0**0=1
-                        if let Ok(exp_u32) = u32::try_from(*exp) {
-                            match base_int.checked_pow(exp_u32) {
-                                Some(result) => Ok(Some(Self::Int(result))),
-                                None => Ok(Some(Self::Float((base_int as f64).powf(*exp as f64)))),
-                            }
-                        } else {
-                            Ok(Some(Self::Float((base_int as f64).powf(*exp as f64))))
-                        }
+                        Ok(Some(Self::Int(i64::from(*base || *exp == 0))))
                     } else {
                         // Negative exponent: CPython hands off to `float_pow`
-                        Ok(Some(Self::Float(float_pow(base_int as f64, *exp as f64)?)))
+                        Ok(Some(float_pow_value(base_int as f64, *exp as f64, vm.heap)?))
                     }
                 }
                 (Self::Int(base), Self::Bool(exp)) => {
@@ -1113,7 +1112,7 @@ impl<'h> PyTrait<'h> for Value {
                         Ok(Some(Self::Int(1)))
                     }
                 }
-                (Self::Bool(base), Self::Float(exp)) => Ok(Some(Self::Float(float_pow(f64::from(*base), *exp)?))),
+                (Self::Bool(base), Self::Float(exp)) => Ok(Some(float_pow_value(f64::from(*base), *exp, vm.heap)?)),
                 (Self::Float(base), Self::Bool(exp)) => {
                     // base ** True = base, base ** False = 1.0
                     if *exp {
@@ -1494,7 +1493,7 @@ impl Value {
             Self::InternBytes(_) => Type::Bytes,
             Self::Builtin(_) => Type::BuiltinFunction,
             Self::ModuleFunction(_) | Self::DefFunction(_) => Type::Function,
-            Self::Marker(_) => Type::SpecialForm,
+            Self::Marker(m) => m.py_type(),
             Self::Property(_) => Type::Property,
             Self::Ref(_) => Type::NoneType, // callers should resolve Ref via HeapData::py_type()
             #[cfg(feature = "memory-model-checks")]
@@ -1532,19 +1531,6 @@ impl Value {
                 Some(id)
             }
             _ => None,
-        }
-    }
-
-    /// Returns the module name if this value is a module, otherwise returns "<unknown>".
-    ///
-    /// Used for error messages in `from module import name` when the name doesn't exist.
-    pub fn module_name(&self, vm: &mut VM<'_>) -> String {
-        match self {
-            Self::Ref(id) => match vm.heap.get(*id) {
-                HeapData::Module(module) => vm.interns.get_str(module.name()).to_string(),
-                _ => "<unknown>".to_string(),
-            },
-            _ => "<unknown>".to_string(),
         }
     }
 
@@ -1678,43 +1664,30 @@ impl Value {
             // Bool and int hash directly as their value, and are equivalent
             Self::Bool(b) => Ok(Some(HashValue::new((*b).into()))),
             Self::Int(i) => Ok(Some(HashValue::new(i.cast_unsigned()))),
-            Self::Float(f) => {
-                // 2^63, the first power of two past i64::MAX (exactly representable).
-                const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
-                if f.fract() != 0.0 || !f.is_finite() {
-                    // Non-integral or non-finite: hash the bit representation.
-                    Ok(Some(HashValue::new(f.to_bits())))
-                } else if *f >= -TWO_POW_63 && *f < TWO_POW_63 {
-                    // Integral float in i64 range hashes as the equivalent int
-                    // (e.g. `1.0` hashes the same as `1`).
-                    #[expect(clippy::cast_possible_truncation)]
-                    Ok(Some(HashValue::new((*f as i64).cast_unsigned())))
-                } else {
-                    // Integral float outside i64 range hashes as the equivalent
-                    // big int, so an exactly-equal `float`/`int` pair (e.g.
-                    // `2.0**100 == 2**100`) preserves `hash(a) == hash(b)`.
-                    Ok(Some(hash_python_long_int(
-                        &BigInt::from_f64(*f).expect("finite f64 converts to BigInt"),
-                    )))
-                }
-            }
+            Self::Float(f) => Ok(Some(hash_f64(*f))),
             // For heap-allocated values, dispatch to the per-type `py_hash`
             // impl. Types that benefit from caching (Str/Bytes/Tuple/
             // NamedTuple/FrozenSet/Path) carry an inline `cached_hash`;
             // cheap-to-hash types recompute each call.
             Self::Ref(id) => vm.heap.read(*id).py_hash(vm),
-            // Singleton values hash by discriminant
-            Self::Undefined | Self::Ellipsis | Self::NotImplemented | Self::None => {
-                Ok(Some(hash_one(discriminant(self))))
-            }
-            Self::Builtin(b) => Ok(Some(hash_one(b))),
-            Self::ModuleFunction(mf) => Ok(Some(hash_one(mf))),
+            // Values with no heap identity hash by name, never by discriminant:
+            // dict and set entries persist their hash, so a hash tied to an
+            // enum's declaration order would break lookups in older dumps.
+            Self::Undefined => Ok(Some(hash_named("singleton", "Undefined"))),
+            Self::Ellipsis => Ok(Some(hash_named("singleton", "Ellipsis"))),
+            Self::NotImplemented => Ok(Some(hash_named("singleton", "NotImplemented"))),
+            Self::None => Ok(Some(hash_named("singleton", "None"))),
+            Self::Builtin(Builtins::Function(function)) => Ok(Some(hash_named("builtin", (*function).into()))),
+            Self::Builtin(Builtins::ExcType(exc_type)) => Ok(Some(hash_named("type", (*exc_type).into()))),
+            // an instance's class is a heap object, hashed by identity like its instances
+            Self::Builtin(Builtins::Type(Type::Instance(class_id))) => Ok(Some(identity_hash(*class_id))),
+            Self::Builtin(Builtins::Type(ty)) => Ok(Some(hash_named("type", &ty.name(vm.heap, vm.interns)))),
+            // the `Debug` form carries the module too, so `time.sleep` and `asyncio.sleep` differ
+            Self::ModuleFunction(function) => Ok(Some(hash_named("module_function", &format!("{function:?}")))),
             // Hash functions based on function ID
             Self::DefFunction(f_id) => Ok(Some(hash_one(f_id))),
-            // Markers are hashable based on their discriminant
-            Self::Marker(m) => Ok(Some(hash_one(m))),
-            // Properties are hashable based on their OS function discriminant
-            Self::Property(p) => Ok(Some(hash_one(p))),
+            Self::Marker(marker) => Ok(Some(hash_named("marker", marker.0.into()))),
+            Self::Property(property) => Ok(Some(hash_named("property", property.name()))),
             #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => panic!("Cannot access Dereferenced object"),
         }
@@ -1785,45 +1758,22 @@ impl Value {
                 if let Some(call_result) = vm.heap.read(*heap_id).py_getattr(attr, vm)? {
                     return Ok(call_result);
                 }
+                // CPython names the module, not its type, for a missing module attribute.
+                if let HeapData::Module(module) = vm.heap.get(*heap_id) {
+                    return Err(ExcType::attribute_error_module(
+                        module.name_str(vm.interns),
+                        attr.as_str(vm.interns),
+                    ));
+                }
             }
+            // Type objects (`list`, `date`, `chain`) answer for themselves:
+            // `__name__`, class constants and the members handed out as values
+            // all live with the type, including the `AttributeError`.
             Self::Builtin(Builtins::Type(t)) => {
-                // Handle type object attributes like __name__
-                let is_dunder_name = attr.static_string(vm.interns).map_or_else(
-                    || attr.as_str(vm.interns) == "__name__",
-                    |ss| ss == StaticStrings::DunderName,
-                );
-                if is_dunder_name {
-                    return Ok(CallResult::Value(allocate_string(
-                        t.dunder_name(vm.heap, vm.interns),
-                        vm.heap,
-                    )));
-                }
-                let t = *t;
-                if let Some(constant) = t.class_constant(attr, vm) {
-                    return Ok(CallResult::Value(constant));
-                }
-                // `chain.from_iterable`, the one attribute an `itertools`
-                // type carries. Handed out as a value so it can be bound and
-                // called later, not only called in place.
-                if t == Type::ItertoolsChain && attr.static_string(vm.interns) == Some(StaticStrings::FromIterable) {
-                    return Ok(CallResult::Value(Self::ModuleFunction(ModuleFunctions::Itertools(
-                        ItertoolsFunctions::ChainFromIterable,
-                    ))));
-                }
-                // `object.__setattr__` is the only member `object` carries: it
-                // exists so a class that hooks attribute writes has a way to
-                // perform one (see `limitations/classes.md`).
-                if t == Type::Object && attr.as_str(vm.interns) == "__setattr__" {
-                    return Ok(CallResult::Value(Self::Builtin(Builtins::Function(
-                        BuiltinsFunctions::ObjectSetattr,
-                    ))));
-                }
-                // CPython names the class rather than the metaclass here:
-                // `type object 'list' has no attribute 'nonexistent'`.
-                return Err(ExcType::attribute_error_type(
-                    &t.name(vm.heap, vm.interns),
-                    attr.as_str(vm.interns),
-                ));
+                return match t.class_getattr(attr, vm) {
+                    Some(value) => Ok(CallResult::Value(value)),
+                    None => Err(t.attribute_error(attr, vm)),
+                };
             }
             _ => {}
         }
@@ -2199,7 +2149,27 @@ impl Value {
     /// proper reference counting. Using `.clone()` directly will bypass reference counting
     /// and cause memory leaks or double-frees.
     #[must_use]
+    #[inline]
     pub fn clone_with_heap(&self, heap: &impl ContainsHeap) -> Self {
+        if let Self::Ref(id) = self {
+            heap.heap().inc_ref(*id);
+            Self::Ref(*id)
+        } else {
+            self.copy_immediate()
+        }
+    }
+
+    /// Copies a value that holds no heap reference, for contexts with no heap
+    /// to count against — the compiler's constant arena, which only ever holds
+    /// literals and interned ids.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `Ref`, which must go through
+    /// [`clone_with_heap`](Self::clone_with_heap) to stay refcounted.
+    #[must_use]
+    #[inline]
+    pub fn copy_immediate(&self) -> Self {
         match self {
             Self::Undefined => Self::Undefined,
             Self::Ellipsis => Self::Ellipsis,
@@ -2216,10 +2186,7 @@ impl Value {
             Self::InternLongInt(bi) => Self::InternLongInt(*bi),
             Self::Marker(m) => Self::Marker(*m),
             Self::Property(p) => Self::Property(*p),
-            Self::Ref(id) => {
-                heap.heap().inc_ref(*id);
-                Self::Ref(*id)
-            }
+            Self::Ref(_) => panic!("heap reference copied without refcounting"),
             #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => panic!("Cannot copy Dereferenced object"),
         }
@@ -2527,6 +2494,7 @@ impl EitherStr {
 ///   provide functionality in the sandboxed environment
 /// - Typing constructs from the `typing` module that are imported for type hints but
 ///   don't need runtime functionality
+/// - Stateless sentinels such as `dataclasses.MISSING`, compared only by identity
 ///
 /// Wraps a `StaticStrings` variant to leverage its string conversion capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2549,12 +2517,13 @@ impl<'de> serde::Deserialize<'de> for Marker {
 impl Marker {
     /// Returns the Python type of this marker.
     ///
-    /// System markers (stdout, stderr) are `TextIOWrapper`; the typing
-    /// markers (Any, Optional, etc.) are `_SpecialForm`. (`typing.Union` is
-    /// a real type, `Type::Union`, not a marker.)
+    /// System markers (stdout, stderr) are `TextIOWrapper`, `dataclasses.MISSING`
+    /// is `_MISSING_TYPE`, and the typing markers (Any, Optional, etc.) are
+    /// `_SpecialForm`. (`typing.Union` is a real type, `Type::Union`, not a marker.)
     pub(crate) fn py_type(self) -> Type {
         match self.0 {
             StaticStrings::Stdout | StaticStrings::Stderr => Type::TextIOWrapper,
+            StaticStrings::Missing => Type::MissingType,
             _ => Type::SpecialForm,
         }
     }
@@ -2562,12 +2531,18 @@ impl Marker {
     /// Writes the Python repr for this marker.
     ///
     /// System markers have special repr formats ("<stdout>", "<stderr>");
+    /// `dataclasses.MISSING` is a plain object, so it prints with its `id()`;
     /// typing markers are prefixed with "typing." (e.g., "typing.Any").
     pub(crate) fn py_repr_fmt(self, f: &mut impl Write) -> fmt::Result {
         let s: &'static str = self.0.into();
         match self.0 {
             StaticStrings::Stdout => f.write_str("<stdout>")?,
             StaticStrings::Stderr => f.write_str("<stderr>")?,
+            StaticStrings::Missing => write!(
+                f,
+                "<dataclasses._MISSING_TYPE object at 0x{:x}>",
+                Identity::Marker(self).encoded()
+            )?,
             _ => write!(f, "typing.{s}")?,
         }
         Ok(())
@@ -2682,7 +2657,19 @@ pub(crate) fn py_float_divmod(a: f64, b: f64) -> (f64, f64) {
     (floordiv, modulus)
 }
 
-/// Raises `base` to `exp` with CPython's `float_pow` error rules.
+/// Python `base ** exp` for real operands: [`float_pow`], except that a negative
+/// base with a fractional exponent yields a `complex` as CPython's `float_pow` does
+/// (`(-8.0) ** (1/3)`), which is why the result is a `Value` rather than an `f64`.
+pub(crate) fn float_pow_value(base: f64, exp: f64, heap: &Heap) -> RunResult<Value> {
+    if base < 0.0 && base.is_finite() && exp.is_finite() && exp.fract() != 0.0 {
+        Ok(Complex::new(base, 0.0).pow(Complex::new(exp, 0.0))?.into_value(heap))
+    } else {
+        float_pow(base, exp).map(Value::Float)
+    }
+}
+
+/// Raises `base` to `exp` with CPython's `float_pow` error rules, for callers that
+/// know the result is real; Python-level `**` goes through [`float_pow_value`].
 ///
 /// Zero to a finite negative power is `ZeroDivisionError`, and finite operands whose
 /// result overflows raise `OverflowError` where C's `pow` would set `ERANGE`. Infinite or
@@ -2765,7 +2752,10 @@ mod tests {
     use num_bigint::BigInt;
 
     use super::*;
-    use crate::{bytecode::Code, heap::HeapReader, run::VmEnv};
+    use crate::{
+        heap::HeapReader,
+        run::{Program, SessionTables},
+    };
 
     /// Creates a heap and directly allocates a LongInt with the given BigInt value.
     ///
@@ -2778,11 +2768,6 @@ mod tests {
         (heap, heap_id)
     }
 
-    /// Creates a minimal Interns for testing.
-    fn create_test_interns() -> Interns {
-        Interns::default()
-    }
-
     /// Tests that `as_index()` correctly handles a LongInt containing an i64-fitting value.
     ///
     /// This tests a defensive code path that's normally unreachable because
@@ -2793,17 +2778,10 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(BigInt::from(42));
         let value = Value::Ref(heap_id);
 
-        let mut interns = create_test_interns();
-        let code = Code::empty();
-        let result = HeapReader::with(&mut heap, &mut (&code, &mut interns), |reader, (code, interns)| {
-            let mut vm = VM::new(
-                Vec::new(),
-                code,
-                reader,
-                interns,
-                PrintWriter::Disabled,
-                VmEnv::default(),
-            );
+        let mut tables = SessionTables::default();
+        let program = Program::for_tests();
+        let result = HeapReader::with(&mut heap, &mut (&program, &mut tables), |reader, (program, tables)| {
+            let mut vm = VM::new(Vec::new(), tables, program, reader, PrintWriter::Disabled);
             value.as_index(&mut vm, Type::List)
         });
         assert_eq!(result.unwrap(), 42);
@@ -2816,17 +2794,10 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(BigInt::from(-100));
         let value = Value::Ref(heap_id);
 
-        let mut interns = create_test_interns();
-        let code = Code::empty();
-        let result = HeapReader::with(&mut heap, &mut (&code, &mut interns), |reader, (code, interns)| {
-            let mut vm = VM::new(
-                Vec::new(),
-                code,
-                reader,
-                interns,
-                PrintWriter::Disabled,
-                VmEnv::default(),
-            );
+        let mut tables = SessionTables::default();
+        let program = Program::for_tests();
+        let result = HeapReader::with(&mut heap, &mut (&program, &mut tables), |reader, (program, tables)| {
+            let mut vm = VM::new(Vec::new(), tables, program, reader, PrintWriter::Disabled);
             value.as_index(&mut vm, Type::List)
         });
         assert_eq!(result.unwrap(), -100);
@@ -2841,17 +2812,10 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(big_value);
         let value = Value::Ref(heap_id);
 
-        let mut interns = create_test_interns();
-        let code = Code::empty();
-        let result = HeapReader::with(&mut heap, &mut (&code, &mut interns), |reader, (code, interns)| {
-            let mut vm = VM::new(
-                Vec::new(),
-                code,
-                reader,
-                interns,
-                PrintWriter::Disabled,
-                VmEnv::default(),
-            );
+        let mut tables = SessionTables::default();
+        let program = Program::for_tests();
+        let result = HeapReader::with(&mut heap, &mut (&program, &mut tables), |reader, (program, tables)| {
+            let mut vm = VM::new(Vec::new(), tables, program, reader, PrintWriter::Disabled);
             value.as_index(&mut vm, Type::List)
         });
         assert!(result.is_err());
@@ -2866,17 +2830,10 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(BigInt::from(12345));
         let value = Value::Ref(heap_id);
 
-        let mut interns = create_test_interns();
-        let code = Code::empty();
-        let result = HeapReader::with(&mut heap, &mut (&code, &mut interns), |reader, (code, interns)| {
-            let mut vm = VM::new(
-                Vec::new(),
-                code,
-                reader,
-                interns,
-                PrintWriter::Disabled,
-                VmEnv::default(),
-            );
+        let mut tables = SessionTables::default();
+        let program = Program::for_tests();
+        let result = HeapReader::with(&mut heap, &mut (&program, &mut tables), |reader, (program, tables)| {
+            let mut vm = VM::new(Vec::new(), tables, program, reader, PrintWriter::Disabled);
             value.as_int(&mut vm)
         });
         assert_eq!(result.unwrap(), 12345);
@@ -2890,17 +2847,10 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(big_value);
         let value = Value::Ref(heap_id);
 
-        let mut interns = create_test_interns();
-        let code = Code::empty();
-        let result = HeapReader::with(&mut heap, &mut (&code, &mut interns), |reader, (code, interns)| {
-            let mut vm = VM::new(
-                Vec::new(),
-                code,
-                reader,
-                interns,
-                PrintWriter::Disabled,
-                VmEnv::default(),
-            );
+        let mut tables = SessionTables::default();
+        let program = Program::for_tests();
+        let result = HeapReader::with(&mut heap, &mut (&program, &mut tables), |reader, (program, tables)| {
+            let mut vm = VM::new(Vec::new(), tables, program, reader, PrintWriter::Disabled);
             value.as_int(&mut vm)
         });
         assert!(result.is_err());
@@ -2913,17 +2863,10 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(BigInt::from(i64::MAX));
         let value = Value::Ref(heap_id);
 
-        let mut interns = create_test_interns();
-        let code = Code::empty();
-        let result = HeapReader::with(&mut heap, &mut (&code, &mut interns), |reader, (code, interns)| {
-            let mut vm = VM::new(
-                Vec::new(),
-                code,
-                reader,
-                interns,
-                PrintWriter::Disabled,
-                VmEnv::default(),
-            );
+        let mut tables = SessionTables::default();
+        let program = Program::for_tests();
+        let result = HeapReader::with(&mut heap, &mut (&program, &mut tables), |reader, (program, tables)| {
+            let mut vm = VM::new(Vec::new(), tables, program, reader, PrintWriter::Disabled);
             value.as_index(&mut vm, Type::List)
         });
         assert_eq!(result.unwrap(), i64::MAX);
@@ -2936,17 +2879,10 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(BigInt::from(i64::MIN));
         let value = Value::Ref(heap_id);
 
-        let mut interns = create_test_interns();
-        let code = Code::empty();
-        let result = HeapReader::with(&mut heap, &mut (&code, &mut interns), |reader, (code, interns)| {
-            let mut vm = VM::new(
-                Vec::new(),
-                code,
-                reader,
-                interns,
-                PrintWriter::Disabled,
-                VmEnv::default(),
-            );
+        let mut tables = SessionTables::default();
+        let program = Program::for_tests();
+        let result = HeapReader::with(&mut heap, &mut (&program, &mut tables), |reader, (program, tables)| {
+            let mut vm = VM::new(Vec::new(), tables, program, reader, PrintWriter::Disabled);
             value.as_index(&mut vm, Type::List)
         });
         assert_eq!(result.unwrap(), i64::MIN);
@@ -2960,17 +2896,10 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(big_value);
         let value = Value::Ref(heap_id);
 
-        let mut interns = create_test_interns();
-        let code = Code::empty();
-        let result = HeapReader::with(&mut heap, &mut (&code, &mut interns), |reader, (code, interns)| {
-            let mut vm = VM::new(
-                Vec::new(),
-                code,
-                reader,
-                interns,
-                PrintWriter::Disabled,
-                VmEnv::default(),
-            );
+        let mut tables = SessionTables::default();
+        let program = Program::for_tests();
+        let result = HeapReader::with(&mut heap, &mut (&program, &mut tables), |reader, (program, tables)| {
+            let mut vm = VM::new(Vec::new(), tables, program, reader, PrintWriter::Disabled);
             value.as_index(&mut vm, Type::List)
         });
         assert!(result.is_err());
@@ -2984,17 +2913,10 @@ mod tests {
         let (mut heap, heap_id) = create_heap_with_longint(big_value);
         let value = Value::Ref(heap_id);
 
-        let mut interns = create_test_interns();
-        let code = Code::empty();
-        let result = HeapReader::with(&mut heap, &mut (&code, &mut interns), |reader, (code, interns)| {
-            let mut vm = VM::new(
-                Vec::new(),
-                code,
-                reader,
-                interns,
-                PrintWriter::Disabled,
-                VmEnv::default(),
-            );
+        let mut tables = SessionTables::default();
+        let program = Program::for_tests();
+        let result = HeapReader::with(&mut heap, &mut (&program, &mut tables), |reader, (program, tables)| {
+            let mut vm = VM::new(Vec::new(), tables, program, reader, PrintWriter::Disabled);
             value.as_index(&mut vm, Type::List)
         });
         assert!(result.is_err());

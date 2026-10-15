@@ -1,5 +1,3 @@
-export declare const MAX_VALUE_DEPTH: number
-
 export declare function _flushTelemetry(): Promise<void>
 
 export declare function _installTelemetry(
@@ -17,11 +15,12 @@ export interface NativeMount {
   hostPath: string
   mode?: string
   writeBytesLimit?: number
-  memoryUsageLimit: number
+  memoryUsageLimit?: number
 }
 
 export declare class NativeMountDir {
   constructor(mount: NativeMount)
+  get memoryUsageLimit(): number
   close(): void
 }
 
@@ -33,6 +32,7 @@ export declare class NativePool {
 }
 
 export declare class NativeSession {
+  readonly workerId?: number
   readonly workerPid?: number
   enter(telemetryContext?: unknown): Promise<void>
   feed(...args: unknown[]): Promise<object>

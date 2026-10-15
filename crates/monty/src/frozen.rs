@@ -11,15 +11,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     args::{ArgValues, FromArgs},
-    bytecode::{Compiler, Opcode, VM},
+    bytecode::{Opcode, VM},
     defer_drop,
     exception_private::RunResult,
     function::Function,
     heap::HeapData,
-    intern::{FunctionId, Interns, StaticStrings},
+    intern::{CompileInterns, FunctionId, Interns, StaticStrings},
     modules::ModuleFunctions,
-    parse::parse,
-    prepare::prepare,
+    name_map::NameMap,
+    run::compile_module_source,
     types::{Module, lru_cache},
     value::Value,
 };
@@ -161,24 +161,18 @@ fn frozen_interns() -> MutexGuard<'static, Interns> {
 
 /// Captures trusted source separately from user function IDs.
 fn compile_frozen_interns() -> Interns {
-    let parsed = parse(FROZEN_SOURCE, FROZEN_FILENAME).expect("frozen Python source should parse");
-    let prepared = prepare(parsed, Vec::new()).expect("frozen Python source should prepare");
-    let mut interns = prepared.interner;
-    Compiler::compile_module(
-        &prepared.nodes,
-        &mut interns,
-        &prepared.globals,
+    let mut interns = Interns::new(FROZEN_SOURCE);
+    compile_module_source(
+        FROZEN_SOURCE,
+        FROZEN_FILENAME,
+        &mut NameMap::new(),
+        CompileInterns::direct(&mut interns),
+        Vec::<String>::new(),
         CompileOptions::default(),
     )
     .expect("frozen Python source should compile");
-    assert_eq!(
-        interns.functions_len(),
-        2,
-        "frozen function table changed without updating IDs"
-    );
     let reduce = interns.get_function(FunctionId::from_index(0)).clone();
     let cache_miss = interns.get_function(FunctionId::from_index(1)).clone();
-    interns.truncate_functions(0);
     assert_eq!(
         reduce.code.bytecode().get(..REDUCE_LOOP_ENTRY),
         Some([Opcode::LoadLocal1 as u8, Opcode::GetIter as u8].as_slice()),

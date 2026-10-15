@@ -1,16 +1,34 @@
 from __future__ import annotations
 
+import asyncio
 import datetime
+import functools
+import inspect
 import os
+import time
 from abc import ABC, abstractmethod
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, Any, Callable, Literal, NamedTuple, Protocol, Sequence, TypeAlias, TypeGuard
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Coroutine,
+    Literal,
+    NamedTuple,
+    Protocol,
+    Sequence,
+    TypeAlias,
+    TypeGuard,
+)
 
 from ._monty import NOT_HANDLED, MontyFileHandle
 
 if TYPE_CHECKING:
     # Self is 3.11+, hence this
     from typing import Self
+
+    # only an annotation here; importing at runtime would be circular
+    from . import TimeCaller
 
 __all__ = (
     'OsFunction',
@@ -20,6 +38,7 @@ __all__ = (
     'CallbackFile',
     'OSAccess',
     'StatResult',
+    'ScanEntry',
     'path_from_arg',
 )
 
@@ -39,6 +58,7 @@ OsFunction = Literal[
     'Path.unlink',
     'Path.rmdir',
     'Path.iterdir',
+    'Path.scan',
     'Path.stat',
     'Path.rename',
     'Path.resolve',
@@ -48,6 +68,11 @@ OsFunction = Literal[
     'date.today',
     'datetime.now',
     'os.urandom',
+    'time.time',
+    'time.sleep',
+    'asyncio.sleep',
+    'system.sleep',
+    'system.async_sleep',
 ]
 
 MAX_URANDOM_BYTES_DEFAULT: int = 1_048_576
@@ -67,10 +92,7 @@ class StatResult(NamedTuple):
             size: File size in bytes
             mode: File permissions as octal (e.g., 0o644) or full mode with file type
             mtime: Modification time as Unix timestamp, defaults to Now.
-
         """
-        import time
-
         # If only permission bits provided (no file type), add regular file type
         if mode < 0o1000:
             mode = mode | 0o100_000
@@ -90,8 +112,6 @@ class StatResult(NamedTuple):
         Returns:
             A namedtuple with stat_result fields
         """
-        import time
-
         # If only permission bits provided (no file type), add directory type
         if mode < 0o1000:
             mode = mode | 0o040_000
@@ -130,36 +150,82 @@ class StatResult(NamedTuple):
     """time of last change"""
 
 
+_MAX_SCAN_ENTRIES = 100_000
+"""Maximum entries per default scan, including the root."""
+
+_MAX_SCAN_PATH_BYTES = 100_000_000
+"""Maximum accumulated scan path data, estimated at four bytes per character for absolute and relative paths."""
+
+
+class ScanEntry(NamedTuple):
+    """One entry of a `Path.scan` reply: what `os.DirEntry` would report for it.
+
+    `is_dir` and `is_file` follow a symlink; `is_symlink` does not.
+    """
+
+    path: str
+    """Path relative to the scanned directory, `''` for the directory itself."""
+
+    is_dir: bool
+    """The entry is, or links to, a directory."""
+
+    is_file: bool
+    """The entry is, or links to, a regular file."""
+
+    is_symlink: bool
+    """The entry itself is a symbolic link."""
+
+
 class AbstractOS(ABC):
-    """Abstract base class for implementing virtual filesystems and host OS access.
+    """Base class for virtual filesystems and host OS callbacks.
 
-    Subclass this and implement the abstract methods to provide a custom
-    filesystem and selected host-backed operations that Monty code can interact
-    with via `pathlib.Path`, `os`, `date.today()`, and `datetime.now()`.
-
-    Pass an instance to `feed_run(code, os=...)`.
+    Implement the abstract methods and pass an instance to `feed_run(code, os=...)`.
+    Clock and sleep callbacks require `os_policy` to select `'call_host'`.
     """
 
     max_urandom_bytes: int = MAX_URANDOM_BYTES_DEFAULT
     """Maximum host allocation per `urandom()` call; defaults to 1 MiB."""
 
-    def __call__(self, function_name: OsFunction, args: tuple[Any, ...], kwargs: dict[str, Any] | None = None) -> Any:
-        """Adapter used by Monty's `os=` callback surface.
+    max_sleep: float | None = 10
+    """Maximum seconds per host sleep; `None` waits the full requested time.
+    Applies to `'call_host'` sleeps and manually dispatched `feed_start` sleeps.
+    Default `'system'` sleeps use the pool's `sleep_system_max` instead."""
 
-        Monty calls `__call__` directly, so this method stays as the public
-        callable entrypoint. Override `dispatch()` when you want to customize
-        routing or return `NOT_HANDLED`.
+    def __call__(
+        self,
+        *,
+        name: OsFunction,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        is_async: bool,
+        **_future_kwargs: Any,
+    ) -> Any:
+        """The `OsHandler` entrypoint Monty calls; see `OsHandler`.
+
+        Override `dispatch()` when you want to customize routing or return
+        `NOT_HANDLED`.
 
         Returns:
             The OS operation result, or `NOT_HANDLED` to let Monty apply its
             standard unhandled-operation behavior.
         """
         try:
-            return self.dispatch(function_name, args, kwargs)
+            if _dispatch_takes_is_async(type(self)):
+                return self.dispatch(name, args, kwargs, is_async=is_async)
+            # an override with the older three-argument signature never sees
+            # `is_async`, so its sleeps block as they did before it existed
+            return self.dispatch(name, args, kwargs)
         except NotImplementedError:
             return NOT_HANDLED
 
-    def dispatch(self, function_name: OsFunction, args: tuple[Any, ...], kwargs: dict[str, Any] | None = None) -> Any:
+    def dispatch(
+        self,
+        function_name: OsFunction,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any] | None = None,
+        *,
+        is_async: bool = False,
+    ) -> Any:
         """Dispatch an OS operation to the appropriate method.
 
         This handles Monty's built-in `pathlib.Path`, `os`, and host clock
@@ -170,6 +236,7 @@ class AbstractOS(ABC):
             function_name: The OS operation being called (e.g., 'Path.exists').
             args: The arguments passed to the method.
             kwargs: The keyword arguments passed to the method.
+            is_async: Whether the caller can await a coroutine answer; see `OsHandler`.
 
         Returns:
             The result of the OS operation.
@@ -215,6 +282,8 @@ class AbstractOS(ABC):
                 return self.path_rmdir(*args)
             case 'Path.iterdir':
                 return self.path_iterdir(*args)
+            case 'Path.scan':
+                return self.path_scan(*args, **kwargs)
             case 'Path.stat':
                 return self.path_stat(*args)
             case 'Path.rename':
@@ -233,6 +302,13 @@ class AbstractOS(ABC):
                 return self.datetime_now(*args)
             case 'os.urandom':
                 return self.urandom(*args)
+            case 'time.time':
+                return self.time(*args)
+            # `feed_start` callers can dispatch system sleeps manually.
+            case 'time.sleep' | 'system.sleep':
+                return self.sleep(*args)
+            case 'asyncio.sleep' | 'system.async_sleep':
+                return self.async_sleep(*args, is_async=is_async)
             case _:  # pyright: ignore[reportUnnecessaryComparison]
                 raise NotImplementedError(f'Unknown OS function: {function_name}')
 
@@ -461,6 +537,80 @@ class AbstractOS(ABC):
         """
         raise NotImplementedError
 
+    def path_scan(
+        self,
+        path: PurePosixPath,
+        *,
+        max_depth: int | None,
+        follow_symlinks: bool,
+        pattern: list[str] | None = None,
+        case_sensitive: bool | None = None,
+        recurse_symlinks: bool = False,
+    ) -> list[ScanEntry]:
+        """Read a subtree in one call, for `os.scandir`, `os.walk`, `Path.walk` and `Path.glob`.
+
+        Return the directory itself (path `''`) and every entry down to `max_depth` levels below it
+        (`None` for the whole tree), descending into symlinked directories only when `follow_symlinks`.
+        `pattern`, `case_sensitive` and `recurse_symlinks` describe a glob and are only a hint:
+        returning entries the pattern cannot match is allowed, since Monty filters the reply itself.
+        A directory below `path` that cannot be listed reads as empty, as it does for a mount.
+        When following symlinks without a `max_depth`, the default stops 64 levels down so a link cycle ends.
+        The default also caps each scan at 100,000 entries, including the root, and 100 MB of path data
+        estimated at four bytes per character for both absolute and relative paths.
+
+        The default walks the tree with `path_iterdir()`, `path_is_dir()`, `path_is_file()` and
+        `path_is_symlink()`; override it to answer in fewer host calls.
+
+        Args:
+            path: The directory to scan; may also name a file, which is described but not listed.
+            max_depth: The deepest level to return, `None` for no limit.
+            follow_symlinks: Whether to descend into symlinked directories.
+            pattern: Glob pattern parts relative to `path`, or `None`.
+            case_sensitive: The glob's `case_sensitive` argument.
+            recurse_symlinks: Whether the glob's `**` descends into symlinked directories.
+
+        Raises:
+            FileNotFoundError: If `path` does not exist.
+            RuntimeError: If the default scan exceeds its entry or path-data limit.
+        """
+        if not (self.path_exists(path) or self.path_is_symlink(path)):
+            raise FileNotFoundError(f'[Errno 2] No such file or directory: {str(path)!r}')
+        root = self._scan_entry('', path)
+        entries = [root]
+        path_bytes = 4 * len(str(path))
+        if path_bytes > _MAX_SCAN_PATH_BYTES:
+            raise RuntimeError(f'directory scan exceeded {_MAX_SCAN_PATH_BYTES} bytes of path data')
+        stack = [(path, '', 0)] if root.is_dir else []
+        while stack:
+            directory, relative, depth = stack.pop()
+            # Following links, 64 levels bounds a symlink cycle, as a mount's path limit does.
+            limit = 64 if max_depth is None and follow_symlinks else max_depth
+            if limit is not None and depth >= limit:
+                continue
+            try:
+                children = self.path_iterdir(directory)
+            except OSError:
+                if depth == 0:
+                    raise
+                continue
+            for child in children:
+                if len(entries) >= _MAX_SCAN_ENTRIES:
+                    raise RuntimeError(f'directory scan exceeded {_MAX_SCAN_ENTRIES} entries')
+                name = PurePosixPath(child).name
+                relative_len = len(relative) + bool(relative) + len(name)
+                path_bytes += 4 * (relative_len + len(str(directory)) + 1 + len(name))
+                if path_bytes > _MAX_SCAN_PATH_BYTES:
+                    raise RuntimeError(f'directory scan exceeded {_MAX_SCAN_PATH_BYTES} bytes of path data')
+                entry = self._scan_entry(f'{relative}/{name}' if relative else name, directory / name)
+                entries.append(entry)
+                if entry.is_dir and (follow_symlinks or not entry.is_symlink):
+                    stack.append((directory / name, entry.path, depth + 1))
+        return entries
+
+    def _scan_entry(self, relative: str, path: PurePosixPath) -> ScanEntry:
+        """Describes `path` for `path_scan()` with the single-path predicates."""
+        return ScanEntry(relative, self.path_is_dir(path), self.path_is_file(path), self.path_is_symlink(path))
+
     @abstractmethod
     def path_stat(self, path: PurePosixPath) -> StatResult:
         """Get file status information.
@@ -539,19 +689,16 @@ class AbstractOS(ABC):
         raise NotImplementedError
 
     def date_today(self) -> datetime.date:
-        """Return today's date for Monty's `date.today()` host callback.
+        """Return the host's date when `os_policy` routes the clock or zone to the host.
 
-        Override this when the sandbox should observe a virtual or fixed clock.
-        The default implementation proxies to the host Python process.
+        Use `os_policy` directly to configure a fixed clock.
         """
         return datetime.date.today()
 
     def datetime_now(self, tz: datetime.tzinfo | None = None) -> datetime.datetime:
-        """Return the current datetime for Monty's `datetime.now(tz=...)` callback.
+        """Return host `datetime.now(tz)` when `os_policy` routes the clock or zone to the host.
 
-        Override this when the sandbox should observe a virtual or fixed clock.
-        The default implementation proxies to the host Python process and passes
-        any provided timezone through to `datetime.datetime.now()`.
+        Use `os_policy` directly to configure a fixed clock.
         """
         return datetime.datetime.now(tz=tz)
 
@@ -559,12 +706,68 @@ class AbstractOS(ABC):
         """Return `size` random bytes for Monty's `os.urandom(size)` host callback.
 
         Raises `MemoryError` before allocating if `size` exceeds `max_urandom_bytes`.
-        An unseeded `random` generator requests 2496 bytes on its first draw.
+        Under `random_start='call_host'`, an unseeded generator requests 2496 bytes on its first draw.
         An override that allocates host memory must apply its own limit.
         """
         if size > self.max_urandom_bytes:
             raise MemoryError(f'os.urandom() size exceeds max_urandom_bytes ({self.max_urandom_bytes})')
         return os.urandom(size)
+
+    def time(self, caller: TimeCaller = 'time.time') -> float:
+        """Return the epoch seconds for Monty's `time` module clocks.
+
+        Reached only under `os_policy={'datetime': 'call_host'}`; override it
+        alongside `date_today()` and `datetime_now()` for a virtual clock.
+        An override must accept `caller`: the dispatcher passes it positionally.
+
+        Args:
+            caller: The `time` function that asked, e.g. `'time.monotonic'`; ignore it
+                unless each clock should read differently.
+        """
+        return time.time()
+
+    def sleep(self, seconds: float) -> None:
+        """Block this thread for at most `max_sleep` seconds.
+
+        Used for `'call_host'` sleeps and manually dispatched `feed_start` system sleeps.
+        Override to scale or refuse waits, by raising or returning `NOT_HANDLED`.
+        """
+        time.sleep(self._capped(seconds))
+
+    def async_sleep(self, delay: float, *, is_async: bool) -> Coroutine[Any, Any, None] | None:
+        """Handle host-routed or manually dispatched `asyncio.sleep()`, capped by `max_sleep`.
+
+        Returns a coroutine under `AsyncMonty`, allowing gathered sleeps to overlap; otherwise blocks via `sleep()`.
+        Overrides may return `None` after waiting, or a coroutine when `is_async` (not a `Future` or `Task`).
+        The coroutine's return is ignored; the sandbox retains its `asyncio.sleep()` result argument.
+        """
+        if is_async:
+            return asyncio.sleep(self._capped(delay))
+        return self.sleep(delay)
+
+    def _capped(self, seconds: float) -> float:
+        """`seconds` cut down to `max_sleep`, when there is one.
+
+        Fails closed: a NaN cap is returned rather than the request (`min()` would keep
+        the request), so the sleep raises instead of running uncapped.
+        """
+        cap = self.max_sleep
+        return seconds if cap is None or seconds <= cap else cap
+
+
+@functools.cache
+def _dispatch_takes_is_async(cls: type[AbstractOS]) -> bool:
+    """Whether `cls.dispatch` accepts `is_async`, cached per subclass.
+
+    Overrides written against the three-argument `dispatch` predate the keyword
+    and would fail on every call if it were passed; `**kwargs` counts as taking it.
+    """
+    params = inspect.signature(cls.dispatch).parameters
+    is_async = params.get('is_async')
+    by_keyword = {inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+    return (is_async is not None and is_async.kind in by_keyword) or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
 
 
 class AbstractFile(Protocol):
@@ -822,6 +1025,7 @@ class OSAccess(AbstractOS):
         *,
         root_dir: str | PurePosixPath = '/',
         max_urandom_bytes: int = MAX_URANDOM_BYTES_DEFAULT,
+        max_sleep: float | None = 10,
     ):
         """Create a virtual filesystem with the given files.
 
@@ -835,12 +1039,17 @@ class OSAccess(AbstractOS):
                 paths in files will be prefixed with this. Default is '/'.
             max_urandom_bytes: Maximum bytes per `os.urandom()` call, defaulting to 1 MiB.
                 Zero rejects nonempty requests, including unseeded `random` draws.
+            max_sleep: Longest wait a `time.sleep()` or `asyncio.sleep()` performs,
+                in seconds (default 10); longer sleeps are cut short, `None` waits
+                the full time.
 
         Raises:
             AssertionError: If root_dir is not an absolute path.
             ValueError: If a file path conflicts with another file (e.g., trying
                 to create a file inside another file's path), or `max_urandom_bytes` is negative.
-            TypeError: If `max_urandom_bytes` is not an int (a float `nan` would disable the cap).
+                Also if `max_sleep` is negative or `nan`, either of which would disable the cap.
+            TypeError: If `max_urandom_bytes` is not an int (a float `nan` would disable the cap),
+                or `max_sleep` is not a number or `None`.
         """
         if not isinstance(max_urandom_bytes, int):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(f'max_urandom_bytes must be an int, not {type(max_urandom_bytes).__name__}')
@@ -849,6 +1058,13 @@ class OSAccess(AbstractOS):
         self.max_urandom_bytes = max_urandom_bytes
         self.files = list(files) if files else []
         self.environ = environ or {}
+        if max_sleep is not None:
+            if isinstance(max_sleep, bool) or not isinstance(max_sleep, (int, float)):  # pyright: ignore[reportUnnecessaryIsInstance]
+                raise TypeError(f'max_sleep must be a number or None, not {type(max_sleep).__name__}')
+            # `not >=` rather than `<` so `nan`, which compares false both ways, is rejected
+            if not max_sleep >= 0:
+                raise ValueError('max_sleep must be non-negative')
+        self.max_sleep = max_sleep
         # Initialize tree with root directory - / is always present
         self._tree = {'/': {}}
         root_dir = PurePosixPath(root_dir)

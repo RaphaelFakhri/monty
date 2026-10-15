@@ -3,6 +3,7 @@
 # ===
 
 import functools
+import hashlib
 import sys
 from typing import TypedDict, assert_type
 
@@ -135,6 +136,8 @@ def loop_over_dict_items(mapping: dict[str, int]) -> None:
 
 
 print(sys.missing)
+hashlib.file_digest
+hashlib.sha256('text')
 
 
 # The cached-wrapper stub names its `cache_info()` return type the way typeshed

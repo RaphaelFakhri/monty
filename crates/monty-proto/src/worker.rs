@@ -22,18 +22,24 @@ use std::{
     time::{Duration, Instant},
 };
 
-use monty::{Dump, MontyRepl, ReplProgress, ReplStartError, Session, SessionRef, dump};
-use monty_type_checking::{SourceFile, TypeChecker};
+use monty::{
+    CheckedSource, Dump, MontyRepl, ReplProgress, ReplStartError, Session, SessionRef, dump,
+    source_within_nesting_bound,
+};
+use monty_type_checking::{SourceFile, TypeCheckContext, TypeChecker, scan_imports};
 use monty_types::{
-    AssertMessageAnnotations, CompileOptions, ExcType, ExtFunctionResult, MontyException, MontyObject, OsFunctionCall,
-    PrintStream, PrintWriter, PrintWriterCallback, ResourceLimits, ResourceTracker, TypeCheckState, TypeCheckingConfig,
+    AssertMessageAnnotations, CHECKER_MODULE_NAMES, CompileOptions, ExcType, ExtFunctionResult, IMPORT_STUBS_CALL_ID,
+    ModuleStub, MontyException, MontyObject, NamedValues, OsFunctionCall, OsPolicy, PrintStream, PrintWriter,
+    PrintWriterCallback, ResourceLimits, ResourceTracker, SANDBOX_MODULE_NAMES, SOURCE_SCAN_THRESHOLD, SourceRange,
+    TypeCheckState, TypeCheckingConfig, allocate_into_baseline,
 };
 
 use super::{
-    DEFAULT_PRINT_FLUSH_INTERVAL, FrameError, FrameReader, MAX_FRAME_LEN, ProtoConvertError, WireFunctionCall,
-    check_protocol_version, exceeds_max_frame_len, exceeds_max_value_depth, future_results_from_proto, pb, write_frame,
+    BudgetVec, DEFAULT_PRINT_FLUSH_INTERVAL, FrameError, FrameReader, MAX_FRAME_LEN, ProtoConvertError,
+    WireFunctionCall, check_protocol_version, exceeds_max_frame_len, ext_result_from_proto, future_results_from_proto,
+    named_values_from_proto, os_call_from_proto, os_call_to_proto, pb, write_frame,
 };
-use crate::wire::uuid_to_pb;
+use crate::{convert::limits::micros_field, wire::uuid_to_pb};
 
 /// A sink for framed [`pb::ChildEvent`]s, decoupling the child from its
 /// transport.
@@ -168,6 +174,8 @@ pub struct SessionBudget {
     /// Maximum suspensions the host may service; enforced outside the child.
     /// `None` only when no session exists.
     pub max_suspensions: Option<usize>,
+    /// Host-enforced sleep budget; `None` when unlimited or no session exists.
+    pub max_total_sleep: Option<Duration>,
 }
 
 /// REPL session state of the child.
@@ -182,6 +190,17 @@ enum SessionState {
     /// Mid-feed, waiting for a resume request. Never holds
     /// `ReplProgress::Complete` — completion ends the turn immediately.
     Suspended(Box<ReplProgress>),
+    /// A feed awaiting host stubs before type checking.
+    AwaitingStubs(Box<PendingFeed>),
+}
+
+/// A feed held until the parent answers `import_stubs`.
+struct PendingFeed {
+    repl: Box<MontyRepl>,
+    code: String,
+    inputs: NamedValues,
+    /// Requested modules, in source order.
+    asked: Vec<String>,
 }
 
 /// All state of one protocol child: the current REPL session plus the
@@ -200,13 +219,20 @@ pub struct Child {
     /// Script name of the current session (used for error and type-check
     /// diagnostics).
     script_name: String,
-    type_checker: TypeChecker,
+    /// Built by the first type-checked feed and kept for the worker's life; what
+    /// building it allocates joins the baseline rather than that session's budget.
+    /// What its first run caches is charged to the session, as it always was.
+    type_checker: Option<TypeChecker>,
     /// `Some` when the session was created with `type_check: true`.
     type_check: Option<TypeCheckState>,
     /// How long [`ProtoPrint`] may hold buffered output, from the session's
     /// `Configure`. `Duration::ZERO` means line buffering (see the field's
     /// documentation in the schema).
     print_flush_interval: Duration,
+    /// The session's `OsPolicy` from `Configure`, applied when creating the REPL.
+    os_policy: OsPolicy,
+    /// Host module stubs received through `import_stubs` or restored by `Load`.
+    module_stubs: Vec<ModuleStub>,
 }
 
 impl Default for Child {
@@ -214,9 +240,11 @@ impl Default for Child {
         Self {
             state: SessionState::Configured(None),
             script_name: String::new(),
-            type_checker: TypeChecker::default(),
+            type_checker: None,
             type_check: None,
             print_flush_interval: DEFAULT_PRINT_FLUSH_INTERVAL,
+            os_policy: OsPolicy::default(),
+            module_stubs: Vec::new(),
         }
     }
 }
@@ -312,13 +340,12 @@ impl Child {
         };
         match (progress.as_mut(), &mut event.kind) {
             (ReplProgress::FunctionCall(call), Some(pb::child_event::Kind::FunctionCall(announced))) => {
-                call.args = mem::take(&mut announced.args);
-                call.kwargs = mem::take(&mut announced.kwargs);
+                call.args = mem::take(announced).into_call_args()?;
             }
-            (ReplProgress::OsCall(call), Some(pb::child_event::Kind::OsCall(announced))) => {
-                if let Some(announced) = announced.call.take() {
-                    call.function_call = announced.try_into()?;
-                }
+            (ReplProgress::OsCall(call), Some(pb::child_event::Kind::OsCall(announced)))
+                if announced.call.is_some() =>
+            {
+                call.function_call = os_call_from_proto(mem::take(announced))?.1;
             }
             // any other pairing is an event that borrowed nothing
             _ => {}
@@ -331,8 +358,7 @@ impl Child {
     /// A host that bounds the worker process from outside the interpreter (the
     /// subprocess shell caps its own allocator) sizes that bound from this,
     /// after every request: the budget changes when a session is configured,
-    /// restored from a dump — which brings its own limits, not the
-    /// `Configure`'s — or ended by `Reset`.
+    /// restored from a dump with limits capped by `Configure`, or ended by `Reset`.
     #[must_use]
     pub fn session_budget(&self) -> SessionBudget {
         match &self.state {
@@ -345,10 +371,16 @@ impl Child {
                 type_check: config.type_check,
                 // the wire default applies before the repl exists too
                 max_suspensions: Some(ResourceLimits::from(config.limits.unwrap_or_default()).max_suspensions),
+                max_total_sleep: config
+                    .limits
+                    .as_ref()
+                    .and_then(|limits| limits.max_total_sleep_micros)
+                    .map(Duration::from_micros),
             },
             SessionState::Configured(None) => SessionBudget::default(),
             SessionState::Ready(repl) => self.tracker_budget(repl.tracker()),
             SessionState::Suspended(progress) => self.tracker_budget(progress.tracker()),
+            SessionState::AwaitingStubs(pending) => self.tracker_budget(pending.repl.tracker()),
         }
     }
 
@@ -358,6 +390,7 @@ impl Child {
             max_memory: tracker.max_memory(),
             type_check: self.type_check.is_some(),
             max_suspensions: Some(tracker.max_suspensions()),
+            max_total_sleep: tracker.max_total_sleep(),
         }
     }
 
@@ -418,6 +451,7 @@ impl Child {
         let tracker = match &self.state {
             SessionState::Ready(repl) => repl.tracker(),
             SessionState::Suspended(progress) => progress.tracker(),
+            SessionState::AwaitingStubs(pending) => pending.repl.tracker(),
             // no repl materialized yet → no tracker to report
             SessionState::Configured(_) => return,
         };
@@ -437,6 +471,18 @@ impl Child {
             self.print_flush_interval = configure
                 .print_flush_interval_ms
                 .map_or(DEFAULT_PRINT_FLUSH_INTERVAL, |ms| Duration::from_millis(u64::from(ms)));
+            // Reject invalid settings on the Configure turn.
+            self.os_policy = match configure.os_policy.clone().map(OsPolicy::try_from) {
+                None => OsPolicy::default(),
+                Some(Ok(os_policy)) => os_policy,
+                Some(Err(err)) => return protocol_violation(&format!("invalid os_policy: {err}")),
+            };
+            // ty parses the stubs with every feed, unguarded.
+            if let Some(stubs) = &configure.type_check_stubs
+                && !source_within_nesting_bound(stubs, SOURCE_SCAN_THRESHOLD)
+            {
+                return protocol_violation("invalid type_check_stubs: Source is too deeply nested");
+            }
             self.state = SessionState::Configured(Some(Box::new(configure)));
             ok_event()
         } else {
@@ -453,7 +499,7 @@ impl Child {
         let config = match &mut self.state {
             SessionState::Configured(config) => config.take(),
             // already materialized (or mid-feed) — nothing to do here
-            SessionState::Ready(_) | SessionState::Suspended(_) => return Ok(()),
+            SessionState::Ready(_) | SessionState::Suspended(_) | SessionState::AwaitingStubs(_) => return Ok(()),
         };
         let Some(config) = config else {
             return Err(Box::new(protocol_violation("session has not been configured")));
@@ -476,6 +522,12 @@ impl Child {
             monty_version: _,
             // applied when the `Configure` arrived, so a `Load` honors it too
             print_flush_interval_ms: _,
+            // validated and stored when the `Configure` arrived
+            os_policy: _,
+            // a relay's concern; the child never stores sessions
+            persistence: _,
+            // a relay's concern; the child has no profiles
+            profile: _,
         } = *config;
         let limits = limits.unwrap_or_default().into();
         self.script_name = script_name;
@@ -483,6 +535,9 @@ impl Child {
             committed_stubs: type_check_stubs.unwrap_or_default(),
             pending_snippet: None,
             config: type_check_config,
+            committed_imports: String::new(),
+            pending_imports: String::new(),
+            asked_modules: Vec::new(),
         });
         // Missing field means an older parent; the feature defaults to on.
         let options = CompileOptions {
@@ -490,60 +545,200 @@ impl Child {
                 AssertMessageAnnotations::default,
                 AssertMessageAnnotations::from_max_bytes,
             ),
+            // Not on the wire: every host gets the default.
+            source_scan_threshold: SOURCE_SCAN_THRESHOLD,
         };
-        self.state = SessionState::Ready(Box::new(MontyRepl::new(
-            &self.script_name,
-            ResourceTracker::new(limits),
-            options,
-        )));
+        let repl = MontyRepl::new(&self.script_name, ResourceTracker::new(limits), options)
+            .with_os_policy(self.os_policy.clone());
+        self.state = SessionState::Ready(Box::new(repl));
         Ok(())
     }
 
-    /// Runs a `Feed` on the ready session: type-checks the snippet (unless
-    /// skipped), injects inputs, and drives execution to the turn-ending event.
+    /// Checks source nesting and requests missing host stubs before starting a feed.
     fn handle_repl_feed(&mut self, feed: pb::Feed, sink: &mut dyn EventSink) -> pb::ChildEvent {
         if let Err(event) = self.ensure_repl() {
             return *event;
         }
         if !matches!(self.state, SessionState::Ready(_)) {
-            // ensure_repl left it un-Ready only when mid-suspension
             return protocol_violation("Feed without a session ready for input");
         }
-        if !feed.skip_type_check
-            && let Some(event) = self.type_check_feed(&feed.code)
-        {
-            return event;
-        }
-        let inputs = match named_inputs(feed.inputs) {
+        let inputs = match named_values_from_proto(feed.inputs, feed.values) {
             Ok(inputs) => inputs,
-            Err(event) => return *event,
+            Err(err) => return protocol_violation(&format!("invalid inputs: {err}")),
         };
         let SessionState::Ready(mut repl) = mem::replace(&mut self.state, SessionState::Configured(None)) else {
             unreachable!("checked Ready above");
         };
-        // The working directory persists in the REPL (including `os.chdir`);
-        // the parent sends one only to switch it, and an older parent never does.
+        // Check nesting before the import scan, ty or the compiler parses the snippet.
+        let code = feed.code;
+        let checked = match repl.check_source(&code) {
+            Ok(checked) => checked,
+            Err(error) => {
+                self.state = SessionState::Ready(repl);
+                return error_event_from(&error);
+            }
+        };
+        // The working directory persists in the REPL (including `os.chdir`); the parent
+        // sends one only to switch it, and the switch holds whatever the feed's outcome.
         if !feed.cwd.is_empty() {
             repl.set_cwd(&feed.cwd);
         }
         // snippets fed with skip_type_check never become type-check context:
         // the caller explicitly excluded them from checking, so later snippets
         // must not be checked against their (unchecked) bindings either
-        if !feed.skip_type_check
-            && let Some(state) = &mut self.type_check
-        {
-            state.pending_snippet = Some(feed.code.clone());
+        let type_checked = !feed.skip_type_check && self.type_check.is_some();
+        if type_checked && let Some(state) = &mut self.type_check {
+            let imports = scan_imports(&code);
+            state.pending_snippet = Some(code.clone());
+            state.pending_imports = imports.prelude;
+            // Each answer is final for the session, even if it contains no stub.
+            let unasked = |name: &str| {
+                !SANDBOX_MODULE_NAMES.contains(&name)
+                    && !CHECKER_MODULE_NAMES.contains(&name)
+                    && !state.asked_modules.iter().any(|asked| asked == name)
+            };
+            if let Some(first) = imports.modules.iter().find(|module| unasked(&module.name)) {
+                let asked: Vec<String> = imports
+                    .modules
+                    .iter()
+                    .filter(|module| unasked(&module.name))
+                    .map(|module| module.name.clone())
+                    .collect();
+                let position = SourceRange::new(
+                    &repl.next_script_name(),
+                    first.range.start().to_u32(),
+                    first.range.end().to_u32(),
+                );
+                let ask = OsFunctionCall::ImportStubs(asked.clone());
+                self.state = SessionState::AwaitingStubs(Box::new(PendingFeed {
+                    repl,
+                    code,
+                    inputs,
+                    asked,
+                }));
+                return event(pb::child_event::Kind::OsCall(os_call_to_proto(
+                    IMPORT_STUBS_CALL_ID,
+                    ask,
+                    false,
+                    &position,
+                )));
+            }
+        }
+        self.start_feed(repl, checked, inputs, type_checked, sink)
+    }
+
+    /// Optionally type-checks, injects inputs and executes to the turn-ending event.
+    fn start_feed(
+        &mut self,
+        repl: Box<MontyRepl>,
+        checked: CheckedSource<'_>,
+        inputs: NamedValues,
+        type_checked: bool,
+        sink: &mut dyn EventSink,
+    ) -> pb::ChildEvent {
+        if type_checked && let Some(event) = self.type_check_feed(checked.code()) {
+            self.state = SessionState::Ready(repl);
+            self.discard_pending_snippet();
+            return event;
         }
         let mut print = ProtoPrint::new(sink, self.print_flush_interval);
-        let result = repl.feed_start(&feed.code, inputs, PrintWriter::Callback(&mut print));
-        let event = self.drive(result, &mut print);
+        let result = repl.feed_start_checked(checked, inputs, PrintWriter::Callback(&mut print));
+        let event = self.drive(result);
         print.drain();
         event
+    }
+
+    /// Records the stubs and starts the pending feed; an exception answer ends it before execution.
+    fn handle_resume_stubs(&mut self, resume: pb::ResumeCall, sink: &mut dyn EventSink) -> pb::ChildEvent {
+        if resume.call_id != IMPORT_STUBS_CALL_ID {
+            return protocol_violation(&format!(
+                "ResumeCall call_id {} does not match {IMPORT_STUBS_CALL_ID}",
+                resume.call_id
+            ));
+        }
+        let Some(wire_result) = resume.result else {
+            return protocol_violation("ResumeCall has no result");
+        };
+        let SessionState::AwaitingStubs(pending) = &self.state else {
+            unreachable!("checked by the caller");
+        };
+        let not_handled = matches!(wire_result.kind, Some(pb::ext_function_result::Kind::NotHandled(_)));
+        let result = if not_handled {
+            ExtFunctionResult::NotFound(String::new())
+        } else {
+            match ext_result_from_proto(wire_result, resume.values) {
+                Ok(result) => result,
+                Err(err) => return protocol_violation(&format!("invalid result: {err}")),
+            }
+        };
+        let stubs = match result {
+            ExtFunctionResult::Return(answer) => match stubs_from_answer(&answer, &pending.asked) {
+                Ok(stubs) => stubs,
+                Err(message) => return protocol_violation(&message),
+            },
+            ExtFunctionResult::NotFound(_) => Vec::new(),
+            ExtFunctionResult::Future(_) => {
+                return protocol_violation("import_stubs cannot be answered with a future");
+            }
+            ExtFunctionResult::Error(exc) => {
+                let SessionState::AwaitingStubs(pending) =
+                    mem::replace(&mut self.state, SessionState::Configured(None))
+                else {
+                    unreachable!("checked above");
+                };
+                return self.fail_pending_feed(*pending, &exc);
+            }
+        };
+        let SessionState::AwaitingStubs(pending) = mem::replace(&mut self.state, SessionState::Configured(None)) else {
+            unreachable!("checked above");
+        };
+        for stub in stubs {
+            if !self.module_stubs.iter().any(|known| known.module() == stub.module()) {
+                self.module_stubs.push(stub);
+            }
+        }
+        let PendingFeed {
+            repl,
+            code,
+            inputs,
+            asked,
+        } = *pending;
+        if let Some(state) = &mut self.type_check {
+            state.asked_modules.extend(asked);
+        }
+        // already found within the bound on arrival, so this cannot fail
+        let checked = match repl.check_source(&code) {
+            Ok(checked) => checked,
+            Err(error) => {
+                self.state = SessionState::Ready(repl);
+                self.discard_pending_snippet();
+                return error_event_from(&error);
+            }
+        };
+        self.start_feed(repl, checked, inputs, true, sink)
+    }
+
+    /// Returns the exception and readies the session after a feed fails before execution.
+    fn fail_pending_feed(&mut self, pending: PendingFeed, exc: &MontyException) -> pb::ChildEvent {
+        self.state = SessionState::Ready(pending.repl);
+        self.discard_pending_snippet();
+        error_event_from(exc)
+    }
+
+    /// Excludes a failed feed from later type checks.
+    fn discard_pending_snippet(&mut self) {
+        if let Some(state) = &mut self.type_check {
+            state.pending_snippet = None;
+            state.pending_imports.clear();
+        }
     }
 
     /// Answers a suspended external function or OS call with the parent's
     /// result, checking the `call_id` matches, then resumes execution.
     fn handle_resume_call(&mut self, resume: pb::ResumeCall, sink: &mut dyn EventSink) -> pb::ChildEvent {
+        if matches!(self.state, SessionState::AwaitingStubs(_)) {
+            return self.handle_resume_stubs(resume, sink);
+        }
         let expected_call_id = match &self.state {
             SessionState::Suspended(progress) => match progress.as_ref() {
                 ReplProgress::FunctionCall(call) => Some(call.call_id),
@@ -577,7 +772,7 @@ impl Child {
                 };
                 ExtFunctionResult::Error(call.function_call.on_no_handler())
             } else {
-                match wire_result.try_into() {
+                match ext_result_from_proto(wire_result, resume.values) {
                     Ok(result) => result,
                     Err(err) => return protocol_violation(&format!("invalid result: {err}")),
                 }
@@ -591,7 +786,7 @@ impl Child {
             ReplProgress::OsCall(call) => call.resume(result, PrintWriter::Callback(&mut print)),
             _ => unreachable!("checked above"),
         };
-        let event = self.drive(outcome, &mut print);
+        let event = self.drive(outcome);
         print.drain();
         event
     }
@@ -617,7 +812,7 @@ impl Child {
         };
         let mut print = ProtoPrint::new(sink, self.print_flush_interval);
         let outcome = lookup.resume(result, PrintWriter::Callback(&mut print));
-        let event = self.drive(outcome, &mut print);
+        let event = self.drive(outcome);
         print.drain();
         event
     }
@@ -628,7 +823,7 @@ impl Child {
         // Guard against a corrupt `Complete` state instead of crashing.
         let suspended = matches!(&self.state, SessionState::Suspended(progress)
             if !matches!(progress.as_ref(), ReplProgress::Complete { .. }));
-        if !suspended {
+        if !suspended && !matches!(self.state, SessionState::AwaitingStubs(_)) {
             return protocol_violation("AbortFeed without a suspended feed");
         }
         let Some(exception) = abort.exception else {
@@ -638,8 +833,11 @@ impl Child {
             Ok(exc) => exc,
             Err(err) => return protocol_violation(&format!("invalid exception: {err}")),
         };
-        let SessionState::Suspended(progress) = mem::replace(&mut self.state, SessionState::Configured(None)) else {
-            unreachable!("checked above");
+        let progress = match mem::replace(&mut self.state, SessionState::Configured(None)) {
+            SessionState::Suspended(progress) => progress,
+            // a feed held for its stubs never started, so there is nothing to unwind
+            SessionState::AwaitingStubs(pending) => return self.fail_pending_feed(*pending, &exc),
+            _ => unreachable!("checked above"),
         };
         let mut print = ProtoPrint::new(sink, self.print_flush_interval);
         let outcome = match *progress {
@@ -649,7 +847,7 @@ impl Child {
             ReplProgress::ResolveFutures(state) => state.abort(exc, PrintWriter::Callback(&mut print)),
             ReplProgress::Complete { .. } => unreachable!("checked above"),
         };
-        let event = self.drive(outcome, &mut print);
+        let event = self.drive(outcome);
         print.drain();
         event
     }
@@ -657,7 +855,7 @@ impl Child {
     /// Delivers settled futures to a `ResolveFutures` suspension, or one
     /// settled coroutine to the function call that allowed an eager reply.
     fn handle_resume_futures(&mut self, resume: pb::ResumeFutures, sink: &mut dyn EventSink) -> pb::ChildEvent {
-        let results = match future_results_from_proto(resume.results) {
+        let results = match future_results_from_proto(resume.results, resume.values) {
             Ok(results) => results,
             Err(err) => return protocol_violation(&format!("invalid results: {err}")),
         };
@@ -667,6 +865,10 @@ impl Child {
         };
         let reply = match progress.as_ref() {
             ReplProgress::FunctionCall(call) if call.allow_eager_await => match eager_result(results, call.call_id) {
+                Ok(result) => FuturesReply::Eager(result),
+                Err(message) => return protocol_violation(message),
+            },
+            ReplProgress::OsCall(call) if call.allow_eager_await => match eager_result(results, call.call_id) {
                 Ok(result) => FuturesReply::Eager(result),
                 Err(message) => return protocol_violation(message),
             },
@@ -681,12 +883,15 @@ impl Child {
             (ReplProgress::FunctionCall(call), FuturesReply::Eager(result)) => {
                 call.resume_eager(result, PrintWriter::Callback(&mut print))
             }
+            (ReplProgress::OsCall(call), FuturesReply::Eager(result)) => {
+                call.resume_eager(result, PrintWriter::Callback(&mut print))
+            }
             (ReplProgress::ResolveFutures(state), FuturesReply::Batch(results)) => {
                 state.resume(results, PrintWriter::Callback(&mut print))
             }
             _ => unreachable!("reply shaped by the suspension above"),
         };
-        let event = self.drive(outcome, &mut print);
+        let event = self.drive(outcome);
         print.drain();
         event
     }
@@ -702,10 +907,19 @@ impl Child {
         let session = match &self.state {
             SessionState::Ready(repl) => SessionRef::Idle(repl),
             SessionState::Suspended(progress) => SessionRef::Suspended(progress),
+            // the feed is not yet part of the session, so the dump could not carry it
+            SessionState::AwaitingStubs(_) => {
+                return error_event(
+                    ExcType::RuntimeError,
+                    "cannot dump while a feed awaits its module stubs",
+                );
+            }
             SessionState::Configured(_) => unreachable!("ensure_repl materialized the repl or errored"),
         };
-        match dump(&self.script_name, self.type_check.as_ref(), session) {
-            Ok(state) => event(pb::child_event::Kind::DumpResult(pb::DumpResult { state })),
+        match dump(&self.script_name, self.type_check.as_ref(), &self.module_stubs, session) {
+            Ok(state) => event(pb::child_event::Kind::DumpResult(pb::DumpResult {
+                state: state.into(),
+            })),
             Err(err) => protocol_violation(&format!("dump failed: {err}")),
         }
     }
@@ -720,9 +934,12 @@ impl Child {
     /// session), the repl exists and `Load` is rejected rather than silently
     /// discarding it.
     fn handle_load(&mut self, load: &pb::Load) -> pb::ChildEvent {
-        if !matches!(self.state, SessionState::Configured(_)) {
-            return protocol_violation("Load requires a session that has not started (a feed has already run)");
-        }
+        let limits = match &self.state {
+            SessionState::Configured(config) => {
+                ResourceLimits::from(config.as_ref().and_then(|config| config.limits).unwrap_or_default())
+            }
+            _ => return protocol_violation("Load requires a session that has not started (a feed has already run)"),
+        };
         let restored = match Dump::load(&load.state) {
             Ok(restored) => restored,
             Err(err) => return protocol_violation(&format!("failed to load session: {err}")),
@@ -730,9 +947,16 @@ impl Child {
         let Dump {
             script_name,
             type_check,
-            state,
+            module_stubs,
+            mut state,
         } = restored;
-        // In-process Rust producers can dump values exceeding the wire limits;
+        // Retain snapshot clocks and stricter limits across both idle and suspended restores.
+        match &mut state {
+            Session::Idle(repl) => repl.tracker_mut().tighten_limits(&limits),
+            Session::Suspended(progress) => progress.tracker_mut().tighten_limits(&limits),
+            Session::Running(_) => {}
+        }
+        // In-process Rust producers can dump suspensions exceeding the wire size limit;
         // check transport compatibility even though snapshot integrity is the host's responsibility.
         let mut event = match state {
             Session::Idle(repl) => {
@@ -746,26 +970,18 @@ impl Child {
                 // The public Rust dump API can serialize Complete, even though
                 // this worker only dumps idle or suspended sessions.
                 ReplProgress::Complete { repl, value } => {
-                    if exceeds_max_value_depth(&value) {
-                        protocol_violation("dump value exceeds the maximum wire depth")
-                    } else {
-                        self.state = SessionState::Ready(Box::new(repl));
-                        complete_event(value)
-                    }
+                    self.state = SessionState::Ready(Box::new(repl));
+                    complete_event(value)
                 }
                 mut progress => {
-                    if suspension_args_too_deep(&progress) {
-                        protocol_violation("dump suspension arguments exceed the maximum wire depth")
+                    let mut event = suspension_event(&mut progress);
+                    // size-checked with the stamps `handle` sends it with
+                    stamp_budget(&mut event, progress.tracker());
+                    if let Some(message) = oversize_suspension_error_message(&event) {
+                        protocol_violation(&message)
                     } else {
-                        let mut event = suspension_event(&mut progress);
-                        // size-checked with the stamps `handle` sends it with
-                        stamp_budget(&mut event, progress.tracker());
-                        if let Some(message) = oversize_suspension_error_message(&event) {
-                            protocol_violation(&message)
-                        } else {
-                            self.state = SessionState::Suspended(Box::new(progress));
-                            event
-                        }
+                        self.state = SessionState::Suspended(Box::new(progress));
+                        event
                     }
                 }
             },
@@ -776,89 +992,75 @@ impl Child {
         // name so the parent can report it without parsing the opaque dump.
         if matches!(self.state, SessionState::Ready(_) | SessionState::Suspended(_)) {
             self.script_name = script_name;
+            // the dump's stubs, not this worker's `Configure`: the session was checked against them
+            self.module_stubs = module_stubs;
             self.type_check = type_check;
             event.restored_script_name = Some(self.script_name.clone());
         }
         event
     }
 
-    /// Drives execution until it needs the parent, returning the turn-ending
-    /// event. Every OS call surfaces to the parent — the child performs no
-    /// filesystem I/O (mounts are serviced parent-side).
-    fn drive(
-        &mut self,
-        mut result: Result<ReplProgress, Box<ReplStartError>>,
-        print: &mut ProtoPrint,
-    ) -> pb::ChildEvent {
-        loop {
-            match result {
-                Ok(ReplProgress::Complete { repl, value }) => {
-                    self.state = SessionState::Ready(Box::new(repl));
-                    if let Some(state) = &mut self.type_check
-                        && let Some(snippet) = state.pending_snippet.take()
-                    {
-                        state.committed_stubs.push('\n');
-                        state.committed_stubs.push_str(&snippet);
+    /// Runs until a turn-ending event. OS calls not answered by `OsPolicy`
+    /// go to the parent, including all filesystem I/O.
+    fn drive(&mut self, result: Result<ReplProgress, Box<ReplStartError>>) -> pb::ChildEvent {
+        match result {
+            Ok(ReplProgress::Complete { repl, value }) => {
+                self.state = SessionState::Ready(Box::new(repl));
+                if let Some(state) = &mut self.type_check
+                    && let Some(snippet) = state.pending_snippet.take()
+                {
+                    // The stubs' star import does not re-export imports. Keep them separately,
+                    // deduplicated and ordered so the latest binding wins.
+                    let imports = mem::take(&mut state.pending_imports);
+                    let mut committed: Vec<&str> = state.committed_imports.lines().collect();
+                    for import in imports.lines() {
+                        committed.retain(|line| *line != import);
+                        committed.push(import);
                     }
-                    // a value too deep for the wire must fail cleanly here —
-                    // shipping it would be an undecodable frame, which the
-                    // parent has to treat as a worker crash
-                    if exceeds_max_value_depth(&value) {
-                        return error_event(ExcType::RuntimeError, "Max output depth exceeded");
+                    let mut joined = committed.join("\n");
+                    if !joined.is_empty() {
+                        joined.push('\n');
                     }
-                    return complete_event(value);
+                    state.committed_imports = joined;
+                    state.committed_stubs.push('\n');
+                    state.committed_stubs.push_str(&snippet);
                 }
-                Ok(ReplProgress::OsCall(mut call)) => {
-                    if os_call_args_too_deep(&call) {
-                        let err =
-                            MontyException::new(ExcType::RuntimeError, Some("Max argument depth exceeded".to_owned()));
-                        result = call.resume(ExtFunctionResult::Error(err), PrintWriter::Callback(print));
-                        continue;
-                    }
-                    let mut event = suspension_event_os_call(&mut call);
-                    let progress = ReplProgress::OsCall(call);
-                    // stamped before the size check, so the frame measured is
-                    // the frame `handle` sends
-                    stamp_budget(&mut event, progress.tracker());
-                    if let Some(message) = oversize_suspension_error_message(&event) {
-                        return self.abort_feed_with_runtime_error(progress.into_repl(), &message);
-                    }
+                complete_event(value)
+            }
+            Ok(ReplProgress::OsCall(mut call)) => {
+                let mut event = suspension_event_os_call(&mut call);
+                let progress = ReplProgress::OsCall(call);
+                // stamped before the size check, so the frame measured is
+                // the frame `handle` sends
+                stamp_budget(&mut event, progress.tracker());
+                if let Some(message) = oversize_suspension_error_message(&event) {
+                    self.abort_feed_with_runtime_error(progress.into_repl(), &message)
+                } else {
                     self.state = SessionState::Suspended(Box::new(progress));
-                    return event;
+                    event
                 }
-                Ok(ReplProgress::FunctionCall(mut call)) => {
-                    // arguments too deep for the wire resume the call with a
-                    // catchable error instead of corrupting the protocol
-                    if function_call_args_too_deep(&call) {
-                        let err =
-                            MontyException::new(ExcType::RuntimeError, Some("Max argument depth exceeded".to_owned()));
-                        result = call.resume(ExtFunctionResult::Error(err), PrintWriter::Callback(print));
-                        continue;
-                    }
-                    let mut event = suspension_event_function_call(&mut call);
-                    let progress = ReplProgress::FunctionCall(call);
-                    stamp_budget(&mut event, progress.tracker());
-                    if let Some(message) = oversize_suspension_error_message(&event) {
-                        return self.abort_feed_with_runtime_error(progress.into_repl(), &message);
-                    }
+            }
+            Ok(ReplProgress::FunctionCall(mut call)) => {
+                let mut event = suspension_event_function_call(&mut call);
+                let progress = ReplProgress::FunctionCall(call);
+                stamp_budget(&mut event, progress.tracker());
+                if let Some(message) = oversize_suspension_error_message(&event) {
+                    self.abort_feed_with_runtime_error(progress.into_repl(), &message)
+                } else {
                     self.state = SessionState::Suspended(Box::new(progress));
-                    return event;
+                    event
                 }
-                Ok(mut progress) => {
-                    let event = suspension_event(&mut progress);
-                    self.state = SessionState::Suspended(Box::new(progress));
-                    return event;
-                }
-                Err(err) => {
-                    // Python-level failure: the session always survives
-                    self.state = SessionState::Ready(Box::new(err.repl));
-                    if let Some(state) = &mut self.type_check {
-                        state.pending_snippet = None;
-                    }
-                    return event(pb::child_event::Kind::Error(pb::Error {
-                        exception: Some((&err.error).into()),
-                    }));
-                }
+            }
+            Ok(mut progress) => {
+                let event = suspension_event(&mut progress);
+                self.state = SessionState::Suspended(Box::new(progress));
+                event
+            }
+            Err(err) => {
+                // Python-level failure: the session always survives
+                self.state = SessionState::Ready(Box::new(err.repl));
+                self.discard_pending_snippet();
+                error_event_from(&err.error)
             }
         }
     }
@@ -866,23 +1068,24 @@ impl Child {
     /// Ends the current feed with a runtime error while keeping the REPL usable.
     fn abort_feed_with_runtime_error(&mut self, repl: MontyRepl, message: &str) -> pb::ChildEvent {
         self.state = SessionState::Ready(Box::new(repl));
-        if let Some(state) = &mut self.type_check {
-            state.pending_snippet = None;
-        }
+        self.discard_pending_snippet();
         error_event(ExcType::RuntimeError, message)
     }
 
-    /// Type-checks a snippet against the accumulated session stubs. Returns
-    /// the turn-ending event if the check fails (or errors), `None` to
-    /// proceed with execution.
+    /// Checks against accumulated stubs and imports, returning an event on failure.
     fn type_check_feed(&mut self, code: &str) -> Option<pb::ChildEvent> {
         let state = self.type_check.as_ref()?;
         let stubs =
             (!state.committed_stubs.is_empty()).then(|| SourceFile::new(&state.committed_stubs, "repl_type_stubs.pyi"));
-        match self
+        let context = TypeCheckContext {
+            stubs: stubs.as_ref(),
+            module_stubs: &self.module_stubs,
+            prelude: &state.committed_imports,
+        };
+        let type_checker = self
             .type_checker
-            .run(&SourceFile::new(code, &self.script_name), stubs.as_ref(), state.config)
-        {
+            .get_or_insert_with(|| allocate_into_baseline(TypeChecker::default));
+        match type_checker.run_with(&SourceFile::new(code, &self.script_name), &context, state.config) {
             Ok(None) => None,
             Ok(Some(diagnostics)) => Some(event(pb::child_event::Kind::TypingError(pb::TypingError {
                 diagnostics: diagnostics.to_string(),
@@ -901,7 +1104,9 @@ impl Child {
         self.type_check = None;
         self.script_name = String::new();
         self.print_flush_interval = DEFAULT_PRINT_FLUSH_INTERVAL;
-        self.type_checker.reset()
+        self.os_policy = OsPolicy::default();
+        self.module_stubs = Vec::new();
+        self.type_checker.as_mut().map_or(Ok(()), TypeChecker::reset)
     }
 }
 
@@ -927,7 +1132,7 @@ pub fn protocol_violation(message: &str) -> pb::ChildEvent {
         exception: Some(pb::RaisedException {
             exc_type: ExcType::RuntimeError.to_string(),
             message: Some(format!("protocol violation: {message}")),
-            traceback: vec![],
+            traceback: BudgetVec::new(),
             data: None,
         }),
     }))
@@ -955,10 +1160,43 @@ fn error_event(exc_type: ExcType, message: &str) -> pb::ChildEvent {
         exception: Some(pb::RaisedException {
             exc_type: exc_type.to_string(),
             message: Some(message.to_owned()),
-            traceback: vec![],
+            traceback: BudgetVec::new(),
             data: None,
         }),
     }))
+}
+
+/// Preserves the exception's traceback in the error event.
+fn error_event_from(exc: &MontyException) -> pb::ChildEvent {
+    event(pb::child_event::Kind::Error(pb::Error {
+        exception: Some(exc.into()),
+    }))
+}
+
+/// Validates a dict of dotted module paths to `.pyi` source or `None`.
+/// Paths must belong to a requested module; errors are protocol-violation messages.
+fn stubs_from_answer(answer: &MontyObject, asked: &[String]) -> Result<Vec<ModuleStub>, String> {
+    let answer = answer.as_ref();
+    let pairs = match answer.pairs() {
+        Some(pairs) if answer.type_name() == "dict" => pairs,
+        _ => return Err("import_stubs must be answered with a dict of module to stub source".to_owned()),
+    };
+    let mut stubs = Vec::new();
+    for (key, value) in pairs {
+        let Some(module) = key.as_str() else {
+            return Err("import_stubs answer keys must be module names".to_owned());
+        };
+        let top_level = module.split('.').next().unwrap_or_default();
+        if !asked.iter().any(|name| name == top_level) {
+            return Err(format!("import_stubs answered for {module:?}, which was not asked for"));
+        }
+        if let Some(source) = value.as_str() {
+            stubs.push(ModuleStub::new(module, source).map_err(|err| format!("import_stubs: {err}"))?);
+        } else if value.type_name() != "NoneType" {
+            return Err(format!("import_stubs answer for {module:?} must be a str or None"));
+        }
+    }
+    Ok(stubs)
 }
 
 /// Stamps `tracker`'s timing and parent-enforced limits onto an event. Called
@@ -966,9 +1204,10 @@ fn error_event(exc_type: ExcType, message: &str) -> pb::ChildEvent {
 /// is size-checked with the stamps it will carry.
 fn stamp_budget(event: &mut pb::ChildEvent, tracker: &ResourceTracker) {
     event.total_execution_micros = u64::try_from(tracker.elapsed().as_micros()).unwrap_or(u64::MAX);
-    event.max_duration_micros = tracker
-        .max_duration()
-        .map(|max| u64::try_from(max.as_micros()).unwrap_or(u64::MAX));
+    event.feed_execution_micros = u64::try_from(tracker.feed_elapsed().as_micros()).unwrap_or(u64::MAX);
+    event.max_feed_duration_micros = micros_field(tracker.max_feed_duration());
+    event.max_turn_duration_micros = micros_field(tracker.max_turn_duration());
+    event.max_total_sleep_micros = micros_field(tracker.max_total_sleep());
     event.max_suspensions = Some(tracker.max_suspensions() as u64);
 }
 
@@ -982,8 +1221,8 @@ fn oversize_suspension_error_message(event: &pb::ChildEvent) -> Option<String> {
         .map(|len| format!("argument frame of {len} bytes exceeds the maximum of {MAX_FRAME_LEN} bytes"))
 }
 
-/// Builds the suspension event for a `FunctionCall` (depth-checked by the
-/// caller), **moving** the arguments into it.
+/// Builds the suspension event for a `FunctionCall`, **moving** the
+/// arguments into it.
 ///
 /// The suspension keeps its args — a `Dump` of the suspended state (and its
 /// replay on `Load`) needs them — so they come back via
@@ -994,67 +1233,38 @@ fn oversize_suspension_error_message(event: &pb::ChildEvent) -> Option<String> {
 /// encode buffer, is what used to push a large host-call argument past the
 /// session's memory limit.
 fn suspension_event_function_call(call: &mut monty::ReplFunctionCall) -> pb::ChildEvent {
-    event(pb::child_event::Kind::FunctionCall(WireFunctionCall {
-        function_name: call.function_name.clone(),
-        args: mem::take(&mut call.args),
-        kwargs: mem::take(&mut call.kwargs),
-        call_id: call.call_id,
-        object_id: call.object_id,
-        allow_eager_await: call.allow_eager_await,
-    }))
+    event(pb::child_event::Kind::FunctionCall(WireFunctionCall::new(
+        call.function_name.clone(),
+        mem::take(&mut call.args),
+        call.call_id,
+        call.object_id,
+        call.allow_eager_await,
+        call.position.clone(),
+    )))
 }
 
-/// Builds the suspension event for an `OsCall` (depth-checked by the caller),
-/// **moving** the call payload into it — see
+/// Builds the suspension event for an `OsCall`, **moving** the call payload
+/// into it — see
 /// [`suspension_event_function_call`] for why, and
 /// [`Child::reclaim_suspension_payload`] for how it comes back. `GetEnviron` is
 /// the placeholder left behind: a unit variant, so the swap allocates nothing.
 fn suspension_event_os_call(call: &mut monty::ReplOsCall) -> pb::ChildEvent {
     let function_call = mem::replace(&mut call.function_call, OsFunctionCall::GetEnviron);
-    event(pb::child_event::Kind::OsCall(pb::OsCall {
-        call_id: call.call_id,
-        call: Some(function_call.into()),
-    }))
+    event(pb::child_event::Kind::OsCall(os_call_to_proto(
+        call.call_id,
+        function_call,
+        call.allow_eager_await,
+        &call.position,
+    )))
 }
 
 fn complete_event(value: MontyObject) -> pb::ChildEvent {
-    event(pb::child_event::Kind::Complete(pb::Complete {
-        value: Some(value.into()),
-    }))
-}
-
-/// Whether a suspension's argument payload nests too deeply for the wire —
-/// used by `drive` and `handle_load`, including dumps from in-process Rust producers.
-fn suspension_args_too_deep(progress: &ReplProgress) -> bool {
-    match progress {
-        ReplProgress::FunctionCall(call) => function_call_args_too_deep(call),
-        ReplProgress::OsCall(call) => os_call_args_too_deep(call),
-        // name lookups / future resolutions carry no sandbox values
-        _ => false,
-    }
-}
-
-/// Whether an external call's args/kwargs nest too deeply for the wire.
-fn function_call_args_too_deep(call: &monty::ReplFunctionCall) -> bool {
-    call.args.iter().any(exceeds_max_value_depth)
-        || call
-            .kwargs
-            .iter()
-            .any(|(k, v)| exceeds_max_value_depth(k) || exceeds_max_value_depth(v))
-}
-
-/// Whether an OS call's payload nests too deeply for the wire — only
-/// `os.getenv`'s default carries an arbitrary (nestable) sandbox value.
-fn os_call_args_too_deep(call: &monty::ReplOsCall) -> bool {
-    match &call.function_call {
-        OsFunctionCall::Getenv(args) => exceeds_max_value_depth(&args.default),
-        _ => false,
-    }
+    event(pb::child_event::Kind::Complete(value.into()))
 }
 
 /// Builds the suspension event for a non-`Complete` progress state. Used on
 /// `Load` to re-announce a restored suspension; fresh suspensions go through
-/// `drive`, which adds depth/oversize checks before delegating to the same
+/// `drive`, which adds the oversize check before delegating to the same
 /// per-variant builders.
 fn suspension_event(progress: &mut ReplProgress) -> pb::ChildEvent {
     match progress {
@@ -1063,33 +1273,19 @@ fn suspension_event(progress: &mut ReplProgress) -> pb::ChildEvent {
         ReplProgress::NameLookup(lookup) => event(pb::child_event::Kind::NameLookup(pb::NameLookup {
             name: lookup.name.clone(),
             object_id: lookup.object_id().as_ref().map(uuid_to_pb),
+            position: Some((&lookup.position).into()),
         })),
         ReplProgress::ResolveFutures(state) => event(pb::child_event::Kind::ResolveFutures(pb::ResolveFutures {
-            pending_call_ids: state.pending_call_ids().to_vec(),
+            pending_call_ids: state.pending_call_ids().to_vec().into(),
+            position: Some(state.position().into()),
         })),
         ReplProgress::Complete { .. } => unreachable!("Complete is handled before suspension_event"),
     }
 }
 
-/// Converts wire named inputs into `(name, value)` pairs for `feed_start`.
-fn named_inputs(inputs: Vec<pb::NamedValue>) -> Result<Vec<(String, MontyObject)>, Box<pb::ChildEvent>> {
-    inputs
-        .into_iter()
-        .map(|input| {
-            let value = input
-                .value
-                .ok_or_else(|| Box::new(protocol_violation(&format!("input {:?} has no value", input.name))))?;
-            let value = value
-                .into_object()
-                .map_err(|err| Box::new(protocol_violation(&format!("invalid input {:?}: {err}", input.name))))?;
-            Ok((input.name, value))
-        })
-        .collect()
-}
-
 /// A validated `ResumeFutures` body, shaped for the suspension it answers.
 enum FuturesReply {
-    /// One settled coroutine for a function call with `allow_eager_await`.
+    /// One settled coroutine for a call with `allow_eager_await`.
     Eager(Result<MontyObject, MontyException>),
     /// Results for a `ResolveFutures` suspension.
     Batch(Vec<(u32, ExtFunctionResult)>),
@@ -1199,7 +1395,9 @@ impl<'a> ProtoPrint<'a> {
 
     /// Sends `segments` as one `Print` event.
     fn send(&mut self, segments: Vec<pb::PrintSegment>) -> Result<(), MontyException> {
-        let event = event(pb::child_event::Kind::Print(pb::Print { segments }));
+        let event = event(pb::child_event::Kind::Print(pb::Print {
+            segments: segments.into(),
+        }));
         self.sink.send(&event).map_err(|err| {
             MontyException::new(
                 ExcType::RuntimeError,

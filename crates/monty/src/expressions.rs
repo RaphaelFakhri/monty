@@ -8,7 +8,7 @@ use crate::{
     intern::{BytesId, LongIntId, StringId},
     namespace::NamespaceId,
     parse::{CodeRange, ParsedSignature, Try},
-    value::{EitherStr, Marker, Value},
+    value::{EitherStr, Marker},
 };
 
 /// Indicates which namespace a variable reference belongs to.
@@ -25,8 +25,10 @@ pub enum NameScope {
     ///
     /// If accessed before assignment, raises `UnboundLocalError`.
     #[default]
+    #[serde(rename = "L")]
     Local,
     /// Variable is in the module-level global namespace.
+    #[serde(rename = "G")]
     Global,
     /// Variable accessed through a cell (heap-allocated container).
     ///
@@ -36,12 +38,21 @@ pub enum NameScope {
     ///
     /// The namespace slot contains `Value::Ref(cell_id)` pointing to a `HeapData::Cell`.
     /// Access requires dereferencing through the cell.
+    #[serde(rename = "C")]
     Cell,
     /// Comprehension target stored in isolated operand-stack storage.
     ///
     /// The namespace ID is a comprehension-local slot ID. The compiler stores
     /// uncaptured targets directly and gives captured targets a stable cell.
+    #[serde(rename = "V")]
     CompVar,
+    /// Top-level name of an `eval()` / `exec()` snippet that runs with a locals
+    /// dict or dict globals: resolved by name at runtime through the frame's
+    /// namespace. The namespace ID is the session global slot for the name (a
+    /// scratch slot under dict globals) so the slot-globals tail of the lookup
+    /// reuses the `LoadGlobal` machinery.
+    #[serde(rename = "N")]
+    Name,
 }
 
 /// Identifies where an enclosing scope stores a cell captured by a callable.
@@ -59,11 +70,15 @@ pub enum CaptureSource {
 /// To get the actual string, look it up in the `Interns` storage.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Identifier {
+    #[serde(rename = "P")]
     pub position: CodeRange,
     /// Interned name ID - look up in Interns to get the actual string.
+    #[serde(rename = "N")]
     pub name_id: StringId,
+    #[serde(rename = "I")]
     opt_namespace_id: Option<NamespaceId>,
     /// Which namespace this identifier refers to (determined at prepare time)
+    #[serde(rename = "S")]
     pub scope: NameScope,
 }
 
@@ -94,15 +109,27 @@ impl Identifier {
     }
 }
 
-/// A single module in an `import` statement (e.g., `sys` in `import sys` or `sys as s`).
-///
-/// Each entry in `import a, b as c` becomes one `ImportName` with its own
-/// module name and binding target.
+/// A dotted-import component and its full path for `ModuleNotFoundError` messages.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct Submodule {
+    /// The attribute name (`b`).
+    pub name: StringId,
+    /// The path through this component (`a.b`).
+    pub path: StringId,
+}
+
+/// One entry of an `import` statement, with its dotted components and binding target.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportName {
-    /// The module name to import (e.g., "sys", "typing").
+    /// The top-level module to load (`a` for `import a.b`).
     pub module_name: StringId,
-    /// The binding target — the alias if provided, otherwise the module name.
+    /// The further components of a dotted name, in order.
+    pub submodules: Vec<Submodule>,
+    /// Whether the statement binds the top-level module (`import a.b` binds
+    /// `a`) rather than the last component (`import a.b as x` binds `a.b`).
+    pub binds_top_level: bool,
+    /// The binding target — the alias if provided, otherwise the module name
+    /// (or its top-level package when dotted).
     /// After the prepare phase, this includes the resolved namespace slot.
     pub binding: Identifier,
 }
@@ -489,6 +516,10 @@ pub enum Literal {
     Bool(bool),
     Int(i64),
     Float(f64),
+    /// An imaginary literal such as `2j`, holding its imaginary part (the real
+    /// part is always zero). It has no constant-pool form: the compiler emits a
+    /// `complex()` constructor call, since a complex value lives on the heap.
+    Complex(f64),
     /// An interned string literal. The StringId references the string in the Interns table.
     Str(StringId),
     /// An interned bytes literal. The BytesId references the bytes in the Interns table.
@@ -498,26 +529,6 @@ pub enum Literal {
     LongInt(LongIntId),
     /// A marker value (e.g., typing constructs like Any, Optional, etc.).
     Marker(Marker),
-}
-
-impl From<Literal> for Value {
-    /// Converts the literal into its runtime `Value` counterpart.
-    ///
-    /// This is the only place parse-time data crosses the boundary into runtime
-    /// semantics, ensuring every literal follows the same conversion path.
-    fn from(literal: Literal) -> Self {
-        match literal {
-            Literal::Ellipsis => Self::Ellipsis,
-            Literal::None => Self::None,
-            Literal::Bool(b) => Self::Bool(b),
-            Literal::Int(v) => Self::Int(v),
-            Literal::Float(v) => Self::Float(v),
-            Literal::Str(string_id) => Self::InternString(string_id),
-            Literal::Bytes(bytes_id) => Self::InternBytes(bytes_id),
-            Literal::LongInt(long_int_id) => Self::InternLongInt(long_int_id),
-            Literal::Marker(marker) => Self::Marker(marker),
-        }
-    }
 }
 
 /// An expression with its source location.
@@ -778,8 +789,10 @@ pub enum Node<F> {
     ///
     /// Imports specific names from a module into the current namespace.
     ImportFrom {
-        /// The module name to import from (e.g., "typing").
+        /// The top-level module to load (`a` for `from a.b import c`).
         module_name: StringId,
+        /// The further components of a dotted module name, in order.
+        submodules: Vec<Submodule>,
         /// Names to import: (import_name, binding) pairs.
         /// The import_name is the name in the module, the binding is the local name
         /// (alias if provided, otherwise the import name) with resolved namespace slot.
@@ -819,6 +832,9 @@ pub struct PreparedFunctionDef {
     /// preparation and so does not fall in the contiguous param/cell/free
     /// region the namespace layout otherwise follows.
     pub free_var_slots: Vec<NamespaceId>,
+    /// Names parallel to `free_var_slots`, including captures never read by this body.
+    /// The compiler records them so `locals()` can report pass-through cells.
+    pub free_var_names: Vec<StringId>,
     /// This function's own namespace slots for cell variables (locals captured
     /// by nested functions). A fresh cell is created for each at call time and
     /// stored at `cell_var_slots[i]`. Parallel to [`Self::cell_param_indices`].

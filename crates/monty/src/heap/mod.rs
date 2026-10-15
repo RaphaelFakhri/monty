@@ -17,7 +17,7 @@ use std::{
     sync::Arc,
 };
 
-use monty_types::{MontyUuid, ResourceTracker};
+use monty_types::{DEFAULT_GC_INTERVAL, MontyUuid, ResourceTracker};
 use serde::{de::Error as _, ser::SerializeStruct};
 
 #[cfg(feature = "ref-count-return")]
@@ -81,20 +81,24 @@ pub(crate) enum CcColor {
     /// Live and not currently a cycle candidate. Default state for every newly
     /// allocated entry.
     #[default]
+    #[serde(rename = "B")]
     Black,
     /// Visited by `MarkGray` during a collection cycle. Children's refcounts
     /// have been provisionally decremented; a later `Scan` pass decides whether
     /// to resurrect (back to [`Black`](Self::Black)) or condemn
     /// ([`White`](Self::White)) the entry.
+    #[serde(rename = "G")]
     Gray,
     /// Confirmed unreachable by the current collection: every reference into
     /// the entry comes from another condemned entry. `CollectWhite` will free
     /// it. Only seen mid-collection.
+    #[serde(rename = "W")]
     White,
     /// Candidate cycle root. Set by `dec_ref` whenever a GC-tracked entry's
     /// refcount drops to a non-zero value — the only situation in which a new
     /// reference cycle can become unreachable. The collector seeds its work
     /// from every entry currently flagged Purple.
+    #[serde(rename = "P")]
     Purple,
 }
 
@@ -262,9 +266,10 @@ macro_rules! define_heap_read_support {
         $variant:ident($storage:ident $payload:ty)
     ),* $(,)?) => {
         /// A type-safe read handle for any payload stored in the heap.
+        /// Variants mirror `HeapData`, which carries their docs; its serde attributes
+        /// would not compile here, so the registry's attributes are not repeated.
         pub enum HeapReadOutput<'a> {
             $(
-                $(#[$meta])*
                 $variant(HeapObjectRead<'a, $payload>),
             )*
         }
@@ -820,6 +825,7 @@ impl<'a> HeapPtr<'a> {
 /// collector's `mark_gray`/`scan`/`scan_black`).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct HeapEntry {
+    #[serde(rename = "R")]
     refcount: Cell<usize>,
     /// Number of active `HeapRead` pointers into this entry's data.
     ///
@@ -827,9 +833,10 @@ pub struct HeapEntry {
     /// the `HeapRead` is dropped. `dec_ref` panics if it would free an entry that
     /// still has active readers — this guarantees that `HeapRead` pointers remain
     /// valid for as long as they exist.
-    #[serde(skip, default)] // should always be 0 during serde ops
+    #[serde(skip)] // should always be 0 during serde ops
     readers: Cell<usize>,
     /// The payload data
+    #[serde(rename = "D")]
     data: UnsafeHeapData,
     /// Cycle-collector color. See [`CcColor`].
     ///
@@ -837,7 +844,7 @@ pub struct HeapEntry {
     /// instructions can capture entries in the [`Purple`](CcColor::Purple)
     /// pending-collection state; dropping the color on restore would leak
     /// any cycle that became unreachable just before the snapshot.
-    #[serde(default)]
+    #[serde(rename = "C")]
     color: Cell<CcColor>,
 }
 
@@ -976,11 +983,8 @@ impl<'de> serde::Deserialize<'de> for Heap {
         struct HeapFields {
             entries: StableHeap<HeapEntry>,
             tracker: ResourceTracker,
-            #[serde(default)]
             purple_count: usize,
-            #[serde(default)]
             allocations_since_gc: u32,
-            #[serde(default)]
             timezone_utc: Option<HeapId>,
         }
         let fields = HeapFields::deserialize(deserializer)?;
@@ -1063,8 +1067,7 @@ impl WeakIndexes {
     }
 }
 
-/// Default GC interval — run cycle collection every 100 000 GC-tracked
-/// allocations unless the configured resource tracker overrides it.
+/// GC interval when the resource tracker sets none: [`DEFAULT_GC_INTERVAL`].
 ///
 /// The trial-deletion collector additionally short-circuits the trace when
 /// `purple_count == 0`, so programs that produce no cycle candidates pay no
@@ -1072,10 +1075,10 @@ impl WeakIndexes {
 ///
 /// When the `memory-model-checks` feature is enabled, this is reduced to 1 to
 /// stress-test GC behavior on every allocation.
-const DEFAULT_GC_INTERVAL: usize = if cfg!(feature = "memory-model-checks") {
+const GC_INTERVAL: usize = if cfg!(feature = "memory-model-checks") {
     1
 } else {
-    100_000
+    DEFAULT_GC_INTERVAL
 };
 
 impl Heap {
@@ -1444,7 +1447,7 @@ impl Heap {
         if self.purple_count == 0 {
             return false;
         }
-        let interval = self.tracker.gc_interval().unwrap_or(DEFAULT_GC_INTERVAL);
+        let interval = self.tracker.gc_interval().unwrap_or(GC_INTERVAL);
         (self.allocations_since_gc.get() as usize) >= interval
     }
 
@@ -1904,6 +1907,9 @@ fn for_each_child_id<F: FnMut(HeapId)>(data: &HeapData, mut on_child: F) {
                     on_child(*id);
                 }
             }
+            if let Some(globals) = closure.globals {
+                on_child(globals);
+            }
         }
         HeapData::FunctionDefaults(fd) => {
             // Add default values that are heap references
@@ -1911,6 +1917,9 @@ fn for_each_child_id<F: FnMut(HeapId)>(data: &HeapData, mut on_child: F) {
                 if let Value::Ref(id) = default {
                     on_child(*id);
                 }
+            }
+            if let Some(globals) = fd.globals {
+                on_child(globals);
             }
         }
         HeapData::Cell(cell) => {
@@ -1977,13 +1986,11 @@ fn for_each_child_id<F: FnMut(HeapId)>(data: &HeapData, mut on_child: F) {
             }
         }
         HeapData::DataclassField(field) => {
-            // A captured default can reach back to the class the field belongs
-            // to (`x: object = SomeInstanceOfIt`), closing a cycle.
-            if let Value::Ref(id) = field.annotation() {
-                on_child(*id);
-            }
-            if let Some(Value::Ref(id)) = field.default() {
-                on_child(*id);
+            // A captured default or factory can reach back to the class the
+            // field belongs to (`x: object = SomeInstanceOfIt`, or a factory
+            // closure capturing the class), closing a cycle.
+            for value in field.ref_children() {
+                on_child(value);
             }
         }
         HeapData::ListIterator(iter) => on_child(iter.list_id()),
@@ -2005,6 +2012,7 @@ fn for_each_child_id<F: FnMut(HeapId)>(data: &HeapData, mut on_child: F) {
         HeapData::DictValueIterator(iter) => on_child(iter.source_id()),
         HeapData::SetIterator(iter) => on_child(iter.source_id()),
         HeapData::CallableIterator(iter) => iter.for_each_child_id(on_child),
+        HeapData::DirScan(scan) => scan.for_each_child_id(on_child),
         HeapData::Itertools(iter) => iter.for_each_child_id(on_child),
         HeapData::Partial(partial) => partial.for_each_child_id(on_child),
         HeapData::GenericAlias(alias) => alias.for_each_child_id(on_child),
@@ -2030,6 +2038,9 @@ fn for_each_child_id<F: FnMut(HeapId)>(data: &HeapData, mut on_child: F) {
                 if let Value::Ref(id) = value {
                     on_child(*id);
                 }
+            }
+            if let Some(globals) = coro.globals {
+                on_child(globals);
             }
         }
         HeapData::GatherFuture(gather) => {
@@ -2061,7 +2072,11 @@ fn for_each_child_id<F: FnMut(HeapId)>(data: &HeapData, mut on_child: F) {
         HeapData::ExternalFuture(fut) => {
             // `Pending { awaiter: Some(GatherSlot { gather, .. }) }` owns an
             // inc_ref on `gather`. `Awaiter::Task` / `None` and the `Failed`
-            // state carry no heap refs. `Resolved` owns the cached value.
+            // state carry no heap refs. `Resolved` owns the cached value, and
+            // a pending sleep owns the `result` it will resolve with.
+            if let Some(Value::Ref(id)) = &fut.sleep_result {
+                on_child(*id);
+            }
             match &fut.state {
                 ExternalFutureState::Resolved(Value::Ref(id)) => on_child(*id),
                 ExternalFutureState::Pending {
@@ -2128,12 +2143,14 @@ fn py_dec_ref_ids_for_data(data: &mut HeapData, stack: &mut Vec<HeapId>) {
             for default in &mut closure.defaults {
                 default.py_dec_ref_ids(stack);
             }
+            stack.extend(closure.globals);
         }
         HeapData::FunctionDefaults(fd) => {
             // Decrement ref count for default values that are heap references
             for default in &mut fd.defaults {
                 default.py_dec_ref_ids(stack);
             }
+            stack.extend(fd.globals);
         }
         HeapData::Cell(cell) => cell.0.py_dec_ref_ids(stack),
         HeapData::HostClass(dc) => dc.py_dec_ref_ids(stack),
@@ -2154,6 +2171,7 @@ fn py_dec_ref_ids_for_data(data: &mut HeapData, stack: &mut Vec<HeapId>) {
         HeapData::DictValueIterator(iter) => iter.py_dec_ref_ids(stack),
         HeapData::SetIterator(iter) => iter.py_dec_ref_ids(stack),
         HeapData::CallableIterator(iter) => iter.py_dec_ref_ids(stack),
+        HeapData::DirScan(scan) => scan.py_dec_ref_ids(stack),
         HeapData::Itertools(iter) => iter.py_dec_ref_ids(stack),
         HeapData::Partial(partial) => partial.py_dec_ref_ids(stack),
         HeapData::GenericAlias(alias) => alias.py_dec_ref_ids(stack),
@@ -2165,6 +2183,7 @@ fn py_dec_ref_ids_for_data(data: &mut HeapData, stack: &mut Vec<HeapId>) {
             for value in &mut coro.namespace {
                 value.py_dec_ref_ids(stack);
             }
+            stack.extend(coro.globals);
         }
         HeapData::GatherFuture(gather) => {
             // Decrement ref count for owned item HeapIds (coroutines and
@@ -2188,16 +2207,22 @@ fn py_dec_ref_ids_for_data(data: &mut HeapData, stack: &mut Vec<HeapId>) {
                 GatherState::Pending | GatherState::Failed(_) => {}
             }
         }
-        HeapData::ExternalFuture(fut) => match &mut fut.state {
-            ExternalFutureState::Resolved(value) => value.py_dec_ref_ids(stack),
-            ExternalFutureState::Pending {
-                awaiter: Some(Awaiter::GatherSlot { gather, .. }),
-            } => stack.push(*gather),
-            ExternalFutureState::Pending {
-                awaiter: None | Some(Awaiter::Task(_)),
+        HeapData::ExternalFuture(fut) => {
+            // Mirror `for_each_child_id`: a pending sleep's `result` is owned too.
+            if let Some(result) = &mut fut.sleep_result {
+                result.py_dec_ref_ids(stack);
             }
-            | ExternalFutureState::Failed(_) => {}
-        },
+            match &mut fut.state {
+                ExternalFutureState::Resolved(value) => value.py_dec_ref_ids(stack),
+                ExternalFutureState::Pending {
+                    awaiter: Some(Awaiter::GatherSlot { gather, .. }),
+                } => stack.push(*gather),
+                ExternalFutureState::Pending {
+                    awaiter: None | Some(Awaiter::Task(_)),
+                }
+                | ExternalFutureState::Failed(_) => {}
+            }
+        }
         HeapData::DateTime(dt) => {
             // Mirror `for_each_child_id`: when an aware datetime is freed we must
             // also drop the retained tzinfo reference so its refcount is balanced.
@@ -2484,9 +2509,9 @@ mod tests {
         assert_eq!(heap.purple_count, 1);
         assert_eq!(heap.entries.get(id).color.get(), CcColor::Purple);
 
-        // Round-trip through postcard.
-        let bytes = postcard::to_allocvec(&heap).expect("serialize");
-        let mut restored: Heap = postcard::from_bytes(&bytes).expect("deserialize");
+        // Round-trip through the dump codec.
+        let bytes = minicbor_serde::to_vec(&heap).expect("serialize");
+        let mut restored: Heap = minicbor_serde::from_slice(&bytes).expect("deserialize");
 
         // `purple_count` and the per-entry color must round-trip.
         assert_eq!(restored.purple_count, 1);

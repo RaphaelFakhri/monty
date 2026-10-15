@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import subprocess
 import sys
 import threading
+from typing import cast
 
 import pytest
 from conftest import RunMonty
@@ -17,6 +19,28 @@ from pydantic_monty import AsyncMonty, Monty, MontyCrashedError, MontyRuntimeErr
 
 def test_basic_execution(monty_run: RunMonty):
     assert monty_run('1 + 2') == snapshot(3)
+
+
+def test_pool_construction_imports_no_modules_lazily():
+    # hosts that run `pydantic_monty` under an import-restricted environment
+    # (e.g. Temporal's workflow sandbox) fail any module first imported after
+    # the initial load — pool construction must not trigger a `pydantic_monty.*`
+    # import, which is why `_monty`'s init imports `_binary` and caches the
+    # resolver. A fresh interpreter is required since pytest has already
+    # imported the module.
+    code = """\
+import sys
+
+import pydantic_monty
+
+loaded = set(sys.modules)
+with pydantic_monty.Monty() as pool, pool.checkout() as session:
+    session.feed_run('1 + 1')
+late = sorted(name for name in sys.modules.keys() - loaded if name.startswith('pydantic_monty'))
+print(late)
+"""
+    result = subprocess.run([sys.executable, '-c', code], check=True, capture_output=True, text=True)
+    assert result.stdout == snapshot('[]\n')
 
 
 def test_session_state_persists_across_feeds(pool: Monty):
@@ -180,33 +204,32 @@ def test_concurrent_sessions_run_in_parallel(pool: Monty):
 
 
 def test_limits_enforced_in_worker(pool: Monty):
-    with pool.checkout(limits={'max_duration_secs': 0.1}) as session:
+    with pool.checkout(limits={'max_feed_duration_secs': 0.1}) as session:
         with pytest.raises(MontyRuntimeError) as exc_info:
             session.feed_run('while True:\n    pass')
         assert exc_info.value.display(format='type-msg').startswith('TimeoutError')
 
 
-def test_deep_external_function_argument_is_catchable(pool: Monty):
-    # arguments too deep for the wire protocol resume the call with a
-    # catchable error inside the sandbox instead of corrupting the protocol
+def test_deep_external_function_argument_crosses(pool: Monty):
+    # arguments cross as a flat node arena, so a deeply nested value reaches
+    # the host intact
     code = """
 x = [1]
 for _ in range(300):
     x = [x]
-try:
-    f(x)
-    result = 'no error'
-except RuntimeError as e:
-    result = str(e)
-result
+f(x)
 """
 
-    def f(v: object) -> None:
-        raise AssertionError('the call must never reach the host')
+    def f(v: object) -> int:
+        depth = 0
+        while isinstance(v, list):
+            (v,) = cast('list[object]', v)
+            depth += 1
+        return depth
 
     with pool.checkout() as session:
         result = session.feed_run(code, external_lookup={'f': f})
-    assert result == snapshot('Max argument depth exceeded')
+    assert result == snapshot(301)
 
 
 # === async variants ===

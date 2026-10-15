@@ -6,7 +6,7 @@
 //! Pending keys and arguments are ordinary frame locals, including across
 //! host suspension and snapshots; the VM needs no cache-specific return effects.
 
-use std::{fmt::Write, mem::take};
+use std::{cell::Cell, fmt::Write, mem::take};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,13 +18,11 @@ use crate::{
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
     frozen::{self, FrozenFunction},
     hash::{HashValue, identity_hash},
-    heap::{
-        BorrowedHeapReadMut, DropGuard, DropWithContext, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput,
-        heap_read_ref_as_field_mut,
-    },
+    heap::{ContainsHeap, DropGuard, DropWithContext, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
     intern::StaticStrings,
     types::{
         Dict, LazyHeapSet, NamedTuple, PyTrait, Type,
+        hash_table::{PyHashTable, Slot, TableEntry, TableProbe, TableSource},
         tuple::{TupleVec, allocate_tuple},
     },
     value::{EitherStr, Value},
@@ -49,10 +47,7 @@ pub(crate) struct LruCache {
     /// from and ones `maxsize=0` never stored.
     misses: u64,
     /// Call key (see [`make_key`]) to result.
-    cache: Dict,
-    /// Recency stamps in dict entry order; empty for unbounded caches.
-    /// Insertions and removals must maintain the parallel positions.
-    stamps: Vec<u64>,
+    cache: PyHashTable<CacheEntry>,
     /// Source of stamps; monotonic, so the smallest stamp is the oldest use.
     clock: u64,
 }
@@ -67,8 +62,7 @@ impl LruCache {
             typed,
             hits: 0,
             misses: 0,
-            cache: Dict::new(),
-            stamps: Vec::new(),
+            cache: PyHashTable::default(),
             clock: 0,
         }
     }
@@ -80,39 +74,22 @@ impl LruCache {
         if let Some(Value::Ref(id)) = self.func {
             on_child(id);
         }
-        if !self.cache.has_refs() {
-            return;
-        }
-        for (key, value) in &self.cache {
-            if let Value::Ref(id) = key {
-                on_child(*id);
+        for entry in self.cache.live() {
+            if let Value::Ref(id) = entry.key {
+                on_child(id);
             }
-            if let Value::Ref(id) = value {
-                on_child(*id);
+            if let Value::Ref(id) = entry.value {
+                on_child(id);
             }
         }
     }
 
-    /// Records a use of the entry at `index`; a no-op while unbounded.
-    ///
-    /// Ignores an index with no stamp: a user `__eq__` running during the key
-    /// lookup can clear or shrink the cache before the index is used.
-    fn touch(&mut self, index: usize) {
+    /// Records a hit without changing the table's keys or slot layout.
+    fn touch(&mut self, slot: &Slot) {
         if self.maxsize.is_some() {
             self.clock += 1;
-            if let Some(stamp) = self.stamps.get_mut(index) {
-                *stamp = self.clock;
-            }
+            self.cache.entry(slot).stamp.set(self.clock);
         }
-    }
-
-    /// Finds the least recently used entry with an O(n) scan when eviction is needed.
-    fn lru_index(&self) -> Option<usize> {
-        self.stamps
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, stamp)| **stamp)
-            .map(|(index, _)| index)
     }
 }
 
@@ -150,26 +127,18 @@ pub(crate) fn call(cache_id: HeapId, args: ArgValues, vm: &mut VM<'_>) -> RunRes
     let mut key_guard = DropGuard::new(key, vm);
     let (key, vm) = key_guard.as_parts_mut();
 
-    // Comparing keys can run a user `__eq__`, which is free to call
-    // `cache_clear()` on this very wrapper, so the index is read back rather
-    // than trusted; a vanished entry counts as a miss.
-    let index = if maxsize == Some(0) {
+    // The shared probe revalidates candidates after a user `__eq__` mutates the cache.
+    let found = if maxsize == Some(0) {
         None
     } else {
-        cache_mut(&mut cache).find_entry_index(key, vm)?
+        let hash = key_hash(key, vm)?;
+        cache.find_index(key, hash, vm)?
     };
-    let hit = match index {
-        Some(index) => cache
-            .get(vm.heap)
-            .cache
-            .value_at(index)
-            .map(|value| (index, value.clone_with_heap(vm))),
-        None => None,
-    };
-    if let Some((index, value)) = hit {
+    if let Some(slot) = found {
+        let value = cache.get(vm.heap).cache.entry(&slot).value.clone_with_heap(vm);
         let this = cache.get_mut(vm.heap);
         this.hits += 1;
-        this.touch(index);
+        this.touch(&slot);
         Ok(CallResult::Value(value))
     } else {
         cache.get_mut(vm.heap).misses += 1;
@@ -233,9 +202,11 @@ pub(crate) fn bad_maxsize_error() -> RunError {
     ExcType::type_error("Expected first argument to be an integer, a callable, or None")
 }
 
-/// The cached results as a dict handle, for the `HeapRead<Dict>` methods.
-fn cache_mut<'r, 'h>(cache: &'r mut HeapObjectRead<'h, LruCache>) -> BorrowedHeapReadMut<'r, 'h, Dict> {
-    heap_read_ref_as_field_mut!(cache, LruCache, cache)
+/// Hashes a cache key before entering the mutation-aware table probe.
+fn key_hash(key: &Value, vm: &mut VM<'_>) -> RunResult<u64> {
+    key.py_hash(vm)?
+        .map(HashValue::raw)
+        .ok_or_else(|| ExcType::type_error_unhashable_dict_key(&key.py_type_name(vm)))
 }
 
 /// Stores a successful frozen call's result. Consumes the key; borrows the wrapper and value.
@@ -256,30 +227,29 @@ pub(crate) fn store_result(cache: &Value, key: Value, value: &Value, vm: &mut VM
 
     // A bounded cache preserves an entry inserted by a recursive call.
     // Unbounded caches instead overwrite it with the outer result.
-    let existing = match cache_mut(&mut cache).find_entry_index(key, vm)? {
-        Some(index) if index < cache.get(vm.heap).cache.len() => Some(index),
-        _ => None,
-    };
-    if let Some(index) = existing {
+    let hash = key_hash(key, vm)?;
+    if let Some(slot) = cache.find_index(key, hash, vm)? {
         if cache.get(vm.heap).maxsize.is_none() {
-            let value = value.clone_with_heap(vm);
-            let old = cache_mut(&mut cache).replace_value_at(index, value, vm);
-            old.drop_with(vm);
+            let old = cache.get(vm.heap).cache.entry(&slot);
+            let entry = CacheEntry {
+                key: old.key.clone_with_heap(vm),
+                value: value.clone_with_heap(vm),
+                hash: old.hash,
+                stamp: Cell::new(old.stamp.get()),
+            };
+            cache.get_mut(vm.heap).cache.replace(slot, entry).drop_with(vm);
         }
         Ok(())
     } else {
+        cache.get(vm.heap).cache.check_growth(&vm.heap.tracker)?;
         let (key, vm) = key_guard.into_parts();
-        insert_new(&mut cache, key, value, vm)
+        insert_new(&mut cache, key, hash, value, vm);
+        Ok(())
     }
 }
 
 /// Inserts an owned key and a cloned result, making room in bounded caches.
-fn insert_new<'h>(
-    cache: &mut HeapObjectRead<'h, LruCache>,
-    key: Value,
-    value: &Value,
-    vm: &mut VM<'h>,
-) -> RunResult<()> {
+fn insert_new<'h>(cache: &mut HeapObjectRead<'h, LruCache>, key: Value, hash: u64, value: &Value, vm: &mut VM<'h>) {
     let maxsize = cache.get(vm.heap).maxsize;
     if let Some(maxsize) = maxsize
         && cache.get(vm.heap).cache.len() as u64 >= maxsize
@@ -288,44 +258,26 @@ fn insert_new<'h>(
     }
 
     let value = value.clone_with_heap(vm);
-    // A re-entrant `__eq__` between the probe above and this insertion can have
-    // stored the key already, in which case `set` hands back the old value and
-    // its refcount with it.
-    if let Some(old) = cache_mut(cache).set(key, value, vm)? {
-        old.drop_with(vm);
-    }
-
     let this = cache.get_mut(vm.heap);
-    if let Some(maxsize) = this.maxsize {
-        this.clock += 1;
-        let clock = this.clock;
-        this.stamps.resize(this.cache.len(), clock);
-        // An equality callback during insertion may have filled the slot we
-        // reserved. Enforce the bound again without invoking any user code.
-        while cache.get(vm.heap).cache.len() as u64 > maxsize {
-            evict_one(cache, vm);
-        }
-    }
-    Ok(())
+    this.clock += 1;
+    this.cache.push(CacheEntry {
+        key,
+        value,
+        hash,
+        stamp: Cell::new(this.clock),
+    });
 }
 
 /// Removes the least recently used entry by position without invoking user code.
 /// A lookup by key could run `__eq__` and mutate both the cache and its stamps.
 fn evict_one<'h>(cache: &mut HeapObjectRead<'h, LruCache>, vm: &mut VM<'h>) {
-    let index = {
-        let this = cache.get_mut(vm.heap);
-        // The lookup this insertion began with may have run a user `__eq__`
-        // that shrank the cache, leaving stamps the entries no longer have.
-        // The scan below reads them as positions, so drop those first.
-        this.stamps.truncate(this.cache.len());
-        this.lru_index()
-    };
-    let Some(index) = index else { return };
-    // `pop_at` shifts everything after the entry down, so `stamps` shifts too.
-    let (key, value) = cache_mut(cache).pop_at(index, vm);
-    key.drop_with(vm);
-    value.drop_with(vm);
-    cache.get_mut(vm.heap).stamps.remove(index);
+    let table = &cache.get(vm.heap).cache;
+    if let Some(oldest) = table.live().min_by_key(|entry| entry.stamp.get()) {
+        let slot = table
+            .find(oldest.hash, |entry| entry.stamp == oldest.stamp)
+            .expect("oldest entry is in the cache");
+        cache.get_mut(vm.heap).cache.remove(slot).drop_with(vm);
+    }
 }
 
 /// Builds and hashes a key, preserving keyword order and optional argument types.
@@ -387,11 +339,18 @@ impl HeapItem for LruCache {
         if let Some(func) = &mut self.func {
             func.py_dec_ref_ids(stack);
         }
-        self.cache.py_dec_ref_ids(stack);
+        for mut entry in self.cache.take_entries() {
+            entry.key.py_dec_ref_ids(stack);
+            entry.value.py_dec_ref_ids(stack);
+        }
     }
 }
 
 impl<'h> PyTrait<'h> for HeapObjectRead<'h, LruCache> {
+    fn py_call(&mut self, args: ArgValues, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        call(self.id(), args, vm)
+    }
+
     fn py_type(&self, _: &VM<'h>) -> Type {
         Type::LruCacheWrapper
     }
@@ -484,10 +443,9 @@ impl<'h> HeapObjectRead<'h, LruCache> {
 
     /// Empties the cache and resets the hit/miss counters, as CPython does.
     fn cache_clear(&mut self, vm: &mut VM<'h>) {
-        let entries = take(&mut self.get_mut(vm.heap).cache);
-        entries.drop_with(vm);
+        let mut entries = take(&mut self.get_mut(vm.heap).cache);
+        entries.take_entries().drop_with(vm);
         let this = self.get_mut(vm.heap);
-        this.stamps.clear();
         this.hits = 0;
         this.misses = 0;
     }
@@ -507,6 +465,60 @@ impl<'h> HeapObjectRead<'h, LruCache> {
         ];
         let dict = Dict::from_pairs(pairs, vm)?;
         Ok(Value::Ref(vm.heap.allocate(HeapData::Dict(dict))))
+    }
+}
+
+/// A cached result and its recency, kept together when the table compacts tombstones.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct CacheEntry {
+    /// Owned call key and result.
+    key: Value,
+    value: Value,
+    /// Cached key hash; eviction never calls user code.
+    hash: u64,
+    /// Interior mutability updates recency without allowing table keys to change.
+    stamp: Cell<u64>,
+}
+
+impl TableEntry for CacheEntry {
+    fn probe_key(&self) -> &Value {
+        &self.key
+    }
+
+    fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    fn tombstone() -> Self {
+        Self {
+            key: Value::Undefined,
+            value: Value::Undefined,
+            hash: 0,
+            stamp: Cell::new(0),
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        !matches!(self.key, Value::Undefined)
+    }
+
+    fn changed_size_error() -> RunError {
+        ExcType::runtime_error_dict_changed_size()
+    }
+}
+
+impl<C: ContainsHeap> DropWithContext<C> for CacheEntry {
+    fn drop_with(self, context: &mut C) {
+        self.key.drop_with(context);
+        self.value.drop_with(context);
+    }
+}
+
+impl<'h> TableSource<'h> for HeapObjectRead<'h, LruCache> {
+    type Entry = CacheEntry;
+
+    fn table<'r>(&self, vm: &'r VM<'h>) -> &'r PyHashTable<CacheEntry> {
+        &self.get(vm.heap).cache
     }
 }
 

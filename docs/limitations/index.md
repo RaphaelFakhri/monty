@@ -1,6 +1,6 @@
 # Limitations
 
-Monty is not a Python implementation aiming for completeness.
+Monty is a sandbox, not a Python implementation aiming for completeness.
 It implements enough Python for a model to express what it wants to do, and deliberately stops there.
 Everything it does implement is meant to behave exactly like CPython 3.14; everywhere it does not, the divergence is
 written down.
@@ -24,17 +24,18 @@ They exist for development and for agents debugging code that runs on Monty; mos
 - Decorators on functions and classes
 - Simple classes: instance methods, `__init__`, `__repr__`/`__str__`, `__eq__`/`__hash__`, `__iter__`/`__next__`,
     `__contains__`, `__index__`, class variables
-- `@dataclass`, with the `eq=` and `frozen=` options only (every other option raises `NotImplementedError`, and
-    there is no `field()`, `fields()` or `asdict()`), plus host class instances passed in and out (and host classes the
-    sandbox may instantiate when granted)
+- `@dataclass`, with the `eq=` and `frozen=` options only (every other option raises `NotImplementedError`),
+    `field()` (with `default=...` / `default_factory=...`) and `__post_init__`, but no `fields()` or `asdict()`, plus host
+    class instances passed in and out (and host classes the sandbox may instantiate when granted)
 - List, dict and set comprehensions
 - `try` / `except` / `else` / `finally`, `raise ... from ...`
 - `for`, `while`, `if` / `elif` / `else`, `break`, `continue`, `pass`, `assert`, `global`, `nonlocal`, `return`
 - `with` statements, for files and for classes implementing `__enter__` / `__exit__`
 - f-strings (including the `=` debug form), `str.format()` and `format()`, with `!r` / `!s` / `!a` conversions,
     format specs and nested replacement fields
-- `async` / `await`, and `asyncio.run` / `asyncio.gather`
-- `import x`, `import x.y`, `from x import y, z as w`
+- `async` / `await`, and `asyncio.run` / `asyncio.gather` / `asyncio.sleep`
+- `import x`, `import x.y`, `from x import y, z as w`; a module the sandbox does not have is requested from the host,
+    see [modules.md](modules.md#host-modules)
 - Starred unpacking everywhere CPython allows it
 - Runtime generic aliases (`list[int]`) and `|` unions (`int | None`), see [typing.md](typing.md)
 
@@ -50,7 +51,7 @@ They exist for development and for agents debugging code that runs on Monty; mos
 - PEP 695 `type` aliases
 - `async with`, `async for` and async comprehensions
 - Wildcard imports (`from m import *`)
-- Complex literals (`1j`) and t-strings
+- t-strings
 
 **Missing in other ways:**
 
@@ -59,7 +60,8 @@ They exist for development and for agents debugging code that runs on Monty; mos
 - Function attributes.
     `fn.__name__`, `fn.__doc__` and friends raise `AttributeError`, and new attributes cannot be set — so
     `functools.wraps`-style metadata copying and registries keyed on `fn.__name__` have no equivalent.
-- `eval`, `exec`, `compile`, `globals`, `locals`, `__import__` and `super` — all raise `NameError`.
+- `compile`, `globals`, `__import__` and `super` — all raise `NameError`.
+    `eval` and `exec` exist (source text only), and so does `locals()`; see [eval_exec.md](eval_exec.md).
 - Third-party packages.
     There is no `sys.path` and no site-packages.
 
@@ -77,24 +79,29 @@ The following modules are present:
 | `dataclasses` | [dataclasses.md](dataclasses.md) |
 | `datetime`    | [datetime.md](datetime.md)       |
 | `functools`   | [functools.md](functools.md)     |
+| `hashlib`     | [hashlib.md](hashlib.md)         |
 | `itertools`   | [itertools.md](itertools.md)     |
 | `json`        | [json.md](json.md)               |
 | `math`        | [math.md](math.md)               |
 | `os`          | [os.md](os.md)                   |
+| `os.path`     | [os.md](os.md)                   |
 | `pathlib`     | [pathlib.md](pathlib.md)         |
+| `posixpath`   | [os.md](os.md)                   |
 | `random`      | [random.md](random.md)           |
 | `re`          | [re.md](re.md)                   |
 | `sys`         | [sys.md](sys.md)                 |
+| `time`        | [time.md](time.md)               |
 | `typing`      | [typing.md](typing.md)           |
 | `unicodedata` | [unicodedata.md](unicodedata.md) |
 
 Each covers only part of its CPython surface — often a small part. `itertools`
-is the exception: every name it exports is implemented.
+and `hashlib` are the exceptions: `itertools` implements every name it exports, and `hashlib` every guaranteed
+algorithm.
 The absent names are missing from the module namespace rather than stubbed, so they fail type checking as well as
 raising `AttributeError` at runtime.
 
-Notably absent: `enum`, `contextlib`, `time`, `io`, `string`, `struct`, `operator`,
-`inspect`, `logging`, `traceback`, `hashlib`, `uuid`, `urllib`.
+Notably absent: `enum`, `contextlib`, `io`, `string`, `struct`, `operator`,
+`inspect`, `logging`, `traceback`, `uuid`, `urllib`.
 Some of those are absent by design — `socket`, `subprocess`, `multiprocessing`, `threading` and `ctypes` would breach
 the sandbox — and others are simply not implemented yet.
 
@@ -117,9 +124,9 @@ Each links to the page that owns it, which is where the full account lives:
 - **Only the class dunders listed above are dispatched.** `__lt__`, `__len__`, `__getitem__`, `__call__` and the
     arithmetic dunders raise `TypeError` as if undefined, while `__bool__` and the `__getattr__` family are ignored
     silently, so an instance is always truthy ([classes.md](classes.md)).
-- **There is no event loop inside the sandbox.** `async` / `await` work, and `asyncio` exposes exactly two functions:
-    `run` and `gather`, the latter running host calls concurrently.
-    `create_task`, `sleep` and everything else do not exist
+- **There is no event loop inside the sandbox.** `async` / `await` work, and `asyncio` exposes exactly three functions:
+    `run`, `gather`, which runs host calls concurrently, and `sleep`, which asks the host to wait.
+    `create_task` and everything else do not exist
     ([asyncio.md](asyncio.md)).
 - **Only UTF-8, ASCII, UTF-16 and UTF-32 codecs exist.** `latin-1` and friends raise `LookupError`
     ([encoding.md](encoding.md)).

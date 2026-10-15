@@ -59,6 +59,11 @@ Mounts are per-feed, and all arguments are keyword-only:
     ```
 
 Pass a list to `mount=` for several at once.
+The mounts of one feed must have distinct virtual paths and cover disjoint host directories; a feed that mounts a
+directory and one inside it, the same directory twice, or two directories at one virtual path fails before it starts
+with a `MontyRuntimeError` wrapping a `ValueError`, since the stricter mount's mode could otherwise be bypassed through
+the other mount's paths.
+See [`limitations/filesystem.md`](limitations/filesystem.md#overlapping-mounts-cannot-both-be-registered).
 In JavaScript `MountDir` comes from the `@pydantic/monty/node` subpath and `using` closes it at the end of scope; the
 WebAssembly build rejects mounts outright, because a browser has no host filesystem.
 
@@ -155,15 +160,17 @@ Each feed starts with a fresh overlay.
 
 ### Options
 
-| Argument             | Default       | Meaning                                                                                  |
-| -------------------- | ------------- | ---------------------------------------------------------------------------------------- |
-| `host_path`          | required      | Real host directory; canonicalized at construction, raises if missing or not a directory |
-| `virtual_path`       | required      | Absolute POSIX-style path prefix inside the sandbox, whatever the host OS                |
-| `mode`               | `'overlay'`   | One of the three above                                                                   |
-| `write_bytes_limit`  | `None`        | Cap on bytes written through the mount per feed; exceeding it raises `OSError`           |
-| `memory_usage_limit` | `100_000_000` | Byte budget for overlay data and transient results; exceeding it raises `MemoryError`    |
+| Argument             | Default                                                                         | Meaning                                                                                  |
+| -------------------- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `host_path`          | required                                                                        | Real host directory; canonicalized at construction, raises if missing or not a directory |
+| `virtual_path`       | required                                                                        | Absolute POSIX-style path prefix inside the sandbox, whatever the host OS                |
+| `mode`               | `'overlay'`                                                                     | One of the three above                                                                   |
+| `write_bytes_limit`  | `None`                                                                          | Cap on bytes written through the mount per feed; exceeding it raises `OSError`           |
+| `memory_usage_limit` | [`DEFAULT_MEMORY_USAGE_LIMIT`](api/rust/monty-fs.md#default_memory_usage_limit) | Byte budget for overlay data and transient results; exceeding it raises `MemoryError`    |
 
 Validation happens at construction, not at feed time — a bad `virtual_path` raises immediately.
+Mounts are serviced by the host, including for remote workers; the worker never receives host paths.
+Closing a mount prevents new feeds from using it, but an in-flight feed keeps its own reference.
 
 The names are keyword-only on purpose: mount tools disagree on whether host or virtual comes first (`docker -v` versus
 nginx's `alias`), so requiring names removes the ambiguity.
@@ -188,7 +195,8 @@ Relative symlinks that stay inside the mount are followed in the non-overlay mod
 - **No live file descriptors.** `open()` keeps no OS handle between calls; each read or write is a separate one-shot
     host operation.
     This is what makes mid-execution [snapshots](snapshots.md) safe.
-    It also means `for line in f` is not supported.
+    It also means a file's whole content is loaded into the sandbox on its first read, `seek()` or iteration step;
+    [limitations/open.md](limitations/open.md) lists the iterator consumers that cannot issue that load.
 - **Only regular files** can be read, written or opened.
     FIFOs, sockets and device nodes raise `PermissionError`, because mount I/O must never block on sandbox-reachable
     input.
@@ -197,10 +205,25 @@ Relative symlinks that stay inside the mount are followed in the non-overlay mod
 The full list is in [`limitations/filesystem.md`](limitations/filesystem.md)
 and [`limitations/open.md`](limitations/open.md).
 
+## I/O timeouts and cancellation
+
+Mount I/O has no timeout: it runs on the host between protocol turns, outside `request_timeout` and the sandbox
+duration limits, whose clock is paused while the host works.
+A stalled NFS or FUSE volume can block a feed indefinitely.
+The pool uses blocking threads for filesystem operations, so a stalled call does not block other sessions' timers.
+
+Cancelling the feed does not cancel an in-flight filesystem operation.
+It keeps its blocking thread until it returns, and a read-write mount's write, rename or delete can finish after
+cancellation was observed.
+Use host storage whose availability and side effects are acceptable for the workload.
+
 ## The `os` callback
 
-Operations no mount covers fall through to the `os=` handler.
-It is called as `(function_name, args, kwargs)` and its return value is handed back to the sandbox:
+Operations no mount covers fall through to the `os=` handler, an [`OsHandler`][pydantic_monty.OsHandler].
+[Host module](host-functions.md#importing-host-modules) calls (`import` and `import_stubs`) use the checkout's
+`external_modules` and never reach this handler.
+It is called with keyword arguments, `name`, `args`, `kwargs` and `is_async`, and its return value is handed back to the sandbox.
+Absorb the arguments you do not use with `**_future_kwargs`, so a later version can pass more:
 
 === "Python"
 
@@ -208,8 +231,8 @@ It is called as `(function_name, args, kwargs)` and its return value is handed b
     from pydantic_monty import NOT_HANDLED, Monty
 
 
-    def handle_os(function_name, args, kwargs):
-        if function_name == 'os.getenv' and args[0] == 'STAGE':
+    def handle_os(*, name, args, **_future_kwargs):
+        if name == 'os.getenv' and args[0] == 'STAGE':
             return 'production'
         return NOT_HANDLED
 
@@ -240,9 +263,25 @@ handler at all.
 
 The operations that can arrive are a fixed set: `Path.exists`, `Path.is_file`, `Path.is_dir`, `Path.is_symlink`, `open`,
 `Path.read_text`, `Path.read_bytes`, `Path.write_text`, `Path.write_bytes`, `Path.append_text`, `Path.append_bytes`,
-`Path.mkdir`, `Path.unlink`, `Path.rmdir`, `Path.iterdir`, `Path.stat`, `Path.rename`, `Path.resolve`, `Path.absolute`,
-`os.getenv`, `os.environ`, `date.today`, `datetime.now` and `os.urandom`.
-`os.urandom` also arrives, for 2496 bytes, the first time an unseeded `random` generator draws a value
+`Path.mkdir`, `Path.unlink`, `Path.rmdir`, `Path.iterdir`, `Path.scan`, `Path.stat`, `Path.rename`, `Path.resolve`,
+`Path.absolute`, `os.getenv`, `os.environ` and `os.urandom`.
+
+`Path.scan` answers `os.scandir`, `os.walk`, `Path.walk`, `Path.glob` and `Path.rglob` with one call for a whole subtree.
+Its keyword arguments are `max_depth` (`None` for the whole tree), `follow_symlinks`, and a glob's `pattern` parts,
+`case_sensitive` and `recurse_symlinks`.
+The reply is a list of `(path, is_dir, is_file, is_symlink)` tuples, one for the scanned directory itself (`''`) and
+one per entry below it, with paths relative to the scanned directory.
+The pattern is only a hint: a handler may return entries it cannot match, because the sandbox filters the reply itself.
+A glob's handler may instead reply `{'matches': [path, ...]}`: the matches already selected, relative to the scanned directory, which the sandbox uses as they are.
+A directory matched before the pattern's last part keeps a trailing `/` there.
+Mounts reply that way unless the matches outnumber the entries they read.
+[`AbstractOS.path_scan()`][pydantic_monty.AbstractOS.path_scan] does this by default from `path_iterdir()` and the
+predicates, returning [`ScanEntry`][pydantic_monty.ScanEntry] tuples.
+A handler that declines `Path.scan` makes `glob()` return nothing and `walk()` report a `PermissionError`, since both
+treat a directory they cannot read as CPython does.
+With `os_policy` configured to call the host, the handler also receives clock and sleep calls
+(see [the clock](security.md#the-clock)).
+Unseeded random generators and `random.seed()` call `os.urandom` only under `random_start='call_host'`
 (see [random](limitations/random.md)).
 
 `os` callbacks run in your process with your process's authority.
@@ -259,6 +298,7 @@ sandbox's own no-handler error.
 `feed_start` is different: it surfaces every OS call as a snapshot instead of answering it.
 `snapshot.resume_auto()` applies the same mounts-then-`os` order, and `snapshot.resume_not_handled()` applies the
 no-handler default explicitly.
+Plain `resume(...)` bypasses both mounts and the handler, using only the supplied answer.
 
 ## A virtual filesystem
 
@@ -307,6 +347,11 @@ JavaScript has no equivalent class, so the TypeScript tab answers the same opera
     console.log(await session.feedRun(code, { os: fs })) // 2
     ```
 
+For JavaScript `open` callbacks, return `new MontyFileHandle(path, mode, { position: 0 })` from `@pydantic/monty`.
+The marker canonicalizes `mode` and exposes `path`, `mode`, `position`, `binary`, `readable` and `writable`.
+Paths are virtual POSIX paths; `position` defaults to zero.
+Returning a handle answers only `open`; reads and writes are separate callbacks, never operations on a live host descriptor.
+
 [`OSAccess`][pydantic_monty.OSAccess] backed by [`MemoryFile`][pydantic_monty.MemoryFile] objects is fully sandboxed: content lives in host memory, path traversal cannot escape
 to real files, and `os.getenv` sees only the `environ` mapping you passed.
 
@@ -316,7 +361,10 @@ you wrote.
 
 For anything more specific, subclass `OSAccess` and override the methods you want to change, or implement every
 abstract method of `AbstractOS` yourself; the optional hooks (`path_open`, the append methods, `date_today`,
-`datetime_now`) report [`NOT_HANDLED`][pydantic_monty.NOT_HANDLED] to Monty if you make them raise `NotImplementedError`.
+`datetime_now`, `time`, `sleep`, `async_sleep`) report [`NOT_HANDLED`][pydantic_monty.NOT_HANDLED] to Monty if you make
+them raise `NotImplementedError`.
+`time` receives the name of the `time` function that asked (`'time.time'`, `'time.monotonic'`, `'time.localtime'`,
+...) so one hook can serve every clock or give each its own answer.
 
 ## Rust
 

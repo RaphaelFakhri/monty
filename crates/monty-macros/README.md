@@ -75,8 +75,8 @@ Since CPython's `def` binding never type-checks, `style = def` structs
 should declare fields as raw `Value` (or `StrArg`-in-body) and coerce in the
 function body, so type errors carry the message the CPython function body
 would produce. `bad_arg` is rejected under `style = def` for the same
-reason, and so is `varargs` (a `*args` signature can never raise
-too-many-positional, so the style would have no effect).
+reason. `varargs` is allowed: a `*args` signature never overflows, but a
+missing required parameter still wants the `def` wording.
 
 `style = unpack` models `PyArg_UnpackTuple`'s fixed positional `min..max`
 range, so the derive rejects anything outside that shape: every positional
@@ -122,16 +122,13 @@ unit tests for every attribute-validation error.
 
 ## `#[derive(ToArgs)]`
 
-Inverse of `FromArgs`: projects a struct into the `(Vec<MontyObject>,
-kwargs)` pair host callbacks expect. Reuses the `#[from_args(...)]` field
-attributes so a struct that derives both stays consistent in both
-directions. Field types must implement `monty::args::ToMontyObject`.
+Projects a struct into the `CallArgs` a host callback takes, reusing the `#[from_args(...)]` field attributes.
+`varargs` fields contribute one positional argument per element.
 
 ## Not a standalone crate
 
-Generated code emits `crate::...` paths and only compiles inside `monty`.
-Cross-crate use would need `proc-macro-crate` plus switching to
-`::monty::...` paths.
+Generated code emits `crate::...` paths: `FromArgs` compiles inside `monty`, and `ToArgs` inside `monty-types`.
+Cross-crate use would need `proc-macro-crate` and paths to the appropriate crate.
 
 ## Monty crates
 

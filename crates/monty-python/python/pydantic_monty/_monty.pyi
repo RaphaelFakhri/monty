@@ -1,8 +1,9 @@
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from pathlib import Path
 from typing import Any, Callable, Literal, NoReturn, final
 
+from opentelemetry.context import Context
 from typing_extensions import Self
 
 from . import (
@@ -10,12 +11,13 @@ from . import (
     ExternalResult,
     ExternalSettledResult,
     OsHandler,
+    OSPolicy,
     PrintCallback,
     ResourceLimits,
     SyncSnapshot,
     TypeCheckFormat,
 )
-from .os_access import AbstractOS, OsFunction
+from .os_access import OsFunction
 
 __all__ = [
     '__version__',
@@ -26,10 +28,13 @@ __all__ = [
     'AsyncMontyWebsocket',
     'CollectStreams',
     'CollectString',
+    'ExternalModule',
     'Frame',
+    'SourceRange',
     'Monty',
     'MontyClassProxy',
     'MontyClassTypeProxy',
+    'MontyStdTypeProxy',
     'MontyConversionError',
     'MontyCrashedError',
     'MontyDisconnectError',
@@ -93,6 +98,13 @@ class MountDir:
     that same directory — so build one and reuse it. `'overlay'` writes live in
     each feed's own table and are discarded when the feed ends.
 
+    Mounts passed to one feed must have distinct virtual paths and cover
+    disjoint host directories: a mount whose host directory overlaps another's
+    (the same directory, or one inside the other), or that repeats a virtual
+    path, is rejected when the feed starts with a `MontyRuntimeError` wrapping
+    a `ValueError`, since the stricter mount's mode could otherwise be bypassed
+    through the other mount's paths.
+
     **Warning: `mode='read-write'` writes files from untrusted code to your
     real filesystem.**
 
@@ -141,7 +153,7 @@ class MountDir:
         virtual_path: str,
         mode: Literal['read-only', 'read-write', 'overlay'] = 'overlay',
         write_bytes_limit: int | None = None,
-        memory_usage_limit: int = 100_000_000,
+        memory_usage_limit: int = ...,
     ) -> MountDir:
         """Configure a mount point; validation happens here, not at feed time.
 
@@ -172,8 +184,8 @@ class MountDir:
             write_bytes_limit: Cap on cumulative bytes written through the
                 mount within one feed; exceeding it raises `OSError` in the
                 sandbox. `None` (default) means unlimited.
-            memory_usage_limit: Per-mount budget in bytes (default 100 MB,
-                matches DEFAULT_MEMORY_USAGE_LIMIT in rust) shared by retained
+            memory_usage_limit: Per-mount budget in bytes (default: monty-fs's
+                `DEFAULT_MEMORY_USAGE_LIMIT`) shared by retained
                 overlay data and transient filesystem results; an operation that
                 would exceed it raises `MemoryError` in the sandbox.
         """
@@ -302,6 +314,41 @@ class Frame:
         """dict of attributes."""
 
 @final
+class SourceRange:
+    """Where the expression that suspended execution is in the source.
+
+    Every snapshot exposes one as `position`: the call expression of a
+    `FunctionSnapshot`, the name (or attribute access) of a
+    `NameLookupSnapshot`, and the `await` the main task is blocked on
+    for a `FutureSnapshot`. `start` and `end` are UTF-8 byte offsets into
+    the source, `end` exclusive, so slice the encoded source:
+    `source.encode()[position.start:position.end].decode()`. A worker that
+    predates the field reports none: `filename` is then empty and both
+    offsets 0.
+    """
+
+    def __new__(cls, *, filename: str, start: int, end: int) -> SourceRange: ...
+    @property
+    def filename(self) -> str:
+        """The source the range indexes, named as in a traceback `Frame`:
+        `<python-input-N>` for the session's N-th feed (a suspension inside a
+        function defined by an earlier feed points into that feed), or
+        `<string>` inside an `eval()` / `exec()` string."""
+
+    @property
+    def start(self) -> int:
+        """UTF-8 byte offset where the expression starts."""
+
+    @property
+    def end(self) -> int:
+        """UTF-8 byte offset where the expression ends (exclusive)."""
+
+    def dict(self) -> dict[str, int | str]:
+        """dict of attributes."""
+
+    def __repr__(self) -> str: ...
+
+@final
 class MontyFileHandle:
     """Host-side handle to a file opened inside a Monty sandbox.
 
@@ -356,6 +403,35 @@ class MontyFileHandle:
     @property
     def writable(self) -> bool:
         """`True` if the mode permits `write()` (`'w'`, `'a'`, `'r+'`, `'w+'`, `'a+'`, and binary variants)."""
+
+@final
+class ExternalModule:
+    """A host module for `external_modules`: its attributes, optional `.pyi` stubs and id.
+
+    `attrs` is copied at construction: callables cross as host functions, nested
+    `ExternalModule`s as submodules (`import pkg.sub`), other values as attributes;
+    keys starting with `_` are not exposed. A module returned from the sandbox decodes
+    to an `ExternalModule` with the id it imported with.
+    """
+
+    def __new__(
+        cls, attrs: dict[str, Any], *, stubs: str | None = None, id: uuid.UUID | None = None
+    ) -> ExternalModule: ...
+    @property
+    def attrs(self) -> dict[str, Any]:
+        """A copy of the module's attributes."""
+
+    @property
+    def stubs(self) -> str | None:
+        """The module's `.pyi` source; needed for type checking unless the checker supplies it.
+        Submodule stubs form a package tree."""
+
+    @property
+    def id(self) -> uuid.UUID:
+        """Identity of the module, carried by every import of it."""
+
+    def __repr__(self) -> str: ...
+    def __eq__(self, value: object, /) -> bool: ...
 
 @final
 class MontyClassProxy:
@@ -414,6 +490,26 @@ class MontyClassTypeProxy:
     def __eq__(self, value: object, /) -> bool: ...
 
 @final
+class MontyStdTypeProxy:
+    """Read-only proxy for a builtin function, or a type object outside the
+    data-type allowlist, returned from the sandbox: `open`, `type(print)`,
+    `functools.partial`. Only the name crosses, so the host never holds a live
+    callable built from sandbox output. Passed back in, it is the builtin again.
+    """
+
+    @property
+    def kind(self) -> Literal['function', 'type']:
+        """`'function'` for a builtin function, `'type'` for a type object."""
+
+    @property
+    def name(self) -> str:
+        """The name the sandbox renders the builtin as (`'open'`, `'functools.partial'`)."""
+
+    def __repr__(self) -> str: ...
+    def __eq__(self, value: object, /) -> bool: ...
+    def __hash__(self) -> int: ...
+
+@final
 class MontyCrashedError(MontyError):
     """Raised when the sandbox is gone and the session with it.
 
@@ -460,10 +556,11 @@ class MontyShutdown(MontyError):
     that raised it **did not run**, so re-running it on a fresh session is
     safe.
 
-    `dump` carries the session state captured just before shutdown — restore
-    it on a new session to carry the session across a server restart, with
+    `dump` is what restores the session on a new one, with
     `session.load_session` (idle, between feeds) or `session.load_snapshot`
-    (suspended mid-feed).
+    (suspended mid-feed): the session's ID from a server that stores sessions.
+    It is `None` from a server that stores nothing, for an ephemeral session,
+    or when the server could not store the session in time.
 
     One caveat: if the interrupted request was answering a suspension (an
     external function or `os` callback), the host already ran that call and
@@ -475,7 +572,7 @@ class MontyShutdown(MontyError):
 
     @property
     def dump(self) -> bytes | None:
-        """Restorable session dump, or `None` when nothing had run yet or the server's dump failed."""
+        """What `load_session` / `load_snapshot` restores, or `None` when there is nothing to load."""
 
 @final
 class Monty:
@@ -503,6 +600,8 @@ class Monty:
         checkout_timeout: float | None = None,
         request_timeout: float | None = None,
         max_checkouts_per_worker: int | None = None,
+        feed_duration_limit_grace: float | None = 1.0,
+        turn_duration_limit_grace: float | None = 1.0,
     ) -> Self:
         """
         Configure a worker pool; the workers are spawned by `with`.
@@ -522,6 +621,11 @@ class Monty:
                 with `timed_out=True`. Trusted synchronous span and log callbacks
                 delay enforcement while they run. Backstops sandbox `limits`.
             max_checkouts_per_worker: Recycle a worker after this many sessions.
+            feed_duration_limit_grace: Seconds the parent waits past a feed's
+                `max_feed_duration_secs` before killing the worker, giving the
+                sandbox time to raise `TimeoutError` itself rather than the
+                session dying with its worker. `None` disables this backstop.
+            turn_duration_limit_grace: The same, for `max_turn_duration_secs`.
         """
 
     def __enter__(self) -> Self: ...
@@ -537,6 +641,8 @@ class Monty:
         type_check_color: bool = False,
         assert_message_annotations: bool | int = ...,
         print_flush_interval: float | None = None,
+        os_policy: OSPolicy | None = None,
+        external_modules: Mapping[str, ExternalModule | Callable[[], ExternalModule]] | None = None,
     ) -> MontySession:
         """
         Prepare a REPL session served by a dedicated worker.
@@ -555,6 +661,8 @@ class Monty:
                 successfully executed snippet is appended to the accumulated
                 context used for type-checking subsequent snippets.
             type_check_stubs: Stub declarations made available to type checking.
+                A host module's own stub is the `stubs` of its `ExternalModule`
+                in `external_modules`.
             type_check_format: How `MontyTypingError` diagnostics are rendered;
                 `None` (the default) means `'full'`. Chosen here rather than on
                 the error because the checker's structured diagnostics never
@@ -575,6 +683,14 @@ class Monty:
                 before a host call and before a run ends, so this only sets
                 how far live output may lag — never what arrives, or in what
                 order.
+            os_policy: Session clock, sleep and random initialization policies;
+                see `OSPolicy`. Defaults to the worker's clock in UTC and its
+                entropy, with sleeps handled by the pool and capped at ten seconds.
+            external_modules: Modules the session may import, keyed by name: an
+                `ExternalModule` or a zero-argument factory returning one, called
+                once per session when first needed. The mapping is read live and
+                each entry validated when first imported, so modules may be
+                added later.
         """
 
 @final
@@ -601,7 +717,7 @@ class MontySession:
         | None = None,
         mount: MountDir | list[MountDir] | None = None,
         cwd: str | None = None,
-        os: Callable[[OsFunction, tuple[Any, ...], dict[str, Any]], Any] | AbstractOS | None = None,
+        os: OsHandler | None = None,
         skip_type_check: bool = False,
     ) -> Any:
         """
@@ -617,7 +733,9 @@ class MontySession:
                 (if any) is converted to a Python object and returned.
             inputs: Values eagerly bound as globals before the snippet runs —
                 every entry is converted and bound once, whether or not it is
-                referenced.
+                referenced. An object appearing under two names, or twice
+                inside one value, is one sandbox object; a cyclic value
+                raises `ValueError`.
             external_lookup: Host values resolving names the snippet leaves
                 undefined, lazily and on demand: a callable entry becomes a host
                 function the sandbox can call, any other value is converted and
@@ -639,8 +757,8 @@ class MontySession:
                 `os.getcwd()` reports it and relative paths resolve against
                 it before reaching a mount or the `os` handler.
             os: Fallback handler for OS calls (e.g. filesystem access) not
-                covered by a mount, invoked as `(function_name, args, kwargs)`,
-                or an `AbstractOS` instance.
+                covered by a mount — an `OsHandler` such as an `AbstractOS`
+                instance, called with keyword arguments.
             skip_type_check: Skip type checking for this feed even when the
                 session was checked out with `type_check=True`.
 
@@ -678,9 +796,9 @@ class MontySession:
             snapshot = snapshot.resume_auto()
         ```
 
-        Unlike `feed_run`, `external_lookup` is *not* consulted during this
-        initial drive — external calls and name lookups are still surfaced as
-        snapshots; it is only captured for later `resume_auto()` calls.
+        External calls, imports and name lookups return snapshots.
+        `external_lookup` is captured for `resume_auto()`, which also answers
+        imports from the session's `external_modules`.
 
         Use `snapshot.dump()` to checkpoint the worker mid-execution and
         `load_snapshot` to restore it.
@@ -690,7 +808,9 @@ class MontySession:
                 (if any) is the `MontyComplete.output` when the feed completes.
             inputs: Values eagerly bound as globals before the snippet runs —
                 every entry is converted and bound once, whether or not it is
-                referenced.
+                referenced. An object appearing under two names, or twice
+                inside one value, is one sandbox object; a cyclic value
+                raises `ValueError`.
             external_lookup: Host functions and values, by name, that
                 `resume_auto()` resolves external calls and undefined names
                 against (as in `feed_run`). Captured for `resume_auto()`; not
@@ -705,10 +825,10 @@ class MontySession:
             cwd: The sandbox's working directory for the whole feed (there is
                 no `cwd=` on `resume`); see `feed_run`. A dump taken mid-feed
                 carries it, so `load_snapshot` needs none.
-            os: Fallback handler for OS calls not covered by a mount, invoked
-                as `(function_name, args, kwargs)`, or an `AbstractOS` instance.
-                Consulted only by `resume_auto()` — `feed_start` always surfaces
-                OS calls as snapshots.
+            os: Fallback handler for OS calls not covered by a mount — an
+                `OsHandler` such as an `AbstractOS` instance. Consulted only by
+                `resume_auto()` — `feed_start` always surfaces OS calls as
+                snapshots.
             skip_type_check: Skip type checking for this feed even when the
                 session was checked out with `type_check=True`.
         """
@@ -756,18 +876,25 @@ class MontySession:
         limits / type-check state (the `checkout()` config for those is not
         applied). The class-instance store starts empty — it is host state and
         never part of a dump, so restored `ClassInstance` values fall back to
-        `MontyClassProxy` stand-ins and method calls on them fail. `mount`
-        re-establishes the suspended feed's mounts, which are never part of the
-        dump — pass the same mounts the original feed used, or its filesystem
-        calls degrade into unhandled OS calls. `'overlay'` writes made before
-        the dump are not preserved (the restored overlay starts empty). Raises
-        if the dump is actually an idle session.
+        `MontyClassProxy` stand-ins and method calls on them fail. Raises if
+        the dump is actually an idle session.
 
-        `external_lookup` / `os` are captured for `resume_auto()`, exactly as on
-        `feed_start`. One caveat applies to a *restored* snapshot: a restored
-        `FutureSnapshot`'s pending coroutines are gone (they lived in the
-        previous process), so `resume_auto()` on it raises — resolve it manually
-        with `resume({call_id: ...})`.
+        Arguments:
+            state: Bytes from `snapshot.dump()`.
+            mount: The suspended feed's mounts, never part of the dump — pass
+                the same mounts the original feed used, or its filesystem
+                calls degrade into unhandled OS calls. `'overlay'` writes made
+                before the dump are not preserved (the restored overlay starts
+                empty).
+            print_callback: Receives the resumed feed's `print()` output, as
+                on `feed_run`.
+            external_lookup: Captured for `resume_auto()`, exactly as on
+                `feed_start`; host state, never part of a dump, so a restored
+                snapshot needs it again. A restored `FutureSnapshot`'s pending
+                coroutines are gone (they lived in the previous process), so
+                `resume_auto()` on it raises — resolve it manually with
+                `resume({call_id: ...})`.
+            os: Captured for `resume_auto()`, as above.
         """
 
     def dump(self) -> bytes:
@@ -825,6 +952,8 @@ class AsyncMonty:
         checkout_timeout: float | None = None,
         request_timeout: float | None = None,
         max_checkouts_per_worker: int | None = None,
+        feed_duration_limit_grace: float | None = 1.0,
+        turn_duration_limit_grace: float | None = 1.0,
     ) -> Self:
         """
         Configure a worker pool; the workers are spawned by `async with`.
@@ -845,13 +974,17 @@ class AsyncMonty:
         type_check_color: bool = False,
         assert_message_annotations: bool | int = ...,
         print_flush_interval: float | None = None,
+        os_policy: OSPolicy | None = None,
+        external_modules: Mapping[str, ExternalModule | Callable[[], Awaitable[ExternalModule]]] | None = None,
     ) -> AsyncMontySession:
         """
         Prepare a REPL session served by a dedicated worker.
 
         The worker is checked out of the pool by `async with` on the returned
         session and returned to the pool when the `async with` block exits.
-        Arguments are identical to `Monty.checkout`.
+        Arguments are identical to `Monty.checkout`, except that an
+        `external_modules` factory returns an awaitable of the `ExternalModule`;
+        the factories a feed needs at once are awaited concurrently.
         """
 
 @final
@@ -874,6 +1007,14 @@ class AsyncMontyWebsocket:
     drop (idle, session or turn timeout, capacity) closes the connection and
     raises `MontyDisconnectError`.
 
+    A server that stores sessions gives each one an ID (`session.session_id`)
+    instead of handing state back: `dump()` writes the current state to a
+    record that never changes and returns its ID, and `load_session` /
+    `load_snapshot` start a new session from either ID, in any process.
+    `checkout(ephemeral=True)` opts a session out. When such a server drains,
+    the session resumes on another server without the caller noticing (see
+    `auto_resume`).
+
     ```python
     async with AsyncMontyWebsocket('ws://127.0.0.1:8799') as pool:
         async with pool.checkout() as session:
@@ -889,6 +1030,9 @@ class AsyncMontyWebsocket:
         checkout_timeout: float | None = None,
         request_timeout: float | None = 10.0,
         connect_headers: Callable[[], Mapping[str, str]] | None = None,
+        feed_duration_limit_grace: float | None = 1.0,
+        turn_duration_limit_grace: float | None = 1.0,
+        auto_resume: bool = True,
     ) -> Self:
         """
         Configure a remote worker pool; connections are made by `async with` and
@@ -923,6 +1067,17 @@ class AsyncMontyWebsocket:
                 `user-agent` and the `traceparent` the Logfire integration
                 adds, and a malformed name or value raises `RuntimeError` as
                 the session is entered.
+            feed_duration_limit_grace: Seconds the parent waits past a feed's
+                `max_feed_duration_secs` before killing the worker, giving the
+                sandbox time to raise `TimeoutError` itself rather than the
+                session dying with its worker. `None` disables this backstop.
+            turn_duration_limit_grace: The same, for `max_turn_duration_secs`.
+            auto_resume: When a server that stores sessions drains one, redial,
+                load the state it named into a new session and re-send the
+                request it did not run, instead of raising `MontyShutdown`; the
+                session's suspension and sleep totals carry over. `MontyShutdown`
+                is still raised when the resume fails. A closed connection is
+                never resumed: the request may have run.
         """
 
     async def __aenter__(self) -> Self: ...
@@ -938,21 +1093,35 @@ class AsyncMontyWebsocket:
         type_check_color: bool = False,
         assert_message_annotations: bool | int = ...,
         print_flush_interval: float | None = None,
+        os_policy: OSPolicy | None = None,
+        external_modules: Mapping[str, ExternalModule | Callable[[], Awaitable[ExternalModule]]] | None = None,
+        ephemeral: bool | None = None,
+        profile: str | None = None,
     ) -> AsyncMontySession:
         """
         Prepare a REPL session served by a dedicated remote connection.
 
-        Identical to `AsyncMonty.checkout`; the connection is opened by
-        `async with` on the returned session.
+        Identical to `AsyncMonty.checkout`, except for `ephemeral` and
+        `profile`; the connection is opened by `async with` on the returned
+        session.
+
+        Arguments:
+            ephemeral: Whether a server that stores sessions may store this one.
+                `True` means the server never stores it on its own and it gets
+                no `session_id`; `False` asks for it to be stored; `None` takes
+                the server's default. Servers that store nothing ignore it.
+            profile: The name of the server-side profile to run the session
+                under; `None` takes the server's default. Sent to the server
+                as-is; the `monty` worker itself ignores it.
         """
 
 @final
 class AsyncMontySession:
     """
-    A REPL session running in a dedicated `monty` subprocess worker.
+    A REPL session running in a dedicated `monty` worker, local or remote.
 
-    Obtained from `AsyncMonty.checkout()` and used as an async context
-    manager. Session state (globals, functions) persists across
+    Obtained from `AsyncMonty.checkout()` or `AsyncMontyWebsocket.checkout()`
+    and used as an async context manager. Session state (globals, functions) persists across
     `feed_run` calls within the session.
     """
 
@@ -970,7 +1139,7 @@ class AsyncMontySession:
         | None = None,
         mount: MountDir | list[MountDir] | None = None,
         cwd: str | None = None,
-        os: Callable[[OsFunction, tuple[Any, ...], dict[str, Any]], Any] | AbstractOS | None = None,
+        os: OsHandler | None = None,
         skip_type_check: bool = False,
     ) -> Any:
         """
@@ -990,7 +1159,9 @@ class AsyncMontySession:
                 (if any) is converted to a Python object and returned.
             inputs: Values eagerly bound as globals before the snippet runs —
                 every entry is converted and bound once, whether or not it is
-                referenced.
+                referenced. An object appearing under two names, or twice
+                inside one value, is one sandbox object; a cyclic value
+                raises `ValueError`.
             external_lookup: Host values resolving names the snippet leaves
                 undefined, lazily and on demand: a callable entry (sync or a
                 coroutine function) becomes a host function the sandbox can call,
@@ -1013,8 +1184,8 @@ class AsyncMontySession:
                 `os.getcwd()` reports it and relative paths resolve against
                 it before reaching a mount or the `os` handler.
             os: Fallback handler for OS calls (e.g. filesystem access) not
-                covered by a mount, invoked as `(function_name, args, kwargs)`,
-                or an `AbstractOS` instance.
+                covered by a mount — an `OsHandler` such as an `AbstractOS`
+                instance, called with keyword arguments.
             skip_type_check: Skip type checking for this feed even when the
                 session was checked out with `type_check=True`.
         """
@@ -1036,9 +1207,9 @@ class AsyncMontySession:
         (whose `resume(...)` / `resume_auto()` is awaitable) or a
         `MontyComplete`.
 
-        As in the sync version, `external_lookup` (and `os`) are captured for
-        `await snapshot.resume_auto()` rather than consulted during this initial
-        drive. A coroutine external answered by `resume_auto()` is awaited
+        As in the sync version, `external_lookup` and `os` are captured for
+        `await snapshot.resume_auto()` rather than consulted during this
+        initial drive. A coroutine external answered by `resume_auto()` is awaited
         directly when the snapshot's `allow_eager_await` is true; otherwise it
         is awaited concurrently and yields an `AsyncFutureSnapshot` whose
         `resume_auto()` settles the pending coroutines.
@@ -1048,7 +1219,9 @@ class AsyncMontySession:
                 (if any) is the `MontyComplete.output` when the feed completes.
             inputs: Values eagerly bound as globals before the snippet runs —
                 every entry is converted and bound once, whether or not it is
-                referenced.
+                referenced. An object appearing under two names, or twice
+                inside one value, is one sandbox object; a cyclic value
+                raises `ValueError`.
             external_lookup: Host functions and values, by name, that
                 `resume_auto()` resolves external calls and undefined names
                 against (as in `feed_run`). Callables may be coroutine
@@ -1064,10 +1237,10 @@ class AsyncMontySession:
             cwd: The sandbox's working directory for the whole feed (there is
                 no `cwd=` on `resume`); see `feed_run`. A dump taken mid-feed
                 carries it, so `load_snapshot` needs none.
-            os: Fallback handler for OS calls not covered by a mount, invoked
-                as `(function_name, args, kwargs)`, or an `AbstractOS` instance.
-                Consulted only by `resume_auto()` — `feed_start` always surfaces
-                OS calls as snapshots.
+            os: Fallback handler for OS calls not covered by a mount — an
+                `OsHandler` such as an `AbstractOS` instance. Consulted only by
+                `resume_auto()` — `feed_start` always surfaces OS calls as
+                snapshots.
             skip_type_check: Skip type checking for this feed even when the
                 session was checked out with `type_check=True`.
         """
@@ -1077,6 +1250,14 @@ class AsyncMontySession:
         Async counterpart of `MontySession.load_session`: restore a session between feeds.
 
         The snapshot trust requirements of `MontySession.load_session` also apply here.
+
+        Against a server that stores sessions, `state` may be an ID: a
+        `session_id` loads the state as of that session's last park, and an ID
+        returned by `dump()` loads the state dumped. Loading either always
+        starts a new session, with its own `session_id`; the record is unchanged
+        and the session that wrote it is never resumed in place, so loading one
+        ID twice gives two independent sessions. A server that stores nothing
+        raises `MontyRuntimeError`; the session stays usable.
         """
 
     async def load_snapshot(
@@ -1095,15 +1276,28 @@ class AsyncMontySession:
         Restore a snapshot generated while a block of code is running (e.g.
         after `feed_start`) and return the re-announced snapshot to resume.
 
-        `external_lookup` / `os` are captured for `resume_auto()`, with the same
-        restored-snapshot caveats as the sync method (a restored `FutureSnapshot`
-        cannot be driven with `resume_auto()` — its pending coroutines are gone).
+        Arguments:
+            state: Bytes from `snapshot.dump()`, or an ID as in `load_session`.
+            mount: The suspended feed's mounts, as on `MontySession.load_snapshot`.
+            print_callback: Receives the resumed feed's `print()` output.
+            external_lookup: Captured for `resume_auto()`, with the same
+                restored-snapshot caveats as the sync method: host state is not
+                in the dump, so pass it again, and a restored `FutureSnapshot`
+                cannot be driven with `resume_auto()` — its pending coroutines
+                are gone.
+            os: Captured for `resume_auto()`, as above.
         """
 
     async def dump(self) -> bytes:
         """
         Serialize the worker's session state (idle or suspended) to opaque
         bytes using monty's existing dump format. The session stays usable.
+
+        A server that stores sessions instead writes the state to a record that
+        never changes and returns that record's ID, which `load_session` /
+        `load_snapshot` start new sessions from. The session continues under
+        its existing `session_id`. A server that stores nothing raises
+        `MontyRuntimeError`; the session stays usable.
         """
 
     async def install_dependencies(self, requirements: list[str]) -> None:
@@ -1127,6 +1321,15 @@ class AsyncMontySession:
         on another thread (the getter never blocks on a running turn).
         """
 
+    @property
+    def session_id(self) -> bytes | None:
+        """The opaque ID a server that stores sessions gave this session.
+
+        Pass it to `load_session` / `load_snapshot` to start a new session from
+        the state as of this one's last park, from any process. `None` for local
+        workers, ephemeral sessions and servers that store nothing.
+        """
+
 @final
 class MontyComplete:
     """The result of a completed `feed_start` execution."""
@@ -1148,10 +1351,18 @@ class FunctionSnapshot:
 
     @property
     def allow_eager_await(self) -> bool:
-        """Whether the worker permits eager coroutine resolution at this call."""
+        """Whether the worker permits eager coroutine resolution at this call.
+
+        True for a host function or `asyncio.sleep` awaited at once while no other
+        sandbox task can run, so a coroutine answer is awaited in place rather than
+        surfacing as a future snapshot.
+        """
 
     @property
     def script_name(self) -> str: ...
+    @property
+    def position(self) -> SourceRange:
+        """The call expression that suspended execution."""
     @property
     def is_os_function(self) -> bool: ...
     @property
@@ -1170,6 +1381,14 @@ class FunctionSnapshot:
     def args(self) -> tuple[Any, ...]: ...
     @property
     def kwargs(self) -> dict[str, Any]: ...
+    def trace_context(self) -> Context:
+        """Return the suspension's OTel context, without activating it or resuming.
+
+        Preserves context entries captured at `feed_start` / `load_snapshot`; without Monty tracing,
+        returns that captured context unchanged. Raises `ImportError` without `opentelemetry-api`
+        or `RuntimeError` after resume. Previously returned contexts do not keep the span open.
+        """
+
     def resume(self, result: ExternalResult) -> SyncSnapshot:
         """Resume with the call's result; resumes at most once.
 
@@ -1185,12 +1404,10 @@ class FunctionSnapshot:
         """Answer this call automatically, then return the next snapshot (or
         `MontyComplete`). Resumes at most once.
 
-        An OS call is offered to the feed's mounts first, falling back to the
-        `os=` captured at `feed_start` / `load_snapshot` and then to monty's
-        unhandled default. An external call is resolved through
-        `external_lookup=`; a name absent from it makes the sandbox raise
-        `NameError` (as in `feed_run`). A coroutine external raises
-        `RuntimeError` — use `AsyncMonty` for async externals."""
+        Imports and stub requests use the session's `external_modules`. Other OS calls
+        try mounts, then `os`, then Monty's unhandled default. External calls use
+        `external_lookup`; missing names raise `NameError`. Coroutine results raise
+        `RuntimeError`; use `AsyncMonty` for async externals."""
 
     def dump(self) -> bytes:
         """Serialize the suspended worker; restore via `MontySession.load_snapshot`."""
@@ -1206,12 +1423,18 @@ class NameLookupSnapshot:
     @property
     def script_name(self) -> str: ...
     @property
+    def position(self) -> SourceRange:
+        """The name, or the attribute access, that suspended execution."""
+    @property
     def variable_name(self) -> str: ...
     @property
     def object_id(self) -> uuid.UUID | None:
         """Session uuid of the receiver for a lazy attribute lookup; `None`
         for a plain undefined-name lookup. An omitted-`value` resume raises
         `AttributeError` (not `NameError`) for attribute lookups."""
+    def trace_context(self) -> Context:
+        """As `FunctionSnapshot.trace_context`, for this name lookup."""
+
     def resume(self, *, value: Any = ...) -> SyncSnapshot:
         """Resume by binding the name to `value` (any value, including `None`), or
         omit `value` to leave the name undefined — the sandbox then raises
@@ -1239,7 +1462,13 @@ class FutureSnapshot:
     @property
     def script_name(self) -> str: ...
     @property
+    def position(self) -> SourceRange:
+        """The `await` the main task is blocked on."""
+    @property
     def pending_call_ids(self) -> list[int]: ...
+    def trace_context(self) -> Context:
+        """As `FunctionSnapshot.trace_context`, for this future-resolution suspension."""
+
     def resume(self, results: dict[int, ExternalSettledResult]) -> SyncSnapshot:
         """Resume with settled results for one or more pending futures (by
         `call_id`); a future cannot resolve to another `future`."""
@@ -1265,6 +1494,9 @@ class AsyncFunctionSnapshot:
     @property
     def script_name(self) -> str: ...
     @property
+    def position(self) -> SourceRange:
+        """As `FunctionSnapshot.position`: the call expression."""
+    @property
     def is_os_function(self) -> bool: ...
     @property
     def object_id(self) -> uuid.UUID | None:
@@ -1278,6 +1510,9 @@ class AsyncFunctionSnapshot:
     def args(self) -> tuple[Any, ...]: ...
     @property
     def kwargs(self) -> dict[str, Any]: ...
+    def trace_context(self) -> Context:
+        """As `FunctionSnapshot.trace_context`; returns a context, not an awaitable."""
+
     async def resume(self, result: ExternalResult) -> AsyncSnapshot: ...
     async def resume_not_handled(self) -> AsyncSnapshot: ...
     async def resume_auto(self) -> AsyncSnapshot:
@@ -1294,10 +1529,16 @@ class AsyncNameLookupSnapshot:
     @property
     def script_name(self) -> str: ...
     @property
+    def position(self) -> SourceRange:
+        """As `NameLookupSnapshot.position`: the name or attribute access."""
+    @property
     def variable_name(self) -> str: ...
     @property
     def object_id(self) -> uuid.UUID | None:
         """As `NameLookupSnapshot.object_id`: the host object a lazy attribute is read from."""
+
+    def trace_context(self) -> Context:
+        """As `FunctionSnapshot.trace_context`; returns a context, not an awaitable."""
 
     async def resume(self, *, value: Any = ...) -> AsyncSnapshot: ...
     async def resume_auto(self) -> AsyncSnapshot:
@@ -1313,7 +1554,13 @@ class AsyncFutureSnapshot:
     @property
     def script_name(self) -> str: ...
     @property
+    def position(self) -> SourceRange:
+        """As `FutureSnapshot.position`: the main task's `await`."""
+    @property
     def pending_call_ids(self) -> list[int]: ...
+    def trace_context(self) -> Context:
+        """As `FunctionSnapshot.trace_context`; returns a context, not an awaitable."""
+
     async def resume(self, results: dict[int, ExternalSettledResult]) -> AsyncSnapshot: ...
     async def resume_auto(self) -> AsyncSnapshot:
         """Wait for one or more coroutine externals spawned by earlier

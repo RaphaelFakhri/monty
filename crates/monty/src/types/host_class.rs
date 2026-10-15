@@ -5,7 +5,7 @@ use std::{
     mem,
 };
 
-use monty_types::{DictPairs, MontyClassType, MontyUuid};
+use monty_types::{MontyUuid, unstable::ClassTypeNode};
 
 use super::{Dict, LazyHeapSet, PyTrait, attribute_name_value, str::allocate_string};
 use crate::{
@@ -65,15 +65,6 @@ impl HostClass {
             class_id,
             attrs,
         }
-    }
-
-    /// Rebuilds the wire [`MontyClassType`] this instance's class crosses out
-    /// as. The worker sends the `type` branch of an instance with empty
-    /// `attrs` (the host resolves the class by id); on the way in a host may
-    /// fill them, and the class's type object refreshes from them.
-    #[must_use]
-    pub fn class_type(&self, heap: &Heap, interns: &Interns) -> MontyClassType {
-        host_class_type(heap, self.class_id).class_type(interns)
     }
 
     /// Returns the class name, read from the shared class entry.
@@ -190,7 +181,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, HostClass> {
         let name = self.get(vm.heap).name(vm.heap, vm.interns).to_owned();
         let attr_count = self.get(vm.heap).attrs.len();
         write_dataclass_repr(f, &name, attr_count, vm, heap_ids, |i, vm| {
-            let Some((key, _)) = self.get(vm.heap).attrs.item_at(i) else {
+            let Some((key, _)) = self.get(vm.heap).attrs.iter().nth(i) else {
                 return Ok((String::new(), None));
             };
             let key = key.clone_with_heap(vm.heap);
@@ -211,9 +202,20 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, HostClass> {
             let value = self
                 .get(vm.heap)
                 .attrs
-                .item_at(i)
+                .iter()
+                .nth(i)
                 .map(|(_, v)| v.clone_with_heap(vm.heap));
             Ok((key_str, value))
+        })
+    }
+
+    /// Suspends as a `__call__` on the instance's uuid: whether a host object
+    /// is callable, and what calling it does, is the host's decision.
+    fn py_call(&mut self, args: ArgValues, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        Ok(CallResult::MethodCall {
+            name: EitherStr::Heap("__call__".to_owned()),
+            args,
+            object_id: self.get(vm.heap).instance_id(),
         })
     }
 
@@ -307,7 +309,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, HostClass> {
 ///
 /// Each caller supplies its own field list via `field`, mapping an index to that
 /// field's name and a cloned value (dropped here). A cycle renders `...`, a
-/// `None` value `<?>`, and exhausting `max_duration` truncates `...[timeout]`.
+/// `None` value `<?>`, and exhausting a time limit truncates `...[timeout]`.
 ///
 /// `field` is resolved immediately before that field is written, never all up
 /// front, so a `__repr__` that mutates a later field is observed — matching the
@@ -329,7 +331,7 @@ pub(crate) fn write_dataclass_repr<'h>(
     for i in 0..field_count {
         if i > 0 {
             // Same between-item checkpoint as sequence repr, so a wide instance
-            // cannot outrun `max_duration`.
+            // cannot outrun its time limit.
             if vm.heap.tracker.check_memory_time_every(i).is_err() {
                 f.write_str(", ...[timeout]")?;
                 break;
@@ -422,17 +424,17 @@ impl HostClassType {
         self.is_dataclass
     }
 
-    /// Rebuilds the wire [`MontyClassType`] this type object crosses out as —
+    /// Rebuilds the [`ClassTypeNode`] this type object crosses out as —
     /// minus `attrs`, which hold heap `Value`s: the object bridge converts
     /// and appends them when the type crosses out as a value.
     #[must_use]
-    pub fn class_type(&self, interns: &Interns) -> MontyClassType {
-        MontyClassType {
+    pub fn class_type(&self, interns: &Interns) -> ClassTypeNode {
+        ClassTypeNode {
             name: self.name.as_str(interns).to_owned(),
             id: self.type_id,
             host_defined: true,
             is_dataclass: self.is_dataclass,
-            attrs: DictPairs::default(),
+            attrs: Vec::new(),
         }
     }
 }
@@ -465,6 +467,16 @@ impl<'h> HeapRead<'h, HostClassType> {
 }
 
 impl<'h> PyTrait<'h> for HeapObjectRead<'h, HostClassType> {
+    /// Suspends as a `__call__` on the class's uuid: constructing a host class
+    /// is the host's own policy decision, not the sandbox's.
+    fn py_call(&mut self, args: ArgValues, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        Ok(CallResult::MethodCall {
+            name: EitherStr::Heap("__call__".to_owned()),
+            args,
+            object_id: self.get(vm.heap).type_id(),
+        })
+    }
+
     fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::Type
     }

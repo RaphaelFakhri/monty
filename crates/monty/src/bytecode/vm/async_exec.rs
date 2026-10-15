@@ -11,7 +11,7 @@ use std::{mem, task::Poll};
 use monty_types::{InvalidInputError, MontyException, ResourceError, ResourceTracker};
 use smallvec::{SmallVec, smallvec};
 
-use super::{AwaitResult, CallFrame, FrameExit, FrameFunction, Opcode, VM};
+use super::{AwaitResult, CallFrame, FrameExit, Opcode, VM, frame_code, function_namespace, stack_index};
 use crate::{
     asyncio::{
         AwaitedGather, Awaiter, CallId, Coroutine, CoroutineState, ExternalFuture, ExternalFutureState, GatherFuture,
@@ -34,8 +34,8 @@ use crate::{
 impl<'h> VM<'h> {
     /// Allows eager host resolution only for an immediate await with no competing work.
     pub(crate) fn allow_eager_await(&self) -> bool {
-        let frame = self.current_frame();
-        frame.bytecode.get(frame.ip) == Some(&(Opcode::Await as u8)) && self.scheduler.can_await_eagerly()
+        let next = self.current_frame.bytecode.get(self.current_frame.ip);
+        next == Some(&(Opcode::Await as u8)) && self.scheduler.can_await_eagerly()
     }
 
     /// Executes the Await opcode.
@@ -90,6 +90,7 @@ impl<'h> VM<'h> {
 
         // Extract coroutine data before mutating
         let func_id = coro.get(self.heap).func_id;
+        let globals = coro.get(self.heap).globals;
         let namespace_values: Vec<Value> = coro
             .get(self.heap)
             .namespace
@@ -101,7 +102,7 @@ impl<'h> VM<'h> {
         coro.get_mut(self.heap).state = CoroutineState::Running;
 
         // Create namespace and push frame (guard drops awaitable at scope exit)
-        self.start_coroutine_frame(func_id, namespace_values)?;
+        self.start_coroutine_frame(func_id, namespace_values, globals)?;
 
         Ok(AwaitResult::FramePushed)
     }
@@ -373,9 +374,14 @@ impl<'h> VM<'h> {
     ///
     /// Extends the VM stack with the coroutine's pre-bound namespace values
     /// and pushes a new frame to execute the coroutine's function body.
-    fn start_coroutine_frame(&mut self, func_id: FunctionId, namespace_values: Vec<Value>) -> Result<(), RunError> {
+    fn start_coroutine_frame(
+        &mut self,
+        func_id: FunctionId,
+        namespace_values: Vec<Value>,
+        globals: Option<HeapId>,
+    ) -> Result<(), RunError> {
         let call_offset = self.current_offset();
-        let func = self.interns.get_function(func_id);
+        let code = &self.interns.get_function(func_id).code;
         let locals_count = u16::try_from(namespace_values.len()).expect("coroutine namespace size exceeds u16");
 
         // Extend the stack with the coroutine's pre-bound locals.
@@ -384,13 +390,15 @@ impl<'h> VM<'h> {
 
         // Push frame to execute the coroutine
         let exc_stack_base = self.exception_stack.len();
+        let namespace = function_namespace(globals, &*self.heap);
         self.push_frame(CallFrame::new_function(
-            &func.code,
+            code,
             stack_base,
             locals_count,
             exc_stack_base,
             func_id,
             call_offset,
+            namespace,
         ))?;
 
         Ok(())
@@ -500,22 +508,27 @@ impl<'h> VM<'h> {
             .map(|f| SerializedTaskFrame {
                 function: f.function,
                 ip: f.ip,
-                stack_base: f.stack_base,
+                stack_base: f.stack_base(),
                 locals_count: f.locals_count,
-                exception_stack_base: f.exception_stack_base,
+                exception_stack_base: f.exception_stack_base(),
                 call_offset: f.call_offset,
                 is_initializer: f.is_initializer,
+                namespace: f.namespace,
+                import_from_module: f.import_from_module,
             })
             .collect();
-        let current = &self.current_frame;
+        // The namespace moves across so the frame left behind releases nothing.
+        let current = &mut self.current_frame;
         frames.push(SerializedTaskFrame {
             function: current.function,
             ip: current.ip,
-            stack_base: current.stack_base,
+            stack_base: current.stack_base(),
             locals_count: current.locals_count,
-            exception_stack_base: current.exception_stack_base,
+            exception_stack_base: current.exception_stack_base(),
             call_offset: current.call_offset,
             is_initializer: current.is_initializer,
+            namespace: mem::take(&mut current.namespace),
+            import_from_module: current.import_from_module,
         });
 
         // Count this task's recursion depth contribution and subtract it from
@@ -569,28 +582,21 @@ impl<'h> VM<'h> {
             let mut frames: Vec<_> = frames
                 .into_iter()
                 .map(|sf| {
-                    let code = match sf.function {
-                        Some(FrameFunction::User(function)) => &self.interns.get_function(function).code,
-                        Some(FrameFunction::Frozen(function)) => {
-                            &self.interns.get_frozen_function(function).function().code
-                        }
-                        None => {
-                            // This happens for the main task's module-level code
-                            self.module_code.expect("module_code not set for main task frame")
-                        }
-                    };
+                    let code = frame_code(self.interns, self.module_code, sf.function);
                     CallFrame {
                         code,
                         bytecode: code.bytecode(),
                         ip: sf.ip,
-                        stack_base: sf.stack_base,
+                        stack_base: stack_index(sf.stack_base),
                         locals_count: sf.locals_count,
-                        exception_stack_base: sf.exception_stack_base,
+                        exception_stack_base: stack_index(sf.exception_stack_base),
                         function: sf.function,
                         call_offset: sf.call_offset,
                         should_return: false,
                         is_parked: false,
+                        namespace: sf.namespace,
                         is_initializer: sf.is_initializer,
+                        import_from_module: sf.import_from_module,
                     }
                 })
                 .collect();
@@ -636,6 +642,7 @@ impl<'h> VM<'h> {
 
         // Extract coroutine data
         let func_id = coro.get(self.heap).func_id;
+        let globals = coro.get(self.heap).globals;
         let namespace_values: Vec<Value> = coro
             .get(self.heap)
             .namespace
@@ -649,20 +656,22 @@ impl<'h> VM<'h> {
         // Push locals onto stack and push frame directly (can't use start_coroutine_frame
         // because that needs a current frame for call_offset, but spawned tasks
         // don't have a parent frame — the coroutine is the root)
-        let func = self.interns.get_function(func_id);
+        let code = &self.interns.get_function(func_id).code;
         let locals_count = u16::try_from(namespace_values.len()).expect("coroutine namespace size exceeds u16");
 
         let stack_base = self.stack.len();
         self.stack.extend(namespace_values);
 
         let exc_stack_base = self.exception_stack.len();
+        let namespace = function_namespace(globals, &*self.heap);
         self.current_frame = CallFrame::new_function(
-            &func.code,
+            code,
             stack_base,
             locals_count,
             exc_stack_base,
             func_id,
             None, // No call position — this is the root frame for a spawned task
+            namespace,
         );
         self.suspended_frames.clear();
 
@@ -687,12 +696,21 @@ impl<'h> VM<'h> {
         let this = self;
         defer_drop!(fut_val, this);
 
-        let mut value_guard = DropGuard::new(value, this);
-        let (value, this) = value_guard.as_parts_mut();
-
         let HeapReadOutput::ExternalFuture(mut fut) = this.heap.read(future_id) else {
             panic!("pending_externals entry doesn't point to an ExternalFuture")
         };
+
+        // `asyncio.sleep(delay, result)`: the host's value was only the
+        // wake-up signal, `result` is what the await produces.
+        let value = match fut.get_mut(this.heap).sleep_result.take() {
+            Some(result) => {
+                value.drop_with(this);
+                result
+            }
+            None => value,
+        };
+        let mut value_guard = DropGuard::new(value, this);
+        let (value, this) = value_guard.as_parts_mut();
 
         let awaiter_and_value = match &mut fut.get_mut(this.heap).state {
             ExternalFutureState::Pending { awaiter } => awaiter.take().map(|a| (a, value.clone_with_heap(this.heap))),
@@ -798,7 +816,10 @@ impl<'h> VM<'h> {
                 panic!("fail_future: future was already resolved")
             }
         };
+        // A failed sleep never produces its result.
+        let sleep_result = fut.get_mut(this.heap).sleep_result.take();
         drop(fut);
+        sleep_result.drop_with(this);
         if let Some(awaiter) = awaiter {
             this.deliver_awaiter_failure(awaiter, error);
         }
@@ -812,16 +833,45 @@ impl<'h> VM<'h> {
     /// the stack is the user's reference, which travels with the value until
     /// it's awaited or dropped.
     pub fn add_pending_call(&mut self, call_id: CallId) {
+        self.push_pending_future(call_id, None);
+    }
+
+    /// Like [`Self::add_pending_call`], for a host answering `asyncio.sleep`
+    /// with a future: the awaitable resolves with `result`, the value the
+    /// call was given, rather than with whatever the host resolves it with.
+    pub(crate) fn add_pending_sleep(&mut self, call_id: CallId, result: Value) {
+        self.push_pending_future(call_id, Some(result));
+    }
+
+    /// Allocates the pending `ExternalFuture`, indexes it for the host's
+    /// resolution and pushes it as the call's value.
+    fn push_pending_future(&mut self, call_id: CallId, sleep_result: Option<Value>) {
         let future_id = self
             .heap
-            .allocate(HeapData::ExternalFuture(Box::new(ExternalFuture::new_pending(call_id))));
+            .allocate(HeapData::ExternalFuture(Box::new(ExternalFuture::new_pending(
+                call_id,
+                sleep_result,
+            ))));
         self.scheduler.add_pending_external(call_id, future_id, self.heap);
         self.push(Value::Ref(future_id));
     }
 
-    /// Gets the pending call IDs from the scheduler.
-    pub fn get_pending_call_ids(&self) -> Vec<CallId> {
-        self.scheduler.pending_call_ids()
+    /// Allocates an `ExternalFuture` already resolved with `value`, for an OS
+    /// call whose result the sandbox awaits (`asyncio.sleep`).
+    ///
+    /// The host answered immediately, so nothing is registered with the
+    /// scheduler — awaiting the future hands the value straight back, and
+    /// dropping it unawaited releases the value like any other awaitable. The
+    /// call id is allocated rather than reused so it stays unique if the
+    /// future is ever inspected.
+    pub(crate) fn settled_awaitable(&mut self, value: Value) -> Value {
+        let call_id = self.allocate_call_id();
+        let future = ExternalFuture {
+            call_id,
+            state: ExternalFutureState::Resolved(value),
+            sleep_result: None,
+        };
+        Value::Ref(self.heap.allocate(HeapData::ExternalFuture(Box::new(future))))
     }
 
     /// Raises `exc` uncatchably at the suspension point, for hosts enforcing
@@ -835,10 +885,7 @@ impl<'h> VM<'h> {
     /// suspension the user sees.
     pub fn abort(&mut self, exc: MontyException) -> RunResult<FrameExit> {
         let main = TaskId::default();
-        if self.current_frame.is_parked
-            && self.scheduler.has_task(main)
-            && !self.scheduler.get_task_mut(main).frames.is_empty()
-        {
+        if self.current_frame.is_parked && self.scheduler.main_task().is_some_and(|task| !task.frames.is_empty()) {
             self.scheduler.set_current_task(Some(main));
             self.load_or_init_task(main)?;
         }
@@ -883,7 +930,7 @@ impl<'h> VM<'h> {
             return self.run_external();
         }
 
-        let pending_call_ids = self.get_pending_call_ids();
+        let pending_call_ids = self.scheduler.pending_call_ids();
 
         if pending_call_ids.is_empty() {
             // A stalled turn loses one `feed_run`, aborting loses the session.

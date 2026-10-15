@@ -163,6 +163,25 @@ assert small(2) == 2  # recomputed
 assert evict_calls == [1, 2, 3, 2]
 assert small.cache_info() == (2, 4, 2, 2)
 
+# Recency survives repeated eviction and hash-table compaction.
+turnover_calls = []
+
+
+@functools.lru_cache(maxsize=3)
+def turnover(n):
+    turnover_calls.append(n)
+    return n
+
+
+for n in range(3):
+    assert turnover(n) == n
+for n in range(3, 40):
+    assert turnover(0) == 0
+    assert turnover(n - 1) == n - 1
+    assert turnover(n) == n
+assert turnover_calls == list(range(40))
+assert turnover.cache_info() == (74, 40, 3, 3)
+
 # `maxsize=0` caches nothing; a negative size means the same
 zero_calls = []
 
@@ -437,6 +456,24 @@ try:
     assert False, 'expected private helper lookup to fail'
 except AttributeError as exc:
     assert str(exc) == "'functools._lru_cache_wrapper' object has no attribute 'store'"
+
+
+# === Namespace-sensitive builtins see the caller, not the frozen continuation ===
+def caller_namespace():
+    marker = 42
+    cached_locals = functools.cache(functools.cache(locals))
+    assert cached_locals() == {'marker': marker, 'cached_locals': cached_locals}
+    assert functools.cache(eval)('marker') == marker
+    assert functools.reduce(eval, ['marker', None]) == marker
+    return marker
+
+
+assert caller_namespace() == 42
+functools.cache(exec)('frozen_exec_result = 19')
+assert eval('frozen_exec_result') == 19
+scope = {'marker': 64}
+exec("from functools import cache\nresult = cache(eval)('marker')", scope)
+assert scope['result'] == 64
 
 # === Disabled caches skip hashing and use ordinary frames ===
 disabled = functools.lru_cache(0)(len)

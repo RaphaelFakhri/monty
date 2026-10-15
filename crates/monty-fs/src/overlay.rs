@@ -4,17 +4,18 @@
 //! filesystem when no overlay entry is present. Writes and deletions stay in
 //! memory so the real mounted directory is never modified.
 
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 
 use ahash::AHashSet;
-use cap_std::fs::Dir;
-use monty_types::{FileMode, MontyObject, dir_stat, file_stat, normalize_virtual_path};
+use cap_std::fs::{Dir, Metadata, ReadDir};
+use monty_types::{FileMode, MontyObject, dir_stat, file_stat, normalize_virtual_path, scan::EntryInfo};
 
 use super::{
     common::{
-        LISTING_ENTRY_MEMORY_USAGE, MemoryBudget, MountContext, as_u64, bytes_to_utf8, check_write_limit,
+        LISTING_ENTRY_MEMORY_USAGE, MemoryBudget, MountContext, PathInfo, as_u64, bytes_to_utf8, check_write_limit,
         commit_write_bytes, current_timestamp, format_child_path, host_dir_mtime, host_is_dir, host_is_file,
-        host_list_visible_dir_entry_names, host_read_bytes, host_read_text, host_stat, join_mount_relative, map_io,
+        host_list_visible_dir_entries, host_read_bytes, host_read_text, host_stat, join_mount_relative, map_io,
+        read_file_limited, visible_entries,
     },
     dispatch::{FsRequest, file_handle_result},
     error::MountError,
@@ -124,7 +125,7 @@ fn checked_ref_path<'r>(
 }
 
 /// Returns budget available for a transient result alongside retained state.
-fn available_memory(state: &OverlayState, ctx: &MountContext<'_>) -> Result<MemoryBudget, MountError> {
+pub(super) fn available_memory(state: &OverlayState, ctx: &MountContext<'_>) -> Result<MemoryBudget, MountError> {
     let available = ctx
         .memory_usage_limit
         .checked_sub(state.memory_usage())
@@ -166,7 +167,7 @@ pub(super) fn execute(
         FsRequest::Stat { path } => stat(state, &relative_path(&path, ctx)?, ctx, &path),
         FsRequest::Rename { src, dst } => rename(state, &src, &dst, ctx),
         FsRequest::Resolve { path } | FsRequest::Absolute { path } => {
-            Ok(MontyObject::Path(normalize_virtual_path(&path).into_owned()))
+            Ok(MontyObject::path(normalize_virtual_path(&path).into_owned()))
         }
         FsRequest::Open { path, mode } => open(state, &path, mode, ctx),
     }
@@ -292,7 +293,7 @@ fn exists(
             RealPathState::Missing => false,
         },
     };
-    Ok(MontyObject::Bool(exists))
+    Ok(MontyObject::bool(exists))
 }
 
 /// Implements `Path.is_file()` against overlay state plus real filesystem fallback.
@@ -310,7 +311,7 @@ fn is_file(
             RealPathState::Missing => false,
         },
     };
-    Ok(MontyObject::Bool(is_file))
+    Ok(MontyObject::bool(is_file))
 }
 
 /// Implements `Path.is_dir()` against overlay state plus real filesystem fallback.
@@ -328,7 +329,7 @@ fn is_dir(
             RealPathState::Missing => false,
         },
     };
-    Ok(MontyObject::Bool(is_dir))
+    Ok(MontyObject::bool(is_dir))
 }
 
 /// Implements `Path.is_symlink()`. Overlay entries are never symlinks.
@@ -338,18 +339,176 @@ fn is_dir(
 fn is_symlink(state: &OverlayState, relative: &str, ctx: &MountContext<'_>, vpath: &str) -> MontyObject {
     let is_symlink = match state.get(relative) {
         Some(_) => false,
-        // The one question a symlink may answer, since it reports only that
-        // the name is a link and nothing about the target — CPython answers
-        // the same. The parent chain must still be link-free, or the name is
-        // not the one the sandbox thinks it is.
-        None => resolve_virtual_path(vpath, ctx.mount_virtual).is_ok_and(|target| {
-            let rel = target.for_dir_op();
-            let parent = rel.rsplit_once('/').map_or("", |(parent, _)| parent);
-            reject_symlink_chain(ctx.mount_dir, parent, vpath).is_ok()
-                && ctx.mount_dir.symlink_metadata(rel).is_ok_and(|meta| meta.is_symlink())
-        }),
+        None => real_is_symlink(ctx, vpath),
     };
-    MontyObject::Bool(is_symlink)
+    MontyObject::bool(is_symlink)
+}
+
+/// Whether the real entry at `vpath` is a symlink. The one question a symlink
+/// may answer, since it reports only that the name is a link and nothing about
+/// the target — CPython answers the same. The parent chain must still be
+/// link-free, or the name is not the one the sandbox thinks it is.
+fn real_is_symlink(ctx: &MountContext<'_>, vpath: &str) -> bool {
+    resolve_virtual_path(vpath, ctx.mount_virtual).is_ok_and(|target| {
+        let rel = target.for_dir_op();
+        let parent = rel.rsplit_once('/').map_or("", |(parent, _)| parent);
+        reject_symlink_chain(ctx.mount_dir, parent, vpath).is_ok()
+            && ctx.mount_dir.symlink_metadata(rel).is_ok_and(|meta| meta.is_symlink())
+    })
+}
+
+/// Answers the four path predicates for a directory scan in one lookup, as
+/// [`exists`], [`is_dir`], [`is_file`] and [`is_symlink`] would answer each:
+/// overlay entries are never symlinks, and a real path the mode refuses
+/// (through a symlink, say) is absent but may still be a symlink itself.
+///
+/// `lstat_real` may `lstat` a real path the overlay does not hold, given its
+/// mount-relative form, through a chain of directories it found link-free;
+/// `None` walks and checks the chain here instead.
+pub(super) fn path_info(
+    path: &str,
+    ctx: &MountContext<'_>,
+    state: &OverlayState,
+    lstat_real: impl FnOnce(&str) -> Option<io::Result<Metadata>>,
+) -> Result<PathInfo, MountError> {
+    let relative = relative_path(path, ctx)?;
+    let described = |is_dir: bool, is_file: bool| PathInfo {
+        info: EntryInfo {
+            is_dir,
+            is_file,
+            is_symlink: false,
+        },
+        exists: true,
+    };
+    Ok(match state.get(&relative) {
+        Some(OverlayEntry::File(_) | OverlayEntry::RealFileRef(_)) => described(false, true),
+        Some(OverlayEntry::Directory { .. }) => described(true, false),
+        Some(OverlayEntry::Deleted) => PathInfo::ABSENT,
+        None => match resolve_virtual_path(path, ctx.mount_virtual)
+            .ok()
+            .and_then(|target| lstat_real(target.for_dir_op()))
+        {
+            // As `real_path_info` classifies the name once its parents are known link-free.
+            Some(Ok(meta)) if meta.is_symlink() => PathInfo {
+                info: SYMLINK_ONLY,
+                exists: false,
+            },
+            Some(Ok(meta)) => described(meta.is_dir(), meta.is_file()),
+            Some(Err(_)) => PathInfo::ABSENT,
+            None => real_path_info(path, ctx),
+        },
+    })
+}
+
+/// Lists the directory `path` for a scan, describing each entry as [`path_info`]
+/// on it would, from the listing alone: overlay entries by kind, real ones by
+/// the type their directory entry records.
+///
+/// `budget` is what is left of the scan's. `open_real` may list a real
+/// directory the overlay does not hold, given its mount-relative path, through
+/// a chain of directories it found link-free; `None` resolves and checks the
+/// path here instead, raising what that finds.
+pub(super) fn scan_list(
+    path: &str,
+    ctx: &MountContext<'_>,
+    state: &OverlayState,
+    budget: MemoryBudget,
+    open_real: impl FnOnce(&str) -> Option<ReadDir>,
+) -> Result<Vec<(String, EntryInfo)>, MountError> {
+    let relative = relative_path(path, ctx)?;
+    let opened = if state.get(&relative).is_none() {
+        resolve_virtual_path(path, ctx.mount_virtual).ok().and_then(|target| {
+            let rel = target.for_dir_op();
+            open_real(rel).map(|read_dir| (rel.to_owned(), Some(read_dir)))
+        })
+    } else {
+        None
+    };
+    let host_dir_to_merge = match opened {
+        Some(opened) => Some(opened),
+        None => real_dir_to_merge(state, &relative, ctx, path)?.map(|rel| (rel, None)),
+    };
+    let mut seen_names: AHashSet<&str> = AHashSet::new();
+    let mut entries = Vec::new();
+    let mut transient_usage = 0_u64;
+
+    let prefix = directory_prefix(&relative);
+    for (name, entry) in overlay_children(state, &prefix) {
+        // Charged for the dedup set and the listed copy.
+        transient_usage = transient_usage
+            .saturating_add(as_u64(name.len().saturating_mul(2)))
+            .saturating_add(LISTING_ENTRY_MEMORY_USAGE);
+        budget.check(transient_usage)?;
+        seen_names.insert(name);
+        let (is_dir, is_file) = match entry {
+            OverlayEntry::Deleted => continue,
+            OverlayEntry::Directory { .. } => (true, false),
+            OverlayEntry::File(_) | OverlayEntry::RealFileRef(_) => (false, true),
+        };
+        let info = EntryInfo {
+            is_dir,
+            is_file,
+            is_symlink: false,
+        };
+        entries.push((name.to_owned(), info));
+    }
+
+    if let Some((host_dir, read_dir)) = host_dir_to_merge {
+        let remaining = budget.shrink(transient_usage)?;
+        let listing = match read_dir {
+            Some(read_dir) => visible_entries(read_dir, ctx.mount_dir, &host_dir, path, remaining)?,
+            None => host_list_visible_dir_entries(ctx.mount_dir, &host_dir, path, remaining)?,
+        };
+        for (name, info) in listing {
+            if !seen_names.contains(name.as_str()) {
+                // The mode never follows a link, so one is a symlink and nothing more.
+                let info = if info.is_symlink { SYMLINK_ONLY } else { info };
+                entries.push((name, info));
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// How the mode describes a real symlink: never followed, so neither a file nor a directory.
+const SYMLINK_ONLY: EntryInfo = EntryInfo {
+    is_dir: false,
+    is_file: false,
+    is_symlink: true,
+};
+
+/// [`path_info`] for a path the overlay does not answer, in one walk of the
+/// parent chain and one `lstat` of the name, where asking each predicate would
+/// walk and stat the path again per predicate. As [`real_is_symlink`] says,
+/// the chain must be link-free for the name to be the sandbox's; a link at the
+/// end is reported as one and nothing more, since the mode never follows it.
+fn real_path_info(vpath: &str, ctx: &MountContext<'_>) -> PathInfo {
+    let Ok(target) = resolve_virtual_path(vpath, ctx.mount_virtual) else {
+        return PathInfo::ABSENT;
+    };
+    let rel = target.for_dir_op();
+    let parent = rel.rsplit_once('/').map_or("", |(parent, _)| parent);
+    if reject_symlink_chain(ctx.mount_dir, parent, vpath).is_err() {
+        return PathInfo::ABSENT;
+    }
+    let described = |is_dir: bool, is_file: bool, exists: bool| PathInfo {
+        info: EntryInfo {
+            is_dir,
+            is_file,
+            is_symlink: false,
+        },
+        exists,
+    };
+    match classify_target(ctx.mount_dir, rel, vpath) {
+        Ok(RealTarget::Symlink) => PathInfo {
+            info: SYMLINK_ONLY,
+            exists: false,
+        },
+        Ok(RealTarget::Dir) => described(true, false, true),
+        // Not a symlink, so following changes nothing: one `stat` tells a regular file from a device or pipe.
+        Ok(RealTarget::File) => described(false, host_is_file(ctx.mount_dir, rel), true),
+        Ok(RealTarget::Absent) | Err(_) => PathInfo::ABSENT,
+    }
 }
 
 /// Reads text from the overlay or from the real filesystem on fallback.
@@ -362,7 +521,7 @@ fn read_text(
     match state.get(relative) {
         Some(OverlayEntry::File(file)) => {
             available_memory(state, ctx)?.check(as_u64(file.content.len()))?;
-            Ok(MontyObject::String(bytes_to_utf8(file.content.clone())?))
+            Ok(MontyObject::string(bytes_to_utf8(file.content.clone())?))
         }
         Some(OverlayEntry::RealFileRef(file_ref)) => {
             let rel = checked_ref_path(file_ref, ctx, vpath)?;
@@ -389,7 +548,7 @@ fn read_bytes(
     match state.get(relative) {
         Some(OverlayEntry::File(file)) => {
             available_memory(state, ctx)?.check(as_u64(file.content.len()))?;
-            Ok(MontyObject::Bytes(file.content.clone()))
+            Ok(MontyObject::bytes(file.content.clone()))
         }
         Some(OverlayEntry::RealFileRef(file_ref)) => {
             let rel = checked_ref_path(file_ref, ctx, vpath)?;
@@ -434,7 +593,7 @@ fn write_text(
     )?;
 
     commit_write_bytes(byte_len, ctx);
-    Ok(MontyObject::Int(i64::try_from(char_count).unwrap_or(i64::MAX)))
+    Ok(MontyObject::int(i64::try_from(char_count).unwrap_or(i64::MAX)))
 }
 
 /// Writes bytes into the overlay after validating quota and parent existence.
@@ -462,7 +621,7 @@ fn write_bytes(
     )?;
 
     commit_write_bytes(byte_len, ctx);
-    Ok(MontyObject::Int(i64::try_from(byte_len).unwrap_or(i64::MAX)))
+    Ok(MontyObject::int(i64::try_from(byte_len).unwrap_or(i64::MAX)))
 }
 
 /// Appends text in the overlay without leaving a host file handle open.
@@ -473,7 +632,7 @@ fn append_text(
     ctx: &mut MountContext<'_>,
 ) -> Result<MontyObject, MountError> {
     append_bytes(state, vpath, data.as_bytes(), ctx)?;
-    Ok(MontyObject::Int(
+    Ok(MontyObject::int(
         i64::try_from(data.chars().count()).unwrap_or(i64::MAX),
     ))
 }
@@ -520,7 +679,7 @@ fn append_bytes(
     }
 
     commit_write_bytes(charged_bytes, ctx);
-    Ok(MontyObject::Int(i64::try_from(data.len()).unwrap_or(i64::MAX)))
+    Ok(MontyObject::int(i64::try_from(data.len()).unwrap_or(i64::MAX)))
 }
 
 /// Returns the visible file length for append accounting without loading bytes.
@@ -576,19 +735,13 @@ fn existing_file_bytes(
         Some(OverlayEntry::Deleted) => Ok(Vec::new()),
         Some(OverlayEntry::RealFileRef(file_ref)) => {
             let rel = checked_ref_path(file_ref, ctx, vpath)?;
-            match host_read_bytes(ctx.mount_dir, rel, vpath, budget)? {
-                MontyObject::Bytes(bytes) => Ok(bytes),
-                _ => unreachable!("host_read_bytes should return bytes"),
-            }
+            read_file_limited(ctx.mount_dir, rel, vpath, budget)
         }
         Some(OverlayEntry::Directory { .. }) => {
             Err(MountError::io_err(ErrorKind::IsADirectory, "Is a directory", vpath))
         }
         None => match resolve_real_path_state(vpath, ctx, OnLookupFailure::Propagate)? {
-            RealPathState::Present(rel) => match host_read_bytes(ctx.mount_dir, &rel, vpath, budget)? {
-                MontyObject::Bytes(bytes) => Ok(bytes),
-                _ => unreachable!("host_read_bytes should return bytes"),
-            },
+            RealPathState::Present(rel) => read_file_limited(ctx.mount_dir, &rel, vpath, budget),
             RealPathState::Missing => Ok(Vec::new()),
         },
     }
@@ -686,7 +839,7 @@ fn mkdir(
     match state.get(relative) {
         Some(OverlayEntry::Directory { .. }) => {
             return if exist_ok {
-                Ok(MontyObject::None)
+                Ok(MontyObject::none())
             } else {
                 Err(MountError::io_err(ErrorKind::AlreadyExists, "File exists", vpath))
             };
@@ -700,7 +853,7 @@ fn mkdir(
             // overlay directory shadowing the symlink it had just refused.
             let target = resolve_real(vpath, ctx)?;
             match classify_target(ctx.mount_dir, target.for_dir_op(), vpath)? {
-                RealTarget::Dir if exist_ok => return Ok(MontyObject::None),
+                RealTarget::Dir if exist_ok => return Ok(MontyObject::none()),
                 // Either a file (always an error) or a dir with exist_ok=false.
                 RealTarget::Dir | RealTarget::File => {
                     return Err(MountError::io_err(ErrorKind::AlreadyExists, "File exists", vpath));
@@ -730,7 +883,7 @@ fn mkdir(
         },
         ctx.memory_usage_limit,
     )?;
-    Ok(MontyObject::None)
+    Ok(MontyObject::none())
 }
 
 /// Creates parent directories for `mkdir(parents=True)` with overlay semantics.
@@ -814,7 +967,7 @@ fn unlink(
     match state.get(relative) {
         Some(OverlayEntry::File(_) | OverlayEntry::RealFileRef(_)) => {
             state.insert(relative.to_owned(), OverlayEntry::Deleted, ctx.memory_usage_limit)?;
-            Ok(MontyObject::None)
+            Ok(MontyObject::none())
         }
         Some(OverlayEntry::Directory { .. }) => {
             Err(MountError::io_err(ErrorKind::IsADirectory, "Is a directory", vpath))
@@ -829,7 +982,7 @@ fn unlink(
             match classify_target(ctx.mount_dir, resolved.for_dir_op(), vpath)? {
                 RealTarget::File => {
                     state.insert(relative.to_owned(), OverlayEntry::Deleted, ctx.memory_usage_limit)?;
-                    Ok(MontyObject::None)
+                    Ok(MontyObject::none())
                 }
                 RealTarget::Dir => Err(MountError::io_err(ErrorKind::IsADirectory, "Is a directory", vpath)),
                 RealTarget::Symlink => Err(MountError::PathEscape {
@@ -862,7 +1015,7 @@ fn rmdir(
                 ));
             }
             state.insert(relative.to_owned(), OverlayEntry::Deleted, ctx.memory_usage_limit)?;
-            Ok(MontyObject::None)
+            Ok(MontyObject::none())
         }
         Some(OverlayEntry::File(_) | OverlayEntry::RealFileRef(_)) => {
             Err(MountError::io_err(ErrorKind::NotADirectory, "Not a directory", vpath))
@@ -900,7 +1053,7 @@ fn rmdir(
                 ));
             }
             state.insert(relative.to_owned(), OverlayEntry::Deleted, ctx.memory_usage_limit)?;
-            Ok(MontyObject::None)
+            Ok(MontyObject::none())
         }
     }
 }
@@ -967,75 +1120,89 @@ fn iterdir(
     ctx: &MountContext<'_>,
     vpath: &str,
 ) -> Result<MontyObject, MountError> {
-    let host_dir_to_merge = match state.get(relative) {
-        Some(OverlayEntry::Directory { .. }) => None,
-        Some(OverlayEntry::File(_) | OverlayEntry::RealFileRef(_)) => {
-            return Err(MountError::io_err(ErrorKind::NotADirectory, "Not a directory", vpath));
-        }
-        Some(OverlayEntry::Deleted) => return Err(MountError::not_found(vpath)),
-        None => match resolve_real(vpath, ctx) {
-            Ok(target) if host_is_dir(ctx.mount_dir, target.for_dir_op()) => Some(target.for_dir_op().to_owned()),
-            // `resolve_virtual_path` never touches the filesystem, so a missing
-            // path arrives as `Ok` and must be told apart from a non-directory.
-            Ok(target) if !ctx.mount_dir.exists(target.for_dir_op()) => return Err(MountError::not_found(vpath)),
-            Ok(_) => return Err(MountError::io_err(ErrorKind::NotADirectory, "Not a directory", vpath)),
-            Err(err) => return Err(err),
-        },
-    };
-
+    let host_dir_to_merge = real_dir_to_merge(state, relative, ctx, vpath)?;
     let prefix = directory_prefix(relative);
     let mut seen_names: AHashSet<String> = AHashSet::new();
     let mut entries = Vec::new();
     let budget = available_memory(state, ctx)?;
     let mut transient_usage = 0_u64;
 
-    for (path, entry) in state.prefix_iter(&prefix) {
-        let rest = &path[prefix.len()..];
-        if rest.is_empty() || rest.contains('/') {
-            continue;
-        }
-
+    for (child_name, entry) in overlay_children(state, &prefix) {
         // Names are charged twice: once for the dedup set, once for the clone.
-        let child_name = rest.to_owned();
         transient_usage = transient_usage
             .saturating_add(as_u64(child_name.len().saturating_mul(2)))
             .saturating_add(LISTING_ENTRY_MEMORY_USAGE);
         budget.check(transient_usage)?;
-        seen_names.insert(child_name.clone());
+        seen_names.insert(child_name.to_owned());
 
         if !matches!(entry, OverlayEntry::Deleted) {
-            let child_path = format_child_path(vpath, &child_name);
+            let child_path = format_child_path(vpath, child_name);
             transient_usage = transient_usage
                 .saturating_add(as_u64(child_path.len()))
                 .saturating_add(LISTING_ENTRY_MEMORY_USAGE);
             budget.check(transient_usage)?;
-            entries.push(MontyObject::Path(child_path));
+            entries.push(MontyObject::path(child_path));
         }
     }
 
     if let Some(host_dir) = host_dir_to_merge {
         let remaining = budget.shrink(transient_usage)?;
-        let names = host_list_visible_dir_entry_names(ctx.mount_dir, &host_dir, vpath, remaining.halved())?;
-        if !names.is_empty() {
-            transient_usage = names.iter().fold(transient_usage, |usage, name| {
-                usage
-                    .saturating_add(as_u64(name.len()))
-                    .saturating_add(LISTING_ENTRY_MEMORY_USAGE)
-            });
-            for name in names {
-                if !seen_names.contains(&name) {
-                    let child_path = format_child_path(vpath, &name);
-                    transient_usage = transient_usage
-                        .saturating_add(as_u64(child_path.len()))
-                        .saturating_add(LISTING_ENTRY_MEMORY_USAGE);
-                    budget.check(transient_usage)?;
-                    entries.push(MontyObject::Path(child_path));
-                }
+        let names = host_list_visible_dir_entries(ctx.mount_dir, &host_dir, vpath, remaining.halved())?;
+        transient_usage = names.iter().fold(transient_usage, |usage, (name, _)| {
+            usage
+                .saturating_add(as_u64(name.len()))
+                .saturating_add(LISTING_ENTRY_MEMORY_USAGE)
+        });
+        for (name, _) in names {
+            if !seen_names.contains(&name) {
+                let child_path = format_child_path(vpath, &name);
+                transient_usage = transient_usage
+                    .saturating_add(as_u64(child_path.len()))
+                    .saturating_add(LISTING_ENTRY_MEMORY_USAGE);
+                budget.check(transient_usage)?;
+                entries.push(MontyObject::path(child_path));
             }
         }
     }
 
-    Ok(MontyObject::List(entries))
+    Ok(MontyObject::list(entries))
+}
+
+/// The real directory, mount-relative, whose entries a listing of `relative`
+/// merges; `None` when the overlay holds the directory itself.
+///
+/// Raises what listing `vpath` would: a missing or deleted path, a file, or a
+/// real path reached through a symlink.
+fn real_dir_to_merge(
+    state: &OverlayState,
+    relative: &str,
+    ctx: &MountContext<'_>,
+    vpath: &str,
+) -> Result<Option<String>, MountError> {
+    match state.get(relative) {
+        Some(OverlayEntry::Directory { .. }) => Ok(None),
+        Some(OverlayEntry::File(_) | OverlayEntry::RealFileRef(_)) => {
+            Err(MountError::io_err(ErrorKind::NotADirectory, "Not a directory", vpath))
+        }
+        Some(OverlayEntry::Deleted) => Err(MountError::not_found(vpath)),
+        None => match resolve_real(vpath, ctx) {
+            Ok(target) if host_is_dir(ctx.mount_dir, target.for_dir_op()) => Ok(Some(target.for_dir_op().to_owned())),
+            // `resolve_virtual_path` never touches the filesystem, so a missing
+            // path arrives as `Ok` and must be told apart from a non-directory.
+            Ok(target) if !ctx.mount_dir.exists(target.for_dir_op()) => Err(MountError::not_found(vpath)),
+            Ok(_) => Err(MountError::io_err(ErrorKind::NotADirectory, "Not a directory", vpath)),
+            Err(err) => Err(err),
+        },
+    }
+}
+
+/// Overlay entries directly inside the directory `prefix` names (see
+/// [`directory_prefix`]), by name; deletions included, since they hide real entries.
+fn overlay_children<'s>(state: &'s OverlayState, prefix: &'s str) -> impl Iterator<Item = (&'s str, &'s OverlayEntry)> {
+    state.prefix_iter(prefix).filter_map(move |(path, entry)| {
+        let rest = &path[prefix.len()..];
+        (!rest.is_empty() && !rest.contains('/')).then_some((rest, entry))
+    })
 }
 
 /// Renames a path within the overlay, lazily referencing real files when needed.
@@ -1229,7 +1396,7 @@ fn rename(
         state.insert_unchecked(new_rel, child);
     }
 
-    Ok(MontyObject::None)
+    Ok(MontyObject::none())
 }
 
 /// Refuses to rename or remove the mount root, which has no name inside the
