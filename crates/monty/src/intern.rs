@@ -35,7 +35,7 @@ use storage::Entries;
 use strum::{EnumString, FromRepr, IntoStaticStr};
 
 use crate::{
-    frozen::{FrozenFunction, FrozenFunctionCode},
+    frozen::{FrozenEntry, FrozenFunction},
     function::Function,
     hash::{HashValue, RESERVED_STRING_HASHES, WithHash, hash_python_str},
 };
@@ -1769,9 +1769,6 @@ pub enum StaticStrings {
     /// The uncached callable.
     #[strum(serialize = "__wrapped__")]
     DunderWrapped,
-    /// Private namespace passed to frozen implementations; not importable.
-    #[strum(serialize = "<monty-frozen-helpers>")]
-    FrozenHelpers,
     /// Private cache insertion primitive.
     Store,
     /// Kwarg name `rel_tol` — `math.isclose(rel_tol=...)`.
@@ -2489,8 +2486,8 @@ pub(crate) struct Interns {
     long_ints: Entries<WithHash<BigInt>>,
     /// Boxes keep a mostly empty storage page from reserving hundreds of function bodies.
     functions: Entries<Box<Function>>,
-    /// Frozen function bytecode pinned to this compiled program and its dumps.
-    frozen_functions: Vec<FrozenFunctionCode>,
+    /// Captured entry points into the ordinary function table.
+    frozen_entries: Vec<FrozenEntry>,
     eval_sources: Entries<Arc<str>>,
     #[serde(skip)]
     string_id_by_name: RefCell<AHashMap<String, StringId>>,
@@ -2514,7 +2511,7 @@ struct InternsWire {
     bytes: Entries<WithHash<Vec<u8>>>,
     long_ints: Entries<WithHash<BigInt>>,
     functions: Entries<Box<Function>>,
-    frozen_functions: Vec<FrozenFunctionCode>,
+    frozen_entries: Vec<FrozenEntry>,
     eval_sources: Entries<Arc<str>>,
 }
 
@@ -2542,7 +2539,7 @@ impl TryFrom<InternsWire> for Interns {
             bytes: wire.bytes,
             long_ints: wire.long_ints,
             functions: wire.functions,
-            frozen_functions: wire.frozen_functions,
+            frozen_entries: wire.frozen_entries,
             eval_sources: wire.eval_sources,
             string_id_by_name: RefCell::new(string_id_by_name),
             static_string_ids: RefCell::new(static_string_ids),
@@ -2568,7 +2565,7 @@ impl Interns {
             bytes: Entries::default(),
             long_ints: Entries::default(),
             functions: Entries::default(),
-            frozen_functions: Vec::new(),
+            frozen_entries: Vec::new(),
             eval_sources: Entries::default(),
             string_id_by_name: RefCell::default(),
             static_string_ids: RefCell::default(),
@@ -2584,7 +2581,7 @@ impl Interns {
             bytes: Entries::default(),
             long_ints: Entries::default(),
             functions: Entries::default(),
-            frozen_functions: Vec::new(),
+            frozen_entries: Vec::new(),
             eval_sources: Entries::default(),
             string_id_by_name: RefCell::new(AHashMap::with_capacity(capacity)),
             static_string_ids: RefCell::new(AHashMap::with_capacity(CORE_STATIC_STRINGS.len())),
@@ -2678,17 +2675,15 @@ impl Interns {
         self.long_ints[id.index()].hash()
     }
 
-    /// Returns the frozen function selected by its stable identity.
-    pub(crate) fn get_frozen_function(&self, function: FrozenFunction) -> &FrozenFunctionCode {
-        &self.frozen_functions[function.index()]
+    /// Returns the captured entry point selected by its stable identity.
+    pub(crate) fn frozen_entry(&self, function: FrozenFunction) -> &FrozenEntry {
+        &self.frozen_entries[function.index()]
     }
 
-    /// Moves a fresh frozen bundle's functions out of the user function ID space.
-    /// Only called before the bundle is shared with any executor.
-    pub(crate) fn set_frozen_functions(&mut self, functions: Vec<FrozenFunctionCode>) {
-        assert_eq!(self.functions.len(), functions.len());
-        self.functions = Entries::default();
-        self.frozen_functions = functions;
+    /// Records the entry points of a freshly compiled interpreter bundle.
+    pub(crate) fn set_frozen_entries(&mut self, entries: Vec<FrozenEntry>) {
+        assert_eq!(self.functions.len(), entries.len());
+        self.frozen_entries = entries;
     }
 
     /// Finds canonical text already interned, excluding snippet filename IDs.

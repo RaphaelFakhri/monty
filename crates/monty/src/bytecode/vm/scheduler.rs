@@ -10,12 +10,12 @@ use std::{collections::VecDeque, mem};
 use ahash::AHashMap;
 use smallvec::{SmallVec, smallvec};
 
-use super::{FrameFunction, FrameNamespace};
+use super::FrameNamespace;
 use crate::{
     asyncio::{Awaiter, CallId, TaskId},
     exception_private::RunResult,
     heap::{ContainsHeap, DropWithContext, Heap, HeapId, HeapReadOutput, HeapReader},
-    intern::StringId,
+    intern::{FunctionId, StringId},
     value::Value,
 };
 
@@ -80,11 +80,11 @@ impl<C: ContainsHeap> DropWithContext<C> for Task {
 /// Serialized call frame for task storage.
 ///
 /// Similar to `SerializedFrame` but used within the scheduler for task context.
-/// Cannot store `&Code` references, so it keeps a serializable frame identity.
+/// Cannot store `&Code` references - uses `FunctionId` to look up code on resume.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SerializedTaskFrame {
-    /// Which function's code this frame executes (`None` = module-level).
-    pub function: Option<FrameFunction>,
+    /// Which function's code this frame executes (None = module-level).
+    pub function_id: Option<FunctionId>,
     /// Instruction pointer within this frame's bytecode.
     pub ip: usize,
     /// Base index into the VM stack for this frame's locals region.

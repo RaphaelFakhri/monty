@@ -2,7 +2,7 @@
 
 use std::fmt::{self, Write};
 
-use super::{FrameFunction, VM};
+use super::VM;
 use crate::{
     builtins::Builtins,
     defer_drop,
@@ -27,9 +27,8 @@ enum ExceptionHandlingResult {
 impl VM<'_> {
     /// Returns the current function name, or `<module>` outside a function.
     fn current_frame_name(&self) -> StringId {
-        match self.current_frame().function {
-            Some(FrameFunction::User(function)) => self.interns.get_function(function).name.name_id,
-            Some(FrameFunction::Frozen(function)) => self.interns.get_frozen_function(function).function().name.name_id,
+        match self.current_frame().function_id {
+            Some(function) => self.interns.get_function(function).name.name_id,
             None => self.interns.intern_static(StaticStrings::Module),
         }
     }
@@ -43,7 +42,9 @@ impl VM<'_> {
 
     /// Returns whether the active frame implements a builtin in frozen Python.
     fn current_frame_is_frozen(&self) -> bool {
-        matches!(self.current_frame().function, Some(FrameFunction::Frozen(_)))
+        self.current_frame()
+            .function_id
+            .is_some_and(|id| self.interns.get_function(id).is_internal)
     }
 
     /// Attaches initial frame information to an error if it doesn't have any.

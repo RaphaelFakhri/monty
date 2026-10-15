@@ -16,10 +16,11 @@ use crate::{
     bytecode::{CallResult, VM},
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
-    frozen::{self, FrozenFunction},
+    frozen::{FrozenFunction, FrozenFunctions},
     hash::{HashValue, identity_hash},
     heap::{ContainsHeap, DropGuard, DropWithContext, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
     intern::StaticStrings,
+    modules::ModuleFunctions,
     types::{
         Dict, LazyHeapSet, NamedTuple, PyTrait, Type,
         hash_table::{PyHashTable, Slot, TableEntry, TableProbe, TableSource},
@@ -145,13 +146,13 @@ pub(crate) fn call(cache_id: HeapId, args: ArgValues, vm: &mut VM<'_>) -> RunRes
         let kwargs = Dict::from_pairs(take(keywords), vm)?;
         let kwargs = Value::Ref(vm.heap.allocate(HeapData::Dict(kwargs)));
         let args = allocate_tuple(TupleVec::from_vec(take(positional)), vm.heap);
-        let helpers = frozen::cache_helpers(vm);
+        let store = Value::ModuleFunction(ModuleFunctions::Frozen(FrozenFunctions::Store));
         let function = func.clone_with_heap(vm);
         vm.heap.inc_ref(cache_id);
         let (key, vm) = key_guard.into_parts();
         vm.call_frozen_exact(
             FrozenFunction::CacheMiss,
-            [helpers, Value::Ref(cache_id), key, function, args, kwargs],
+            [store, Value::Ref(cache_id), key, function, args, kwargs],
         )
     }
 }

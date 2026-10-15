@@ -94,9 +94,8 @@ impl Code {
 
     /// Finds the location entry for a given bytecode offset.
     ///
-    /// Entries normally mark instruction boundaries. Fused instructions may also
-    /// mark operand bytes so errors from individual logical operations retain their
-    /// positions. This finds the most recent entry at or before the given offset.
+    /// Location entries are recorded at instruction boundaries. This method finds
+    /// the most recent entry at or before the given offset.
     ///
     /// Returns `None` if the location table is empty, the offset is before
     /// the first recorded location, or the offset exceeds `u32::MAX` (an

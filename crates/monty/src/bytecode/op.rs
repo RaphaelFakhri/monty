@@ -360,9 +360,6 @@ pub enum Opcode {
     ///
     /// Used for method calls with `*args` and/or `**kwargs` unpacking.
     CallAttrExtended = 87,
-    /// Load a local callable and two local arguments, then call it.
-    /// Operands: u8 callable_slot, u8 arg1_slot, u8 arg2_slot.
-    CallLocal2 = 125,
 
     // === Control Flow ===
     /// Unconditional relative jump. Operand: i16 offset.
@@ -597,7 +594,6 @@ enum OperandShape {
     CallKw = 9,
     CallAttrKw = 10,
     U16U16U8 = 11,
-    U8U8U8 = 12,
 }
 
 impl Opcode {
@@ -716,7 +712,6 @@ impl Opcode {
             | Self::JumpIfFalseOrPop
             | Self::ForIter => OperandShape::Offset,
             Self::CallBuiltinFunction | Self::CallBuiltinType | Self::UnpackEx => OperandShape::U8U8,
-            Self::CallLocal2 => OperandShape::U8U8U8,
             Self::CallAttr | Self::CallAttrExtended | Self::MakeFunction => OperandShape::U16U8,
             Self::LoadGlobalCallable | Self::LoadSubmodule => OperandShape::U16U16,
             Self::MakeClosure => OperandShape::U16U8U8,
@@ -759,8 +754,6 @@ pub enum Operand<'a> {
     U16U16U8(u16, u16, u8),
     /// u16 then two u8s (e.g. `MakeClosure`).
     U16U8U8(u16, u8, u8),
-    /// Three u8 operands (e.g. `CallLocal2`).
-    U8U8U8(u8, u8, u8),
     /// `CallFunctionKw` shape: pos_count (u8), kw_count (u8), kw_count * name_id (u16 each).
     CallKw { pos_count: u8, kwname_ids: &'a [u16] },
     /// `CallAttrKw` shape: attr_name_id (u16), pos_count (u8), kw_count (u8), kw_count * name_id (u16 each).
@@ -785,7 +778,6 @@ impl Operand<'_> {
             Self::U16U16(..) => OperandShape::U16U16,
             Self::U16U16U8(..) => OperandShape::U16U16U8,
             Self::U16U8U8(..) => OperandShape::U16U8U8,
-            Self::U8U8U8(..) => OperandShape::U8U8U8,
             Self::CallKw { .. } => OperandShape::CallKw,
             Self::CallAttrKw { .. } => OperandShape::CallAttrKw,
         }
@@ -872,10 +864,6 @@ impl Opcode {
             // MakeClosure: pops `cell_count` cells AND `defaults_count` defaults,
             // pushes the closure → 1 - defaults - cells.
             (MakeClosure, Operand::U16U8U8(_, defaults, cells)) => 1 - i32::from(defaults) - i32::from(cells),
-
-            // === Fixed-effect: U8U8U8 operand ===
-            // Loads three locals, then consumes the callable and two arguments.
-            (CallLocal2, Operand::U8U8U8(..)) => 1,
 
             // === Variable-effect: variable-length kw operands ===
             // pops callable + pos_args + kw_args, pushes result → -(pos_count + kw_count).

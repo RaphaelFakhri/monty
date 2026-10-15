@@ -11,7 +11,7 @@ use std::iter;
 
 use ahash::AHashSet;
 
-use super::{CallFrame, FrameFunction, VM};
+use super::{CallFrame, VM};
 use crate::{
     bytecode::{FrameExit, NAME_CALLABLE, NAME_GLOBAL_ONLY},
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
@@ -147,7 +147,7 @@ impl<'h> VM<'h> {
                     (FrameGlobals::Dict(dict), locals)
                 }
                 None => {
-                    let locals = match (locals, self.namespace_frame().function) {
+                    let locals = match (locals, self.namespace_frame().function_id) {
                         (Some(dict), _) => Some(dict),
                         (None, Some(_)) => Some(self.snapshot_locals()?),
                         (None, None) => None,
@@ -217,7 +217,7 @@ impl<'h> VM<'h> {
                 locals: None,
             }) => self.snapshot_globals()?,
             Some(FrameNamespace::Function { .. }) => self.snapshot_locals()?,
-            None if self.namespace_frame().function.is_none() => self.snapshot_globals()?,
+            None if self.namespace_frame().function_id.is_none() => self.snapshot_globals()?,
             None => self.snapshot_locals()?,
         };
         Ok(Value::Ref(dict_id))
@@ -325,11 +325,8 @@ impl<'h> VM<'h> {
         // Cell slots go last so a captured parameter's live cell value replaces
         // the stale copy left in its parameter slot under the same name.
         let cell_slots: AHashSet<usize> = frame
-            .function
-            .map(|function| match function {
-                FrameFunction::User(id) => this.interns.get_function(id),
-                FrameFunction::Frozen(id) => this.interns.get_frozen_function(id).function(),
-            })
+            .function_id
+            .map(|id| this.interns.get_function(id))
             .into_iter()
             .flat_map(|func| {
                 func.cell_var_slots
@@ -363,7 +360,11 @@ impl<'h> VM<'h> {
             .iter()
             .chain(iter::once(&self.current_frame))
             .rev()
-            .find(|frame| !matches!(frame.function, Some(FrameFunction::Frozen(_))))
+            .find(|frame| {
+                frame
+                    .function_id
+                    .is_none_or(|id| !self.interns.get_function(id).is_internal)
+            })
             .expect("frozen code has a Python caller")
     }
 

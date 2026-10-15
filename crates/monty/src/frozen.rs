@@ -1,8 +1,8 @@
 //! Python implementations of interpreter functions captured with each program.
 //!
-//! Frozen frames use ordinary VM suspension and cleanup but are hidden from
-//! tracebacks. Private native helpers arrive as explicit arguments, never
-//! through the user module's globals or importable modules.
+//! Internal functions use ordinary VM frames and suspension but are hidden from
+//! tracebacks and namespace introspection. Private native helpers arrive as
+//! explicit arguments, never through user globals or importable modules.
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -14,13 +14,10 @@ use crate::{
     bytecode::{Opcode, VM},
     defer_drop,
     exception_private::RunResult,
-    function::Function,
-    heap::HeapData,
-    intern::{CompileInterns, FunctionId, Interns, StaticStrings},
-    modules::ModuleFunctions,
+    intern::{CompileInterns, FunctionId, Interns},
     name_map::NameMap,
     run::compile_module_source,
-    types::{Module, lru_cache},
+    types::lru_cache,
     value::Value,
 };
 
@@ -32,16 +29,16 @@ def __monty_functools_reduce(function, iterator, accumulator):
         accumulator = function(accumulator, item)
     return accumulator
 
-def __monty_cache_miss(helpers, cache, key, function, args, kwargs):
+def __monty_cache_miss(store, cache, key, function, args, kwargs):
     result = function(*args, **kwargs)
-    helpers.store(cache, key, result)
+    store(cache, key, result)
     return result
 ";
 
-/// Stable identities selecting captured frozen bytecode.
-/// Append new variants; reordering or removing them requires a dump-version bump.
+/// Selects an entry in the program's captured frozen-function mapping.
+/// Append variants: their indices select metadata in existing dumps.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum FrozenFunction {
     /// Suspendable fold loop behind `functools.reduce`.
     FunctoolsReduce = 0,
@@ -56,21 +53,23 @@ impl FrozenFunction {
     }
 }
 
-/// Entry metadata travels with frozen code, including in idle session dumps.
+/// Captured entry metadata for an ordinary function in `Interns`.
 /// Bodies must be self-contained: global slots would address the user module.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct FrozenFunctionCode {
-    /// Ordinary compiled Python function metadata and bytecode.
-    function: Function,
+pub(crate) struct FrozenEntry {
+    /// Function ID in the same table as user-defined functions.
+    pub function_id: FunctionId,
     /// Bytecode offset after any native setup.
-    entry_ip: usize,
+    pub entry_ip: usize,
     /// Optional local iterator to copy onto the initial operand stack.
-    iterator_slot: Option<u16>,
+    pub iterator_slot: Option<u16>,
 }
 
-impl FrozenFunctionCode {
+impl FrozenEntry {
     /// Captures an entry point with fixed positional arguments and no closure cells.
-    fn new(function: Function, entry_ip: usize, iterator_slot: Option<u16>) -> Self {
+    fn new(function_id: FunctionId, interns: &Interns, entry_ip: usize, iterator_slot: Option<u16>) -> Self {
+        let function = interns.get_function(function_id);
+        assert!(function.is_internal);
         assert!(function.signature.exact_positional_count().is_some());
         assert!(function.cell_var_slots.is_empty() && function.free_var_slots.is_empty());
         if let Some(slot) = iterator_slot {
@@ -78,46 +77,20 @@ impl FrozenFunctionCode {
             assert_eq!(function.code.bytecode()[entry_ip], Opcode::ForIter as u8);
         }
         Self {
-            function,
+            function_id,
             entry_ip,
             iterator_slot,
         }
     }
-
-    /// Returns the compiled Python function.
-    pub(crate) fn function(&self) -> &Function {
-        &self.function
-    }
-
-    /// Returns the post-setup bytecode entry point.
-    pub(crate) fn entry_ip(&self) -> usize {
-        self.entry_ip
-    }
-
-    /// Returns the iterator slot used to seed the operand stack, if needed.
-    pub(crate) fn iterator_slot(&self) -> Option<u16> {
-        self.iterator_slot
-    }
 }
 
-/// Native primitives available only through an explicitly passed helper namespace.
+/// Native primitives passed directly to internal Python functions.
 /// These identities and their signatures are part of the captured bytecode's ABI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, strum::Display)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum FrozenFunctions {
     /// Insert a successful result into a cache wrapper.
     Store,
-}
-
-/// Creates a private namespace for a cache-miss frame; never installed in globals.
-pub(crate) fn cache_helpers(vm: &mut VM<'_>) -> Value {
-    let mut helpers = Module::new(StaticStrings::FrozenHelpers, vm.interns);
-    helpers.set_attr(
-        StaticStrings::Store,
-        Value::ModuleFunction(ModuleFunctions::Frozen(FrozenFunctions::Store)),
-        vm,
-    );
-    Value::Ref(vm.heap.allocate(HeapData::Module(Box::new(helpers))))
 }
 
 /// Dispatches private helpers using the same argument ownership rules as public natives.
@@ -159,32 +132,29 @@ fn frozen_interns() -> MutexGuard<'static, Interns> {
         .expect("frozen intern lock should not be poisoned")
 }
 
-/// Captures trusted source separately from user function IDs.
+/// Compiles trusted source before user functions are added to the same tables.
 fn compile_frozen_interns() -> Interns {
     let mut interns = Interns::new(FROZEN_SOURCE);
     compile_module_source(
         FROZEN_SOURCE,
         FROZEN_FILENAME,
         &mut NameMap::new(),
-        CompileInterns::direct(&mut interns),
+        CompileInterns::for_frozen(&mut interns),
         Vec::<String>::new(),
         CompileOptions::default(),
     )
     .expect("frozen Python source should compile");
-    let reduce = interns.get_function(FunctionId::from_index(0)).clone();
-    let cache_miss = interns.get_function(FunctionId::from_index(1)).clone();
+    let reduce = FunctionId::from_index(0);
+    let cache_miss = FunctionId::from_index(1);
     assert_eq!(
-        reduce.code.bytecode().get(..REDUCE_LOOP_ENTRY),
+        interns.get_function(reduce).code.bytecode().get(..REDUCE_LOOP_ENTRY),
         Some([Opcode::LoadLocal1 as u8, Opcode::GetIter as u8].as_slice()),
         "frozen reduce setup changed without updating its entry point"
     );
-    assert!(
-        reduce.code.bytecode().contains(&(Opcode::CallLocal2 as u8)),
-        "frozen reduce callback should use CallLocal2"
-    );
-    interns.set_frozen_functions(vec![
-        FrozenFunctionCode::new(reduce, REDUCE_LOOP_ENTRY, Some(1)),
-        FrozenFunctionCode::new(cache_miss, 0, None),
-    ]);
+    let entries = vec![
+        FrozenEntry::new(reduce, &interns, REDUCE_LOOP_ENTRY, Some(1)),
+        FrozenEntry::new(cache_miss, &interns, 0, None),
+    ];
+    interns.set_frozen_entries(entries);
     interns
 }

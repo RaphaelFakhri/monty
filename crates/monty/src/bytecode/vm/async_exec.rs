@@ -506,7 +506,7 @@ impl<'h> VM<'h> {
             .suspended_frames
             .drain(..)
             .map(|f| SerializedTaskFrame {
-                function: f.function,
+                function_id: f.function_id,
                 ip: f.ip,
                 stack_base: f.stack_base(),
                 locals_count: f.locals_count,
@@ -520,7 +520,7 @@ impl<'h> VM<'h> {
         // The namespace moves across so the frame left behind releases nothing.
         let current = &mut self.current_frame;
         frames.push(SerializedTaskFrame {
-            function: current.function,
+            function_id: current.function_id,
             ip: current.ip,
             stack_base: current.stack_base(),
             locals_count: current.locals_count,
@@ -582,7 +582,7 @@ impl<'h> VM<'h> {
             let mut frames: Vec<_> = frames
                 .into_iter()
                 .map(|sf| {
-                    let code = frame_code(self.interns, self.module_code, sf.function);
+                    let code = frame_code(self.interns, self.module_code, sf.function_id);
                     CallFrame {
                         code,
                         bytecode: code.bytecode(),
@@ -590,7 +590,7 @@ impl<'h> VM<'h> {
                         stack_base: stack_index(sf.stack_base),
                         locals_count: sf.locals_count,
                         exception_stack_base: stack_index(sf.exception_stack_base),
-                        function: sf.function,
+                        function_id: sf.function_id,
                         call_offset: sf.call_offset,
                         should_return: false,
                         is_parked: false,

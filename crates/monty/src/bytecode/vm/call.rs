@@ -860,15 +860,15 @@ impl<'h> VM<'h> {
     ) -> Result<CallResult, RunError> {
         let call_offset = self.current_offset();
         let stack_base = self.stack.len();
-        let frozen = self.interns.get_frozen_function(function);
-        let func = frozen.function();
+        let frozen = self.interns.frozen_entry(function);
+        let func = self.interns.get_function(frozen.function_id);
         let namespace_size = func.namespace_size;
         let locals_count = u16::try_from(namespace_size).expect("frozen function namespace exceeds u16");
         assert!(namespace_size >= args.len(), "frozen function has too few local slots");
 
         assert_eq!(func.signature.exact_positional_count(), Some(N));
         let iterator = frozen
-            .iterator_slot()
+            .iterator_slot
             .map(|slot| args[usize::from(slot)].clone_with_heap(self.heap));
         self.stack.extend(args);
         self.stack.resize_with(stack_base + namespace_size, || Value::Undefined);
@@ -877,15 +877,17 @@ impl<'h> VM<'h> {
         }
 
         let exc_stack_base = self.exception_stack.len();
-        self.push_frame(CallFrame::new_frozen(
+        let mut frame = CallFrame::new_function(
             &func.code,
             stack_base,
             locals_count,
             exc_stack_base,
-            function,
+            frozen.function_id,
             call_offset,
-            frozen.entry_ip(),
-        ))?;
+            None,
+        );
+        frame.ip = frozen.entry_ip;
+        self.push_frame(frame)?;
 
         Ok(CallResult::FramePushed)
     }
