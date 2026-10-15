@@ -23,6 +23,10 @@ use crate::{
 
 /// Integer arithmetic on borrowed payloads; none of these operations may re-enter Python.
 /// Implementations for `i64` and `BigInt` specialize away the storage tests.
+#[expect(
+    clippy::inline_always,
+    reason = "hot operators inline so the `i64` instantiation's small-int path has no call overhead"
+)]
 pub(super) trait IntArithmetic {
     /// Returns an immediate payload without allocating a temporary big integer.
     fn small(&self) -> Option<i64>;
@@ -32,6 +36,7 @@ pub(super) trait IntArithmetic {
     fn float(&self) -> RunResult<f64>;
 
     /// Subtracts in operand order, promoting only on overflow or a big operand.
+    #[inline(always)]
     fn sub(&self, other: &Value, vm: &VM<'_>, reflected: bool) -> RunResult<Option<Value>> {
         if let (Some(lhs), Some(rhs)) = (self.small(), small_int(other)) {
             let (lhs, rhs) = ordered(lhs, rhs, reflected);
@@ -52,6 +57,7 @@ pub(super) trait IntArithmetic {
     }
 
     /// Divides exact integers with one rounding step, including beyond the float range.
+    #[inline(always)]
     fn truediv(&self, other: &Value, vm: &VM<'_>, reflected: bool) -> RunResult<Option<Value>> {
         if let (Some(lhs), Some(rhs)) = (self.small(), small_int(other)) {
             let (lhs, rhs) = ordered(lhs, rhs, reflected);
@@ -76,6 +82,7 @@ pub(super) trait IntArithmetic {
     }
 
     /// Computes floor division with an allocation-free machine-integer fast path.
+    #[inline(always)]
     fn floordiv(&self, other: &Value, vm: &VM<'_>, reflected: bool) -> RunResult<Option<Value>> {
         if let (Some(lhs), Some(rhs)) = (self.small(), small_int(other)) {
             let (lhs, rhs) = ordered(lhs, rhs, reflected);
@@ -104,6 +111,7 @@ pub(super) trait IntArithmetic {
     }
 
     /// Computes the remainder with the divisor's sign, including signed float zero.
+    #[inline(always)]
     fn modulo(&self, other: &Value, vm: &VM<'_>, reflected: bool) -> RunResult<Option<Value>> {
         if let (Some(lhs), Some(rhs)) = (self.small(), small_int(other)) {
             let (lhs, rhs) = ordered(lhs, rhs, reflected);

@@ -76,6 +76,7 @@ pub(crate) enum IntRead<'h> {
 /// Keeps storage selection here; a heap integer forwards to its concrete protocol.
 macro_rules! int_binary {
     ($method:ident, $operation:ident, $reflected:literal) => {
+        #[inline(always)]
         fn $method(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
             match self {
                 Self::Small(value) => IntArithmetic::$operation(value, other, vm, $reflected),
@@ -85,6 +86,7 @@ macro_rules! int_binary {
         }
     };
     ($method:ident, $operator:tt) => {
+        #[inline(always)]
         fn $method(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
             match self {
                 Self::Small(value) => Ok(value.bitwise(other, vm, |a, b| a $operator b, |a, b| a $operator b)),
@@ -105,6 +107,10 @@ impl PyObjectIdentity for IntRead<'_> {
     }
 }
 
+#[expect(
+    clippy::inline_always,
+    reason = "small-int fast paths must fold into `Value`'s operator dispatch to avoid a call per operation"
+)]
 impl<'h> PyTrait<'h> for IntRead<'h> {
     fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::Int
@@ -122,6 +128,7 @@ impl<'h> PyTrait<'h> for IntRead<'h> {
         }
     }
 
+    #[inline(always)]
     fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {
         Ok(match self {
             Self::Small(value) => *value != 0,
@@ -147,10 +154,12 @@ impl<'h> PyTrait<'h> for IntRead<'h> {
         }
     }
 
+    #[inline(always)]
     fn py_index_impl(&self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         self.py_pos_impl(vm)
     }
 
+    #[inline(always)]
     fn py_pos_impl(&self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         Ok(Some(match self {
             Self::Small(value) => Value::Int(*value),
@@ -159,6 +168,7 @@ impl<'h> PyTrait<'h> for IntRead<'h> {
         }))
     }
 
+    #[inline(always)]
     fn py_neg_impl(&self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         match self {
             Self::Small(value) => Ok(Some(match value.checked_neg() {
@@ -215,10 +225,12 @@ impl<'h> PyTrait<'h> for IntRead<'h> {
     int_binary!(py_rshift_impl, rshift, false);
     int_binary!(py_rrshift_impl, rshift, true);
 
+    #[inline(always)]
     fn py_radd_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         self.py_add_impl(other, vm)
     }
 
+    #[inline(always)]
     fn py_mul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         match self {
             Self::Small(lhs) => {
@@ -245,6 +257,7 @@ impl<'h> PyTrait<'h> for IntRead<'h> {
         }
     }
 
+    #[inline(always)]
     fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         match self {
             Self::Small(lhs) => {
