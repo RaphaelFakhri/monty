@@ -9,6 +9,7 @@ abc: 3.0-  # not importable at runtime, only for type checking
 asyncio: 3.4-
 base64: 3.0-
 binascii: 3.0-
+bisect: 3.0-
 builtins: 3.0-
 collections: 3.0-
 copy: 3.0-

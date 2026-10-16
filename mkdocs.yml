@@ -61,6 +61,7 @@ nav:
       - asyncio: 'limitations/asyncio.md'
       - Standard library modules: 'limitations/modules.md'
       - base64: 'limitations/base64.md'
+      - bisect: 'limitations/bisect.md'
       - collections: 'limitations/collections.md'
       - copy: 'limitations/copy.md'
       - datetime: 'limitations/datetime.md'

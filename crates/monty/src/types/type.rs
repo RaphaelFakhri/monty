@@ -173,6 +173,15 @@ pub enum Type {
     /// A regex match result from `re.match()` / `re.search()` etc. - displays as "re.Match"
     #[strum(serialize = "re.Match")]
     ReMatch,
+    /// An `os.DirEntry` from `os.scandir()`.
+    #[strum(serialize = "posix.DirEntry")]
+    DirEntry,
+    /// The iterator `os.scandir()` returns.
+    #[strum(serialize = "posix.ScandirIterator")]
+    ScandirIterator,
+    /// The iterator `os.walk()` and `Path.walk()` return; CPython's is a generator.
+    #[strum(serialize = "generator")]
+    WalkGenerator,
     // Variants serialize by name into dumps: renaming one needs `#[serde(alias)]`.
     #[strum(serialize = "tuple_iterator")]
     TupleIterator,
@@ -480,6 +489,8 @@ impl Type {
                 | Self::DictValueIterator
                 | Self::SetIterator
                 | Self::CallableIterator
+                | Self::ScandirIterator
+                | Self::WalkGenerator
                 | Self::ItertoolsCount
                 | Self::ItertoolsRepeat
                 | Self::ItertoolsPairwise

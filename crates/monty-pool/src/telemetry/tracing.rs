@@ -824,6 +824,26 @@ fn os_call_span(os_call: &pb::OsCall, micros: u64, max_feed_duration: Option<u64
             args_cut |= cut;
             os_call!("import_stubs", args.modules = modules)
         }
+        // the pattern is recorded joined, as the user wrote it, built only up to the cap
+        Some(Call::Scan(s)) => os_call!(
+            "scan",
+            args.path = string_arg!(&s.path),
+            args.max_depth = s.max_depth,
+            args.follow_symlinks = s.follow_symlinks,
+            args.pattern = (!s.pattern.is_empty()).then(|| {
+                let (joined, cut) = capped_text(|text| {
+                    for (index, part) in s.pattern.iter().enumerate() {
+                        if index > 0 {
+                            text.write_str("/")?;
+                        }
+                        text.write_str(part)?;
+                    }
+                    Ok(())
+                });
+                args_cut |= cut;
+                joined
+            })
+        ),
         None => os_call!(MISSING),
     });
     if args_cut {

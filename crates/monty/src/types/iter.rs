@@ -143,7 +143,7 @@ where
 }
 
 /// Drains an owned Python iterator with incremental allocation checks.
-fn collect_python_iterator<'h, T>(iterator: Value, vm: &mut VM<'h>) -> RunResult<T>
+pub(crate) fn collect_python_iterator<'h, T>(iterator: Value, vm: &mut VM<'h>) -> RunResult<T>
 where
     T: Default + Extend<Value> + DropWithContext<VM<'h>>,
 {

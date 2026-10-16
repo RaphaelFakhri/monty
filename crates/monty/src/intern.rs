@@ -674,6 +674,12 @@ pub enum StaticStrings {
     Binascii,
     /// `random.binomialvariate()` function.
     Binomialvariate,
+    /// `bisect` in the bisect module.
+    Bisect,
+    /// `bisect_left` in the bisect module.
+    BisectLeft,
+    /// `bisect_right` in the bisect module.
+    BisectRight,
     /// `hashlib.blake2b` type and hash name.
     Blake2b,
     /// `hashlib.blake2s` type and hash name.
@@ -696,6 +702,8 @@ pub enum StaticStrings {
     Callable,
     /// `capitalize()` method, shared by `str` and `bytes`.
     Capitalize,
+    /// Kwarg name `case_sensitive` — `Path.glob(case_sensitive=...)`.
+    CaseSensitive,
     /// `str.casefold()` method.
     Casefold,
     /// `unicodedata.category()` function.
@@ -1063,6 +1071,8 @@ pub enum StaticStrings {
     Foldspaces,
     /// Kwarg name `follow_symlinks` — `os.stat(follow_symlinks=...)`.
     FollowSymlinks,
+    /// Kwarg name `followlinks` — `os.walk(followlinks=...)`.
+    Followlinks,
     /// Kwarg name `format` — `date.strftime(format=...)`, `datetime.strftime(format=...)`.
     Format,
     /// `math.frexp()` function.
@@ -1135,6 +1145,8 @@ pub enum StaticStrings {
     Getsize,
     /// `random.getstate()` function.
     Getstate,
+    /// `Path.glob()` method — yields a host scan.
+    Glob,
     /// `globals` parameter of eval/exec.
     Globals,
     /// `time.gmtime()` function.
@@ -1173,6 +1185,8 @@ pub enum StaticStrings {
     Hexstr,
     /// `sys.hexversion` attribute.
     Hexversion,
+    /// `hi` in the bisect module.
+    Hi,
     /// `high` parameter of `random.triangular()`.
     High,
     /// `datetime` / `time` `hour` attribute and constructor kwarg.
@@ -1207,6 +1221,12 @@ pub enum StaticStrings {
     InnerSize,
     /// `list.insert()` method.
     Insert,
+    /// `insort` in the bisect module.
+    Insort,
+    /// `insort_left` in the bisect module.
+    InsortLeft,
+    /// `insort_right` in the bisect module.
+    InsortRight,
     /// `sys.flags.inspect` field.
     Inspect,
     /// `sys.flags.int_max_str_digits` field.
@@ -1223,6 +1243,8 @@ pub enum StaticStrings {
     IsDir,
     /// `Path.is_file()` method — yields a host call.
     IsFile,
+    /// `DirEntry.is_junction()` method.
+    IsJunction,
     /// `unicodedata.is_normalized()` function.
     #[strum(serialize = "is_normalized")]
     IsNormalized,
@@ -1365,6 +1387,8 @@ pub enum StaticStrings {
     Little,
     /// `ljust()` method, shared by `str` and `bytes`.
     Ljust,
+    /// `lo` in the bisect module.
+    Lo,
     /// `json.loads()` function.
     Loads,
     /// `locals` parameter of eval/exec.
@@ -1474,6 +1498,8 @@ pub enum StaticStrings {
     /// `None` is a legitimate default.
     #[strum(serialize = "MISSING")]
     Missing,
+    /// Path.unlink missing-file option.
+    MissingOk,
     /// `Path.mkdir()` and `os.mkdir()` — yields a host call.
     Mkdir,
     /// `time.mktime()` function.
@@ -1568,6 +1594,10 @@ pub enum StaticStrings {
     Offset,
     /// Kwarg name `old` — `str.replace(old=...)`, `bytes.replace(old=...)`.
     Old,
+    /// Kwarg name `on_error` — `Path.walk(on_error=...)`.
+    OnError,
+    /// Kwarg name `onerror` — `os.walk(onerror=...)`.
+    Onerror,
     /// `Path.open()` and the `open()` builtin, which share the `OsFunctionCall::Open`
     /// round-trip. `Path::py_call_attr` delegates to `builtin_open` for mode/kwarg
     /// validation rather than taking the generic `is_path_os_method` pre-flight.
@@ -1730,6 +1760,8 @@ pub enum StaticStrings {
     Real,
     /// `os.path.realpath()` function.
     Realpath,
+    /// Kwarg name `recurse_symlinks` — `Path.glob(recurse_symlinks=...)`.
+    RecurseSymlinks,
     /// `functools.reduce()` function.
     Reduce,
     /// Kwarg name `rel_tol` — `math.isclose(rel_tol=...)`.
@@ -1769,6 +1801,8 @@ pub enum StaticStrings {
     Reverse,
     /// `rfind()` method, shared by `str` and `bytes`.
     Rfind,
+    /// `Path.rglob()` method — yields a host scan.
+    Rglob,
     /// `rindex()` method, shared by `str` and `bytes`.
     Rindex,
     /// `rjust()` method, shared by `str` and `bytes`.
@@ -1804,6 +1838,8 @@ pub enum StaticStrings {
     Samestat,
     /// `random.sample()` function.
     Sample,
+    /// `os.scandir()` function — yields a host scan.
+    Scandir,
     /// `re.search()` / `pattern.search()` method
     Search,
     /// `datetime` / `time` `second` attribute and constructor kwarg.
@@ -2011,6 +2047,8 @@ pub enum StaticStrings {
     Tan,
     /// `math.tanh()` function.
     Tanh,
+    /// Destination keyword for Path.rename and Path.replace.
+    Target,
     /// `math.tau` constant
     Tau,
     /// `itertools.tee()` function.
@@ -2069,6 +2107,12 @@ pub enum StaticStrings {
     TmZone,
     /// `date.today()` / `datetime.today()` classmethod.
     Today,
+    /// Kwarg name `top` — `os.walk(top=...)`.
+    Top,
+    /// Kwarg name `top_down` — `Path.walk(top_down=...)`.
+    TopDown,
+    /// Kwarg name `topdown` — `os.walk(topdown=...)`.
+    Topdown,
     /// `Counter.total()` method.
     Total,
     /// `timedelta.total_seconds()` method.
@@ -2173,6 +2217,8 @@ pub enum StaticStrings {
     VersionInfo,
     /// `random.vonmisesvariate()` function.
     Vonmisesvariate,
+    /// `os.walk()` / `Path.walk()` — yields a host scan.
+    Walk,
     /// `sys.flags.warn_default_encoding` field.
     WarnDefaultEncoding,
     /// `@dataclass(weakref_slot=...)`.

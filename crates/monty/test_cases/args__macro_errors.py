@@ -12,6 +12,7 @@
 import asyncio
 import base64
 import binascii
+import bisect
 import copy
 import datetime
 import json
@@ -964,3 +965,27 @@ try:
     assert False, 'isoformat(1) should raise'
 except TypeError as e:
     assert str(e) == 'date.isoformat() takes no arguments (1 given)'
+
+
+# === bisect: Clinic keyword-capable arguments and a keyword-only key ===
+for f, name in [
+    (bisect.bisect_left, 'bisect_left'),
+    (bisect.bisect_right, 'bisect_right'),
+    (bisect.insort_left, 'insort_left'),
+    (bisect.insort_right, 'insort_right'),
+]:
+    cases = [
+        ((), {}, TypeError, name + "() missing required argument 'a' (pos 1)"),
+        (([],), {}, TypeError, name + "() missing required argument 'x' (pos 2)"),
+        (([], 1, 0, None, None), {}, TypeError, name + '() takes at most 4 positional arguments (5 given)'),
+        (([], 1), {'unknown': 1}, TypeError, name + "() got an unexpected keyword argument 'unknown'"),
+        (([], 1), {'a': []}, TypeError, 'argument for ' + name + "() given by name ('a') and position (1)"),
+        (([], 1), {'lo': 0.5, 'oops': 1}, TypeError, name + "() got an unexpected keyword argument 'oops'"),
+        (([], 1, 0.5), {'lo': 2}, TypeError, 'argument for ' + name + "() given by name ('lo') and position (3)"),
+    ]
+    for args, kwargs, error, message in cases:
+        try:
+            f(*args, **kwargs)
+            assert False, 'expected failure'
+        except error as exc:
+            assert str(exc) == message

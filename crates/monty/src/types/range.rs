@@ -73,7 +73,8 @@ impl Range {
         self.len_i128().try_into().unwrap_or(usize::MAX)
     }
 
-    fn len_i128(&self) -> i128 {
+    /// Exact length before `len()` saturates to the target pointer width.
+    pub(crate) fn len_i128(&self) -> i128 {
         // self.stop - self.start could be up to i64::MAX - i64::MIN, which overflows i64,
         // so we use i128 for the calculation to avoid overflow.
         let start = i128::from(self.start);

@@ -1,4 +1,5 @@
 import asyncio
+import bisect
 import datetime
 import functools
 import hashlib
@@ -698,3 +699,14 @@ assert_type(random.choices('abc', k=2), list[str])
 assert_type(random.Random(42).uniform(1, 2), float)
 assert_type(random.Random().getrandbits(8), int)
 assert_type(os.urandom(4), bytes)
+
+
+# === bisect ===
+
+assert_type(bisect.bisect_left([1, 2, 3], 2), int)
+assert_type(bisect.bisect_right((1, 2), 2, hi=None), int)
+assert_type(bisect.bisect([1, 2], 2, lo=False), int)
+assert_type(bisect.bisect_left([(1, 'a')], 1, key=lambda row: row[0]), int)
+assert_type(bisect.insort_left([1, 2], 2), None)
+assert_type(bisect.insort_right([(1, 'a')], (2, 'b'), key=lambda row: row[0]), None)
+assert_type(bisect.insort([1, 2], 3), None)

@@ -204,6 +204,13 @@ pub(crate) trait ExcTypeExt: Sized {
         SimpleException::new_msg(ExcType::RuntimeError, "cannot reuse already awaited coroutine").into()
     }
 
+    /// `ValueError: generator already executing` — a generator advanced from
+    /// inside its own step, e.g. by an `os.walk` `onerror` callback.
+    #[must_use]
+    fn generator_already_executing() -> RunError {
+        SimpleException::new_msg(ExcType::ValueError, "generator already executing").into()
+    }
+
     /// Creates a TypeError for item assignment on types that don't support it.
     ///
     /// Matches CPython's format: `TypeError: '{type}' object does not support item assignment`
@@ -746,16 +753,19 @@ pub(crate) trait ExcTypeExt: Sized {
     /// Named positional-overflow wording used by clinic functions with
     /// keyword-only slots (e.g. `os.stat`/`os.mkdir`): `{name}() takes
     /// {exactly|at most} {max} positional argument{s} ({actual} given)` —
-    /// "exactly" when every positional param is required.
+    /// "exactly" when every positional param is required, and `takes no
+    /// positional arguments` when there are none (`DirEntry.is_dir`).
     #[must_use]
     fn type_error_named_positional(name: &str, max: usize, actual: usize, exact: bool) -> RunError {
-        let qualifier = if exact { "exactly" } else { "at most" };
-        let plural = if max == 1 { "" } else { "s" };
-        SimpleException::new_msg(
-            ExcType::TypeError,
-            format!("{name}() takes {qualifier} {max} positional argument{plural} ({actual} given)"),
-        )
-        .into()
+        let message = if max == 0 {
+            // `_PyArg_UnpackKeywords` drops the count for keyword-only signatures.
+            format!("{name}() takes no positional arguments")
+        } else {
+            let qualifier = if exact { "exactly" } else { "at most" };
+            let plural = if max == 1 { "" } else { "s" };
+            format!("{name}() takes {qualifier} {max} positional argument{plural} ({actual} given)")
+        };
+        SimpleException::new_msg(ExcType::TypeError, message).into()
     }
 
     /// Creates a TypeError matching the `os` module's `path_t` converter:
@@ -812,12 +822,20 @@ pub(crate) trait ExcTypeExt: Sized {
 
     /// Creates the `os.fspath` TypeError, also raised by pure-Python `os`
     /// functions that call `fspath` internally (e.g. `os.makedirs`):
-    /// `expected str, bytes or os.PathLike object, not {type}`
+    /// `expected str, bytes or os.PathLike object, not {type}`.
+    ///
+    /// `bytes`, which CPython accepts and Monty refuses, gets the phrase
+    /// narrowed to what Monty takes, as the `os` path converter does.
     #[must_use]
     fn type_error_fspath(type_name: &str) -> RunError {
+        let accepted = if type_name == "bytes" {
+            "str or os.PathLike"
+        } else {
+            "str, bytes or os.PathLike"
+        };
         SimpleException::new_msg(
             ExcType::TypeError,
-            format!("expected str, bytes or os.PathLike object, not {type_name}"),
+            format!("expected {accepted} object, not {type_name}"),
         )
         .into()
     }

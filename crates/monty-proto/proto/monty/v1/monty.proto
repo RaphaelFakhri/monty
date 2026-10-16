@@ -935,6 +935,8 @@ message OsCall {
     // Answer with a dict of dotted module paths to `.pyi` source or None;
     // `not_found` / `not_handled` mean no stubs.
     ImportStubs import_stubs = 32;
+    // Path.scan — a subtree for os.walk / os.scandir / Path.walk / Path.glob.
+    Scan scan = 33;
   }
 
   // The arena any value-typed argument (`Getenv.default`) indexes.
@@ -1010,16 +1012,29 @@ message OsCall {
     // How long to wait, under the same constraints as `Sleep.seconds`.
     double delay = 1;
   }
+  // Path.scan(path, max_depth, follow_symlinks, pattern, ...) — answered with a
+  // list of (relative_path, is_dir, is_file, is_symlink) tuples, root included.
+  message Scan {
+    string path = 1;
+    // Deepest entry to return; absent for the whole tree.
+    optional uint32 max_depth = 2;
+    bool follow_symlinks = 3;
+    // Glob pattern parts, a pruning hint; empty for a plain listing.
+    repeated string pattern = 4;
+    // Absent for CPython's default (`case_sensitive=None`).
+    optional bool case_sensitive = 5;
+    bool recurse_symlinks = 6;
+  }
 
-// The argument of `OsCall.import`.
-message Import {
-  string module = 1;
-}
+  // The argument of `OsCall.import`.
+  message Import {
+    string module = 1;
+  }
 
-// The argument of `OsCall.import_stubs`, in source order.
-message ImportStubs {
-  repeated string modules = 1;
-}
+  // The argument of `OsCall.import_stubs`, in source order.
+  message ImportStubs {
+    repeated string modules = 1;
+  }
 }
 
 // Suspension: the sandbox read an undefined name — typically probing whether

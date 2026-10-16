@@ -74,6 +74,7 @@ The following modules are present:
 | `asyncio`     | [asyncio.md](asyncio.md)         |
 | `base64`      | [base64.md](base64.md)           |
 | `binascii`    | [base64.md](base64.md)           |
+| `bisect`      | [bisect.md](bisect.md)           |
 | `collections` | [collections.md](collections.md) |
 | `copy`        | [copy.md](copy.md)               |
 | `dataclasses` | [dataclasses.md](dataclasses.md) |

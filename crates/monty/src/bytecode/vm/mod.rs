@@ -45,7 +45,8 @@ use crate::{
     name_map::NameMap,
     object_bridge::MontyObjectExt,
     os_dispatch::{
-        PendingEffect, PostConversionEffect, Reshaped, release_pending_effect, resolve_call_paths, urandom_reply_error,
+        PendingEffect, PostConversionEffect, PreConversionEffect, Reshaped, release_pending_effect, resolve_call_paths,
+        urandom_reply_error,
     },
     parse::CodeRange,
     py_value::PyValue,
@@ -2107,6 +2108,16 @@ impl<'h> VM<'h> {
                 Ok(Reshaped::Call { call, effect }) => return self.suspend_again(call, effect),
                 Err(err) => return self.resume_with_exception(err),
             },
+            // Builds its result straight from the raw reply, never converting it.
+            Some(PendingEffect::Scan(effect)) => {
+                return match effect.apply(Ok(obj), self) {
+                    Ok(value) => {
+                        self.push(value);
+                        self.run_external()
+                    }
+                    Err(err) => self.resume_with_exception(err),
+                };
+            }
             post => {
                 self.pending_effect = post;
                 obj
@@ -2180,7 +2191,8 @@ impl<'h> VM<'h> {
             // The sleeps were answered above; any pre-conversion effect was consumed.
             Some(
                 PendingEffect::Post(PostConversionEffect::DiscardResult | PostConversionEffect::SleepResult { .. })
-                | PendingEffect::Pre(_),
+                | PendingEffect::Pre(_)
+                | PendingEffect::Scan(_),
             )
             | None => Ok(Some(value)),
         };
@@ -2226,6 +2238,12 @@ impl<'h> VM<'h> {
     pub fn resume_with_exception(&mut self, error: RunError) -> Result<FrameExit, RunError> {
         if let Some(effect) = self.pending_effect.take() {
             match effect {
+                // Resume on attempting to unlink missing file with unlink(missing_ok=True)
+                PendingEffect::Pre(PreConversionEffect::Unlink { missing_ok: true }) if matches!(&error, RunError::Exc(raise) if raise.exc.exc_type() == ExcType::FileNotFoundError) =>
+                {
+                    self.push(Value::None);
+                    return self.run_external();
+                }
                 PendingEffect::Post(PostConversionEffect::BufferStore { file_id }) => {
                     if let HeapReadOutput::OpenFile(mut file) = self.heap.read(file_id) {
                         file.get_mut(self.heap).clear_pending_read();
@@ -2254,6 +2272,18 @@ impl<'h> VM<'h> {
                     | PostConversionEffect::SeedRandom { .. }),
                 ) => effect.release(self.heap),
                 PendingEffect::Post(PostConversionEffect::SleepResult { result }) => result.drop_with(self),
+                // A walk or glob turns an `OSError` into its result, as CPython's
+                // do for a failed `scandir`; anything else still raises.
+                PendingEffect::Scan(effect) if effect.absorbs(&error) => {
+                    return match effect.apply(Err(error), self) {
+                        Ok(value) => {
+                            self.push(value);
+                            self.run_external()
+                        }
+                        Err(err) => self.resume_with_exception(err),
+                    };
+                }
+                PendingEffect::Scan(effect) => effect.release(self.heap),
                 // Hold no state or heap references — nothing to roll back.
                 PendingEffect::Pre(_)
                 | PendingEffect::Post(
