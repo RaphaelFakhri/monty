@@ -117,8 +117,8 @@ whether each call is permitted.
 - **Hosts see pathlib-style call names.** `os.listdir` suspends as
     `Path.iterdir` (the interpreter reduces the returned paths to names),
     `os.stat` and `os.chdir` as `Path.stat`, `os.remove`/`os.unlink` as `Path.unlink`,
-    `os.mkdir`/`os.makedirs` as `Path.mkdir`, `os.rename`/`os.replace` as
-    `Path.rename`. A custom `os` callback cannot distinguish e.g. `os.listdir`
+    `os.mkdir`/`os.makedirs` as `Path.mkdir`, `os.rename`/`os.replace` and `Path.replace` as `Path.rename`.
+    A custom `os` callback cannot distinguish e.g. `os.listdir`
     from `Path.iterdir`.
 - **`os.scandir` and `os.walk` read their whole directory or tree when called.** One host call answers each (see
     [pathlib.md](pathlib.md#glob-rglob-and-walk) for the shared divergences: no laziness, sorted entries, unreadable

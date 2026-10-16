@@ -54,6 +54,7 @@ assert tuple(name for name in sys.builtin_module_names if name != 'gc') == (
     'asyncio',
     'base64',
     'binascii',
+    'bisect',
     'collections',
     'dataclasses',
     'datetime',

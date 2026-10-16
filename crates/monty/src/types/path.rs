@@ -11,7 +11,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use monty_types::{MontyPath, OsFunctionCall};
+use monty_types::MontyPath;
 use smallvec::SmallVec;
 
 use crate::{
@@ -23,7 +23,7 @@ use crate::{
     hash::HashValue,
     heap::{DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
     intern::{Interns, StaticStrings},
-    os_dispatch::{PreConversionEffect, build_path_os_call, is_path_os_method, value_as_path_str},
+    os_dispatch::{build_path_os_call, is_path_os_method, value_as_path_str},
     types::{
         LazyHeapSet, List, PyTrait, Type, allocate_tuple,
         dir_scan::{glob_call, walk_call},
@@ -590,27 +590,9 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Path> {
             return Err(ExcType::attribute_error(Type::Path, attr.as_str(vm.interns)));
         };
 
-        // Check if this is an OS method that requires host system access.
-        //
-        // Pre-flight via `is_path_os_method` lets us extract the path string
-        // and commit ownership of `args` to the builder; the builder yields
-        // an `OsFunctionCall` variant with the typed args struct populated.
         if is_path_os_method(method) {
             let path = MontyPath::new(self.get(vm.heap).as_str().to_owned());
-            // SAFETY: builder owns `args` and is responsible for dropping it
-            // on every error path; `self` is a separate heap entry that
-            // we don't transfer here.
-            return match build_path_os_call(method, path, args, vm)? {
-                Some(OsFunctionCall::Iterdir(path)) => Ok(CallResult::OsCallWithEffect {
-                    effect: PreConversionEffect::IterdirPaths {
-                        path: path.as_str().to_owned(),
-                    }
-                    .into(),
-                    call: OsFunctionCall::Iterdir(path),
-                }),
-                Some(call) => Ok(CallResult::OsCall(call)),
-                None => unreachable!("is_path_os_method gates the call"),
-            };
+            return build_path_os_call(method, path, args, vm);
         }
 
         // Pure methods (no I/O)

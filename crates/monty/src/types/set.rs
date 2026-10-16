@@ -8,6 +8,7 @@ use crate::{
     bytecode::{CallResult, ContainsVM, RecursionToken, VM},
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
+    expressions::CmpOperator,
     hash::HashValue,
     heap::{
         BorrowedHeapRead, BorrowedHeapReadMut, ContainsHeap, DropGuard, DropWithContext, Heap, HeapData, HeapId,
@@ -317,6 +318,79 @@ impl<'h> HeapRead<'h, SetStorage> {
         Ok(true)
     }
 
+    /// Set ordering tests containment; overlapping sets can satisfy neither <= nor >=.
+    fn compare_storage(&self, other: &Self, op: CmpOperator, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        let lhs_len = self.get(vm.heap).len();
+        let rhs_len = other.get(vm.heap).len();
+
+        // Strict containment requires different lengths; non-strict containment includes equality.
+        let (smaller, larger) = match op {
+            CmpOperator::Lt if lhs_len < rhs_len => (self, other),
+            CmpOperator::LtE if lhs_len <= rhs_len => (self, other),
+            CmpOperator::Gt if lhs_len > rhs_len => (other, self),
+            CmpOperator::GtE if lhs_len >= rhs_len => (other, self),
+            CmpOperator::Lt | CmpOperator::LtE | CmpOperator::Gt | CmpOperator::GtE => return Ok(Some(false)),
+            _ => return Ok(None),
+        };
+
+        Ok(Some(smaller.is_subset(larger, vm)?))
+    }
+
+    /// Tests containment using cached hashes, without cloning either set's storage.
+    fn is_subset(&self, other: &Self, vm: &mut VM<'h>) -> RunResult<bool> {
+        let iter = self.iter(vm)?;
+        defer_drop_mut!(iter, vm);
+        while let Some((elem, hash)) = iter.next_entry(vm)? {
+            if !other.contains_with_hash(elem, hash, vm)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Ordering accepts set, frozenset, dict_keys and dict_items, in either operand position.
+    /// Other iterables (including dict_values) are accepted by issubset/issuperset, but not by these operators.
+    fn compare_operand(&self, other: &Value, op: CmpOperator, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        match other.read_heap(vm) {
+            Some(HeapReadOutput::Set(other)) => self.compare_storage(&other.storage(), op, vm),
+            Some(HeapReadOutput::FrozenSet(other)) => self.compare_storage(&other.storage(), op, vm),
+            Some(view @ (HeapReadOutput::DictKeysView(_) | HeapReadOutput::DictItemsView(_))) => {
+                let lhs_len = self.get(vm.heap).len();
+                let rhs_len = view.py_len(vm).expect("dict views have a length");
+                let possible = match op {
+                    CmpOperator::Lt => lhs_len < rhs_len,
+                    CmpOperator::LtE => lhs_len <= rhs_len,
+                    CmpOperator::Gt => lhs_len > rhs_len,
+                    CmpOperator::GtE => lhs_len >= rhs_len,
+                    _ => return Ok(None),
+                };
+                if !possible {
+                    return Ok(Some(false));
+                }
+
+                // Probe the view directly: an items view may contain unhashable values
+                // without preventing a set from being its subset.
+                if matches!(op, CmpOperator::Lt | CmpOperator::LtE) {
+                    let iter = self.iter(vm)?;
+                    defer_drop_mut!(iter, vm);
+                    while let Some(elem) = iter.next(vm)? {
+                        if view.py_contains_impl(elem, vm)? != Some(true) {
+                            return Ok(Some(false));
+                        }
+                    }
+                    return Ok(Some(true));
+                }
+
+                let Some(storage) = get_storage_from_set_operand(other, vm)? else {
+                    return Ok(None);
+                };
+                defer_drop!(storage, vm);
+                self.compare_storage(&vm.heap.protect(storage), op, vm)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Returns a stack-borrowed lending iterator over the set's elements in
     /// insertion order, holding a recursion-depth token for its lifetime.
     ///
@@ -406,25 +480,6 @@ impl<'h, C: ContainsVM<'h>> DropWithContext<C> for SetIter<'_, 'h> {
 }
 
 impl SetStorage {
-    /// Returns true if this set is a subset of other.
-    fn is_subset(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<bool> {
-        for entry in self.live() {
-            if !vm
-                .heap
-                .protect(other)
-                .contains_with_hash(&entry.value, entry.hash, vm)?
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Returns true if this set is a superset of other.
-    fn is_superset(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<bool> {
-        other.is_subset(self, vm)
-    }
-
     /// Returns true if this set has no elements in common with other.
     fn is_disjoint(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<bool> {
         // Iterate over the smaller set for efficiency
@@ -904,9 +959,12 @@ impl<'h> HeapRead<'h, Set> {
         let self_storage = self.get(vm.heap).0.clone_with_heap(vm.heap);
         defer_drop!(self_storage, vm);
 
+        let self_read = vm.heap.protect(self_storage);
+        let other_read = vm.heap.protect(other_storage);
+
         match op {
-            SetComparison::Subset => self_storage.is_subset(other_storage, vm),
-            SetComparison::Superset => self_storage.is_superset(other_storage, vm),
+            SetComparison::Subset => self_read.is_subset(&other_read, vm),
+            SetComparison::Superset => other_read.is_subset(&self_read, vm),
             SetComparison::Disjoint => self_storage.is_disjoint(other_storage, vm),
         }
     }
@@ -1039,9 +1097,12 @@ impl<'h> HeapRead<'h, FrozenSet> {
         let self_storage = self.get(vm.heap).storage.clone_with_heap(vm.heap);
         defer_drop!(self_storage, vm);
 
+        let self_read = vm.heap.protect(self_storage);
+        let other_read = vm.heap.protect(other_storage);
+
         match op {
-            SetComparison::Subset => self_storage.is_subset(other_storage, vm),
-            SetComparison::Superset => self_storage.is_superset(other_storage, vm),
+            SetComparison::Subset => self_read.is_subset(&other_read, vm),
+            SetComparison::Superset => other_read.is_subset(&self_read, vm),
             SetComparison::Disjoint => self_storage.is_disjoint(other_storage, vm),
         }
     }
@@ -1076,6 +1137,10 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Set> {
 
     fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
         Some(self.get(vm.heap).len())
+    }
+
+    fn py_cmp_op(&self, other: &Value, op: CmpOperator, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        self.storage().compare_operand(other, op, vm)
     }
 
     fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
@@ -1385,6 +1450,10 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, FrozenSet> {
 
     fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
         Some(self.get(vm.heap).len())
+    }
+
+    fn py_cmp_op(&self, other: &Value, op: CmpOperator, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        self.storage().compare_operand(other, op, vm)
     }
 
     fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {

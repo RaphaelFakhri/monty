@@ -716,3 +716,23 @@ fn reset_removes_module_stubs() {
     let second = render_with(&mut checker, "import tools\n", &TypeCheckContext::default());
     assert_snapshot!(second.unwrap(), @"main.py:1:8: error[unresolved-import] Cannot resolve imported module `tools`");
 }
+
+#[test]
+fn bisect_star_import_exports_the_public_functions() {
+    let code = "\
+from bisect import *
+assert bisect_left([1, 2], 2) == 1
+assert bisect_right([1, 2], 2) == 2
+assert bisect([1, 2], 2) == 2
+insort_left([1, 2], 2)
+insort_right([1, 2], 2)
+insort([1, 2], 2)
+";
+    assert!(check(code, "main.py").is_none());
+}
+
+#[test]
+fn bisect_does_not_declare_runtime_all_metadata() {
+    let diagnostics = check_concise("import bisect\nbisect.__all__", "main.py").expect("__all__ is absent at runtime");
+    assert_snapshot!(diagnostics, @"main.py:2:1: error[unresolved-attribute] Module `bisect` has no member `__all__`");
+}

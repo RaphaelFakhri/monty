@@ -17,6 +17,7 @@ use crate::{
 pub(crate) mod asyncio;
 pub(crate) mod base64;
 pub(crate) mod binascii;
+pub(crate) mod bisect;
 pub(crate) mod collections;
 pub(crate) mod copy;
 pub(crate) mod dataclasses;
@@ -88,6 +89,8 @@ pub(crate) enum StandardLib {
     Time,
     /// The `hashlib` module: the guaranteed algorithms, `new()` and `pbkdf2_hmac()`.
     Hashlib,
+    /// Binary search and sorted insertion.
+    Bisect,
     /// The `gc` module exposing a single `collect()` for tests. Only present
     /// under the `test-hooks` feature so production sandboxes never see it.
     ///
@@ -120,6 +123,7 @@ impl StandardLib {
             StaticStrings::Copy => Some(Self::Copy),
             StaticStrings::Time => Some(Self::Time),
             StaticStrings::Hashlib => Some(Self::Hashlib),
+            StaticStrings::Bisect => Some(Self::Bisect),
             #[cfg(feature = "test-hooks")]
             StaticStrings::Gc => Some(Self::Gc),
             _ => None,
@@ -158,6 +162,7 @@ impl StandardLib {
             Self::Copy => copy::create_module(vm),
             Self::Time => time::create_module(vm),
             Self::Hashlib => hashlib::create_module(vm),
+            Self::Bisect => bisect::create_module(vm),
             #[cfg(feature = "test-hooks")]
             Self::Gc => gc::create_module(vm),
         }
@@ -189,6 +194,7 @@ pub(crate) enum ModuleFunctions {
     Frozen(FrozenFunctions),
     Time(time::TimeFunctions),
     Hashlib(hashlib::HashlibFunctions),
+    Bisect(bisect::BisectFunctions),
     /// `gc` module functions — only present under the `test-hooks` feature.
     /// See [`gc`] for why it is gated; as in [`StandardLib`], the gated block
     /// goes last and new variants are appended ahead of it.
@@ -223,6 +229,7 @@ impl fmt::Display for ModuleFunctions {
             Self::Frozen(func) => write!(f, "{func}"),
             Self::Time(func) => write!(f, "{func}"),
             Self::Hashlib(func) => write!(f, "{func}"),
+            Self::Bisect(func) => write!(f, "{func}"),
             #[cfg(feature = "test-hooks")]
             Self::Gc(func) => write!(f, "{func}"),
             #[cfg(feature = "test-hooks")]
@@ -256,6 +263,7 @@ impl ModuleFunctions {
             Self::Frozen(functions) => frozen::call_helper(functions, args, vm).map(CallResult::Value),
             Self::Time(functions) => time::call(vm, functions, args),
             Self::Hashlib(functions) => hashlib::call(vm, functions, args).map(CallResult::Value),
+            Self::Bisect(functions) => bisect::call(vm, functions, args).map(CallResult::Value),
             #[cfg(feature = "test-hooks")]
             Self::Gc(functions) => gc::call(vm, functions, args).map(CallResult::Value),
             #[cfg(feature = "test-hooks")]

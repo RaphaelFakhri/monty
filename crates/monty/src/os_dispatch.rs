@@ -30,12 +30,13 @@ use monty_types::{
 
 use crate::{
     args::{ArgValues, FromArgs, LaxBool},
-    bytecode::VM,
+    bytecode::{CallResult, VM},
+    defer_drop,
     exception_private::{ExcTypeExt, RunError, RunResult, SimpleException},
     heap::{ContainsHeap, DropWithContext, Heap, HeapData, HeapId},
     intern::{Interns, StaticStrings},
     modules::{
-        os::PathArgError,
+        os::{PathArgError, check_mode},
         os_path::{
             StatField, expand_user_reply, expand_vars_reply, lexists_reply, realpath_strict_reply, resolved_path_reply,
             samefile_first_reply, samefile_second_reply, stat_field_reply,
@@ -43,7 +44,7 @@ use crate::{
         random::RandomRetry,
         time::ClockReading,
     },
-    types::{Path, dir_scan::ScanEffect, file::FileName, random::RandomTarget},
+    types::{Path, Type, dir_scan::ScanEffect, file::FileName, random::RandomTarget},
     value::Value,
     virtual_path::posix_join,
 };
@@ -138,11 +139,18 @@ impl From<ScanEffect> for PendingEffect {
 
 /// Reshapes the raw host reply before heap conversion: plain data in, plain
 /// data out, so no variant holds a heap reference and none needs cleanup.
+// TODO: Consider separating effects from caller names so functions can share result handling.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum PreConversionEffect {
     /// `os.listdir`: reduce the host's `Iterdir` result (a list of child
     /// paths) to the list of bare entry names.
     ListdirNames,
+    /// Return the destination path after Path.rename succeeds.
+    RenamePath { target: String },
+    /// Return the destination path after Path.replace succeeds.
+    ReplacePath { target: String },
+    /// Suppress a missing-file exception only when requested by Path.unlink.
+    Unlink { missing_ok: bool },
     /// `os.chdir`: the target was sent to the host as a `Path.stat` call;
     /// normalize and adopt `path` once the reply proves it is a directory.
     Chdir {
@@ -208,6 +216,8 @@ impl PreConversionEffect {
     pub(crate) fn reshape(self, value: MontyObject, vm: &mut VM<'_>) -> Result<Reshaped, RunError> {
         let reply = match self {
             Self::ListdirNames => listdir_names(value),
+            Self::RenamePath { target } | Self::ReplacePath { target } => Ok(MontyObject::path(target)),
+            Self::Unlink { .. } => Ok(MontyObject::none()),
             Self::IterdirPaths { path } => iterdir_paths(value, &path, &vm.heap.tracker),
             Self::UrandomLength { size } => urandom_reply(value, size),
             Self::Chdir { path, spelled } => {
@@ -235,6 +245,9 @@ impl PreConversionEffect {
     fn operation_name(&self) -> &'static str {
         match self {
             Self::ListdirNames => "os.listdir",
+            Self::RenamePath { .. } => "Path.rename",
+            Self::ReplacePath { .. } => "Path.replace",
+            Self::Unlink { .. } => "Path.unlink",
             Self::Chdir { .. } => "os.chdir",
             Self::IterdirPaths { .. } => "Path.iterdir",
             Self::UrandomLength { .. } => "os.urandom",
@@ -554,21 +567,18 @@ pub(crate) fn is_path_os_method(method: StaticStrings) -> bool {
             | StaticStrings::AppendBytes
             | StaticStrings::Mkdir
             | StaticStrings::Rename
+            | StaticStrings::Replace
     )
 }
 
-/// Builds an [`OsFunctionCall`] for a `pathlib.Path` method invocation —
-/// dispatches on `method` and pulls any extra args out of `args` into the
-/// matching typed struct.
-///
-/// Returns `Ok(None)` if `method` isn't an OS call. Owns `path`/`args` and
-/// is responsible for refcount cleanup on every code path.
+/// Builds a host request and its resume action for a `pathlib.Path` OS method.
+/// Owns `args` and cleans up its references on every error path.
 pub(crate) fn build_path_os_call(
     method: StaticStrings,
     path: MontyPath,
     args: ArgValues,
     vm: &mut VM<'_>,
-) -> RunResult<Option<OsFunctionCall>> {
+) -> RunResult<CallResult> {
     // Simple "no extra args" path operations are bundled into one arm to avoid
     // 12 near-identical case lines.
     macro_rules! path_only {
@@ -585,11 +595,30 @@ pub(crate) fn build_path_os_call(
         StaticStrings::IsSymlink => path_only!("is_symlink", IsSymlink),
         StaticStrings::ReadText => path_only!("read_text", ReadText),
         StaticStrings::ReadBytes => path_only!("read_bytes", ReadBytes),
-        StaticStrings::StatMethod => path_only!("stat", Stat),
-        StaticStrings::Iterdir => path_only!("iterdir", Iterdir),
+        StaticStrings::StatMethod => {
+            let PathStatArgs {
+                receiver,
+                follow_symlinks,
+            } = PathStatArgs::from_args(args.prepend(Value::None), vm)?;
+            receiver.drop_with(vm);
+            if !follow_symlinks.bool() {
+                return Err(ExcType::not_implemented_os_arg(Some("stat"), "follow_symlinks"));
+            }
+            OsFunctionCall::Stat(path)
+        }
+        StaticStrings::Iterdir => {
+            args.check_zero_args("iterdir", vm.heap)?;
+            return Ok(CallResult::OsCallWithEffect {
+                effect: PreConversionEffect::IterdirPaths {
+                    path: path.as_str().to_owned(),
+                }
+                .into(),
+                call: OsFunctionCall::Iterdir(path),
+            });
+        }
+        StaticStrings::Unlink => return build_path_unlink(path, args, vm),
         StaticStrings::Resolve => path_only!("resolve", Resolve),
         StaticStrings::Absolute => path_only!("absolute", Absolute),
-        StaticStrings::Unlink => path_only!("unlink", Unlink),
         StaticStrings::Rmdir => path_only!("rmdir", Rmdir),
         StaticStrings::WriteText => {
             OsFunctionCall::WriteText(extract_str_data("write_text", path, args, vm.heap, vm.interns)?)
@@ -604,16 +633,26 @@ pub(crate) fn build_path_os_call(
             OsFunctionCall::AppendBytes(extract_bytes_data("append_bytes", path, args, vm.heap, vm.interns)?)
         }
         StaticStrings::Mkdir => OsFunctionCall::Mkdir(extract_mkdir_args(path, args, vm)?),
-        StaticStrings::Rename => OsFunctionCall::Rename(extract_rename_args(path, args, vm.heap, vm.interns)?),
+        StaticStrings::Rename | StaticStrings::Replace => {
+            let args = extract_rename_args(path, args, method == StaticStrings::Replace, vm)?;
+            let target = args.dst.as_str().to_owned();
+            let effect = if method == StaticStrings::Replace {
+                PreConversionEffect::ReplacePath { target }
+            } else {
+                PreConversionEffect::RenamePath { target }
+            };
+
+            return Ok(CallResult::OsCallWithEffect {
+                call: OsFunctionCall::Rename(args),
+                effect: effect.into(),
+            });
+        }
         _ => {
-            // Unreachable in practice — callers gate on `is_path_os_method`.
-            // Drop the owned inputs anyway so a stray call doesn't leak refs.
-            let _ = path;
             args.drop_with(vm.heap);
-            return Ok(None);
+            unreachable!("is_path_os_method gates the call");
         }
     };
-    Ok(Some(call))
+    Ok(CallResult::OsCall(call))
 }
 
 /// Extracts the `data` arg for `write_text` / `append_text`. Error wording
@@ -667,22 +706,14 @@ fn extract_bytes_data(
     }
 }
 
-/// Python-facing argument shape for `Path.mkdir(mode=0o777, parents=False, exist_ok=False)`.
-///
-/// `Path.mkdir` is a pure-Python `def` in CPython, hence `style = def` (its
-/// duplicate-arg error is `got multiple values for argument`). The
-/// too-many-positional count still diverges: CPython counts the bound `self`
-/// (`takes from 1 to 4 …`), Monty does not — see `limitations/open.md`.
-///
-/// Monty parses `mode` for signature compatibility and arity validation, but
-/// filesystem backends do not model POSIX permission bits. `parents` and
-/// `exist_ok` use [`LaxBool`] so they accept any truth-tested value (matching
-/// CPython, which evaluates them via `bool()`).
+/// Path.mkdir binds a receiver slot so arity errors include self.
 #[derive(FromArgs)]
 #[from_args(name = "Path.mkdir", style = def)]
 struct PathMkdirArgs {
-    #[from_args(default = 0o777_i64)]
-    mode: i64,
+    #[from_args(pos_only)]
+    receiver: Value,
+    #[from_args(default = Value::Int(0o777))]
+    mode: Value,
     #[from_args(default = LaxBool::new(false))]
     parents: LaxBool,
     #[from_args(default = LaxBool::new(false))]
@@ -693,11 +724,14 @@ struct PathMkdirArgs {
 /// excessive arguments before the host sees the OS call.
 fn extract_mkdir_args(path: MontyPath, args: ArgValues, vm: &mut VM<'_>) -> RunResult<MkdirCallArgs> {
     let PathMkdirArgs {
+        receiver,
         mode,
         parents,
         exist_ok,
-    } = PathMkdirArgs::from_args(args, vm)?;
-    let _ = mode;
+    } = PathMkdirArgs::from_args(args.prepend(Value::None), vm)?;
+    receiver.drop_with(vm);
+    defer_drop!(mode, vm);
+    check_mode(mode, vm)?;
     Ok(MkdirCallArgs {
         path,
         parents: parents.bool(),
@@ -705,25 +739,82 @@ fn extract_mkdir_args(path: MontyPath, args: ArgValues, vm: &mut VM<'_>) -> RunR
     })
 }
 
-/// Extracts the `target` arg for `Path.rename(target)`.
-fn extract_rename_args(
-    src: MontyPath,
-    args: ArgValues,
-    heap: &mut Heap,
-    interns: &Interns,
-) -> RunResult<RenameCallArgs> {
-    let target = args.get_one_arg("rename", heap)?;
-    let dst_str = value_to_owned_string(&target, heap, interns);
-    target.drop_with(heap);
-    match dst_str {
-        Some(dst) => Ok(RenameCallArgs {
+/// Keyword-only options shared with os.stat.
+#[derive(FromArgs)]
+#[from_args(name = "Path.stat", style = def)]
+struct PathStatArgs {
+    #[from_args(pos_only)]
+    receiver: Value,
+    #[from_args(kw_only, default = LaxBool::new(true))]
+    follow_symlinks: LaxBool,
+}
+
+#[derive(FromArgs)]
+#[from_args(name = "Path.rename", style = def)]
+struct PathRenameArgs {
+    #[from_args(pos_only)]
+    receiver: Value,
+    target: Value,
+}
+
+#[derive(FromArgs)]
+#[from_args(name = "Path.replace", style = def)]
+struct PathReplaceArgs {
+    #[from_args(pos_only)]
+    receiver: Value,
+    target: Value,
+}
+
+fn extract_rename_args(src: MontyPath, args: ArgValues, replace: bool, vm: &mut VM<'_>) -> RunResult<RenameCallArgs> {
+    let (receiver, target) = if replace {
+        let PathReplaceArgs { receiver, target } = PathReplaceArgs::from_args(args.prepend(Value::None), vm)?;
+        (receiver, target)
+    } else {
+        let PathRenameArgs { receiver, target } = PathRenameArgs::from_args(args.prepend(Value::None), vm)?;
+        (receiver, target)
+    };
+    receiver.drop_with(vm);
+    defer_drop!(target, vm);
+    if let Some(dst) = value_to_owned_string(target, vm.heap, vm.interns) {
+        Ok(RenameCallArgs {
             src,
             dst: MontyPath::new(dst),
-        }),
-        None => Err(ExcType::type_error(
-            "Path.rename() argument 'target' must be str or Path".to_owned(),
-        )),
+        })
+    } else {
+        // pathlib delegates to os.rename/replace; bytes paths remain unsupported in Monty.
+        let accepted = if target.py_type_heap(vm.heap) == Type::Bytes {
+            "string or os.PathLike"
+        } else {
+            "string, bytes or os.PathLike"
+        };
+        Err(ExcType::type_error_os_path(
+            if replace { "replace" } else { "rename" },
+            "dst",
+            accepted,
+            &target.py_type_name_heap(vm.heap, vm.interns),
+        ))
     }
+}
+
+#[derive(FromArgs)]
+#[from_args(name = "Path.unlink", style = def)]
+struct PathUnlinkArgs {
+    #[from_args(pos_only)]
+    receiver: Value,
+    #[from_args(default = LaxBool::new(false))]
+    missing_ok: LaxBool,
+}
+
+fn build_path_unlink(path: MontyPath, args: ArgValues, vm: &mut VM<'_>) -> RunResult<CallResult> {
+    let PathUnlinkArgs { receiver, missing_ok } = PathUnlinkArgs::from_args(args.prepend(Value::None), vm)?;
+    receiver.drop_with(vm);
+    Ok(CallResult::OsCallWithEffect {
+        call: OsFunctionCall::Unlink(path),
+        effect: PreConversionEffect::Unlink {
+            missing_ok: missing_ok.bool(),
+        }
+        .into(),
+    })
 }
 
 /// Pulls the single `data` arg out of `args`, raising the CPython-style

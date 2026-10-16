@@ -675,6 +675,12 @@ pub enum StaticStrings {
     Binascii,
     /// `random.binomialvariate()` function.
     Binomialvariate,
+    /// `bisect` in the bisect module.
+    Bisect,
+    /// `bisect_left` in the bisect module.
+    BisectLeft,
+    /// `bisect_right` in the bisect module.
+    BisectRight,
     /// `hashlib.blake2b` type and hash name.
     Blake2b,
     /// `hashlib.blake2s` type and hash name.
@@ -1180,6 +1186,8 @@ pub enum StaticStrings {
     Hexstr,
     /// `sys.hexversion` attribute.
     Hexversion,
+    /// `hi` in the bisect module.
+    Hi,
     /// `high` parameter of `random.triangular()`.
     High,
     /// `datetime` / `time` `hour` attribute and constructor kwarg.
@@ -1214,6 +1222,12 @@ pub enum StaticStrings {
     InnerSize,
     /// `list.insert()` method.
     Insert,
+    /// `insort` in the bisect module.
+    Insort,
+    /// `insort_left` in the bisect module.
+    InsortLeft,
+    /// `insort_right` in the bisect module.
+    InsortRight,
     /// `sys.flags.inspect` field.
     Inspect,
     /// `sys.flags.int_max_str_digits` field.
@@ -1374,6 +1388,8 @@ pub enum StaticStrings {
     Little,
     /// `ljust()` method, shared by `str` and `bytes`.
     Ljust,
+    /// `lo` in the bisect module.
+    Lo,
     /// `json.loads()` function.
     Loads,
     /// `locals` parameter of eval/exec.
@@ -1483,6 +1499,8 @@ pub enum StaticStrings {
     /// `None` is a legitimate default.
     #[strum(serialize = "MISSING")]
     Missing,
+    /// Path.unlink missing-file option.
+    MissingOk,
     /// `Path.mkdir()` and `os.mkdir()` — yields a host call.
     Mkdir,
     /// `time.mktime()` function.
@@ -2054,6 +2072,8 @@ pub enum StaticStrings {
     Tan,
     /// `math.tanh()` function.
     Tanh,
+    /// Destination keyword for Path.rename and Path.replace.
+    Target,
     /// `math.tau` constant
     Tau,
     /// `itertools.tee()` function.
