@@ -12,11 +12,19 @@ permissions:
 
 jobs:
   benchmarks:
-    name: Run benchmarks
+    name: Run benchmarks (${{ matrix.mode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: walltime
+            runner: codspeed-macro-arm64-graviton-ubuntu-22-04
+          - mode: memory
+            runner: ubuntu-24.04-arm
     # CodSpeed's bare-metal Graviton macro runner, for walltime measurement. Pinned
     # rather than `codspeed-macro` so the baseline stays on the same hardware,
     # see https://codspeed.io/docs/features/macro-runners
-    runs-on: codspeed-macro-arm64-graviton-ubuntu-22-04
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       id-token: write
@@ -55,20 +63,19 @@ jobs:
       - name: Build the monty worker binary
         run: cargo build -p monty-runtime --release
 
-      # No `--bench` filter: build and run every monty-bench target (`main` +
-      # `pool`). CodSpeed runs all benches built into the package. The
+      # No `--bench` filter: build and run every monty-bench target. The
       # `codspeed` profile (root Cargo.toml) is release codegen — fat LTO,
       # one codegen unit — with symbols kept for CodSpeed's flamegraphs, so
       # measurements reflect the optimization level users actually run.
       # The `codspeed` feature selects codspeed-criterion-compat and drops the
-      # CPython comparisons; `cfg(codspeed)` is not set for walltime builds.
+      # CPython comparisons in both measurement modes.
       - name: Build benchmarks
-        run: cargo codspeed build -m walltime -p monty-bench --profile codspeed --features codspeed
+        run: cargo codspeed build -m ${{ matrix.mode }} -p monty-bench --profile codspeed --features codspeed
 
       - name: Run benchmarks
         uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369 # v5.4.2
         with:
-          mode: walltime
+          mode: ${{ matrix.mode }}
           run: cargo codspeed run -p monty-bench
         env:
           MONTY_TEST_BIN: ${{ github.workspace }}/target/release/monty

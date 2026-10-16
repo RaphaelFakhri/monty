@@ -227,15 +227,9 @@ fn wrap_for_cpython(code: &str) -> String {
     format!("def main():\n{}", lines.join("\n"))
 }
 
-const ADD_TWO: &str = "1 + 2";
+const ADD_TWO: &str = include_str!("python/add_two.py");
 
-const LOOP_MOD_13: &str = "
-v = ''
-for i in range(1_000):
-    if i % 13 == 0:
-        v += 'x'
-len(v)
-";
+const LOOP_MOD_13: &str = include_str!("python/loop_mod_13.py");
 
 const REDUCE: &str = "
 import functools
@@ -250,117 +244,47 @@ functools.reduce(add, range(10_000))
 /// Code is shared with test_cases/bench__kitchen_sink.py
 const KITCHEN_SINK: &str = include_str!("../../monty/test_cases/bench__kitchen_sink.py");
 
-const FUNC_CALL_KWARGS: &str = "
-def add(a, b=2):
-    return a + b
-
-add(a=1)
-";
+const FUNC_CALL_KWARGS: &str = include_str!("python/func_call_kwargs.py");
 
 /// Builtin-method argument binding benchmark: a tight loop of cheap calls whose
 /// cost is dominated by `#[derive(FromArgs)]` dispatch (positional fill, kwarg
 /// matching, defaults) rather than the operations themselves. Guards the
 /// FromArgs binding path against regressions.
-const BUILTIN_ARGS: &str = "
-r = 0
-for i in range(10_000):
-    s = 'ab'.replace('a', 'b')
-    t = 'x'.encode('utf-8', 'strict')
-    u = sorted([3, 1, 2], reverse=False)
-    r += len(s) + len(t) + len(u)
-r
-";
+const BUILTIN_ARGS: &str = include_str!("python/builtin_args.py");
 
 /// Mixed list, dict and str method workload, including scanning and allocation.
 /// Kept for continuity with existing measurements; it does not isolate dispatch.
 /// Compare with [`ATTR_DISPATCH_MINIMAL`] to distinguish method costs from dispatch.
-const ATTR_DISPATCH: &str = "
-xs = []
-d = {}
-s = 'Monty Benchmark String'
-r = 0
-for i in range(10_000):
-    xs.append(i)
-    xs.pop()
-    d['k'] = i
-    r += d.get('k', 0)
-    r += len(s.upper()) + len(s.lower()) + s.count('n') + len(s.split(' ')) + len(s.strip())
-r
-";
+const ATTR_DISPATCH: &str = include_str!("python/attr_dispatch.py");
 
 /// Exercises several attribute names with cheap, non-allocating method bodies:
 /// operations on an empty list, a one-entry dict and a single-character string.
 /// Loop, argument binding, branching and arithmetic remain part of the measurement.
-const ATTR_DISPATCH_MINIMAL: &str = "
-xs = []
-d = {'k': 1}
-s = 'x'
-r = 0
-for _ in range(10_000):
-    xs.clear()
-    xs.reverse()
-    r += d.get('k', 0)
-    r += 1 if s.startswith('x') else 0
-    r += 1 if s.endswith('x') else 0
-r
-";
+const ATTR_DISPATCH_MINIMAL: &str = include_str!("python/attr_dispatch_minimal.py");
 
-const LIST_APPEND_STR: &str = "
-a = []
-for i in range(100_000):
-    a.append(str(i))
-len(a)
-";
+const LIST_APPEND_STR: &str = include_str!("python/list_append_str.py");
 
-const LIST_APPEND_INT: &str = "
-a = []
-for i in range(100_000):
-    a.append(i)
-sum(a)
-";
+const LIST_APPEND_INT: &str = include_str!("python/list_append_int.py");
 
-const FIB_25: &str = "
-def fib(n):
-    if n <= 1:
-        return n
-    return fib(n - 1) + fib(n - 2)
-
-fib(25)
-";
+const FIB_25: &str = include_str!("python/fib_25.py");
 
 /// List comprehension benchmark - creates 1000 elements.
-const LIST_COMP: &str = "len([x * 2 for x in range(1000)])";
+const LIST_COMP: &str = include_str!("python/list_comp.py");
 
 /// Dict comprehension benchmark - creates 500 unique keys (i // 2 deduplicates pairs).
-const DICT_COMP: &str = "len({i // 2: i * 2 for i in range(1000)})";
+const DICT_COMP: &str = include_str!("python/dict_comp.py");
 
 /// Empty tuple creation benchmark - creates 100,000 empty tuples in a list.
-const EMPTY_TUPLES: &str = "len([() for _ in range(100_000)])";
+const EMPTY_TUPLES: &str = include_str!("python/empty_tuples.py");
 
 /// 2-tuple creation benchmark - creates 100,000 2-tuples in a list.
-const PAIR_TUPLES: &str = "len([(i, i + 1) for i in range(100_000)])";
+const PAIR_TUPLES: &str = include_str!("python/pair_tuples.py");
 
 /// Container repr throughput over 1,000-element containers (half tracked
 /// strings, so per-item refcount bumps are priced). Guards the
 /// mutation-safe repr paths: live checked iteration for list/tuple/dict,
 /// snapshotting for deque/set/Counter, and the amortized time polls.
-const CONTAINER_REPR: &str = "
-from collections import Counter, deque
-
-words = [str(i) for i in range(500)]
-xs = words + list(range(500))
-tup = tuple(xs)
-d = {w: i for i, w in enumerate(words)}
-st = set(words)
-dq = deque(xs)
-c = Counter({w: i % 7 for i, w in enumerate(words)})
-
-n = 0
-for _ in range(20):
-    n += len(repr(xs)) + len(repr(tup)) + len(repr(d))
-    n += len(repr(st)) + len(repr(dq)) + len(repr(c))
-n
-";
+const CONTAINER_REPR: &str = include_str!("python/container_repr.py");
 
 // --- Agent-workload benchmarks -------------------------------------------
 //
@@ -376,126 +300,30 @@ n
 /// data-analysis agent (group revenue by segment, rank, filter). Dominated
 /// by str-keyed dict get/insert, `sorted` with a lambda key, tuple
 /// unpacking, and a filtered generator-expression `sum`.
-const AGG_ROWS: &str = "
-regions = ['north', 'south', 'east', 'west']
-segments = ['consumer', 'smb', 'enterprise']
-channels = ['organic', 'paid', 'referral', 'email', 'social']
-rows = []
-for i in range(1_000):
-    rows.append({
-        'order_id': i,
-        'region': regions[i % 4],
-        'segment': segments[i % 3],
-        'channel': channels[i % 5],
-        'amount': (i * 37) % 500 + 1,
-        'quantity': i % 7 + 1,
-    })
-
-checksum = 0
-for _ in range(10):
-    revenue = {}
-    orders = {}
-    for row in rows:
-        key = row['region'] + '/' + row['segment']
-        value = row['amount'] * row['quantity']
-        revenue[key] = revenue.get(key, 0) + value
-        orders[key] = orders.get(key, 0) + 1
-    ranked = sorted(revenue.items(), key=lambda kv: kv[1], reverse=True)
-    top_key, top_revenue = ranked[0]
-    big = sum(1 for row in rows if row['amount'] > 400 and row['quantity'] >= 3)
-    checksum += top_revenue + big + top_revenue // orders[top_key]
-checksum
-";
+const AGG_ROWS: &str = include_str!("python/agg_rows.py");
 
 /// Report formatting with f-strings — how agents present results (markdown
 /// tables, aligned columns, percentages, thousands separators). Exercises
 /// the format mini-language (`fstring.rs`), float formatting, and
 /// `str.join` over a large list of tracked strings.
-const FSTRING_REPORT: &str = "
-total = 0.0
-lines = []
-for i in range(2_000):
-    name = 'product-' + str(i % 100)
-    price = (i * 7) % 300 + 0.99
-    share = (i % 100) / 100
-    total += price
-    lines.append(f'| {name:<14} | {price:>10.2f} | {share:>7.1%} | {i:06d} |')
-lines.append(f'total: {total:,.2f}')
-report = '\\n'.join(lines)
-len(report)
-";
+const FSTRING_REPORT: &str = include_str!("python/fstring_report.py");
 
 /// Line-oriented text parsing — the scraping/ETL shape (split lines, split
 /// fields, strip/lower/startswith/`in`, `int()` conversion). Measures str
 /// method throughput on real text rather than `FromArgs` binding (which
 /// `builtin_args` covers with tiny strings).
-const STR_PARSE: &str = "
-lines = []
-for i in range(500):
-    status = 'ACTIVE' if i % 3 else 'retired'
-    lines.append('  Widget-' + str(i) + ' ;  ' + str((i * 13) % 400) + ' ; ' + status + ' ; north-' + str(i % 7) + '  ')
-text = '\\n'.join(lines)
-
-count = 0
-total = 0
-for _ in range(10):
-    for line in text.split('\\n'):
-        parts = line.split(';')
-        name = parts[0].strip()
-        qty = int(parts[1].strip())
-        state = parts[2].strip().lower()
-        zone = parts[3].strip()
-        if state == 'active' and name.lower().startswith('widget') and 'north' in zone:
-            count += 1
-            total += qty
-count + total
-";
+const STR_PARSE: &str = include_str!("python/str_parse.py");
 
 /// Timestamp cohort analysis — parse ISO timestamps, bucket by weekday and
 /// `strftime` month key, subtract datetimes. The retention/day-of-week
 /// questions agents get asked constantly; covers `fromisoformat`,
 /// `strftime`, `weekday`, and timedelta arithmetic.
-const DATETIME_OPS: &str = "
-import datetime
-
-stamps = []
-for i in range(500):
-    stamps.append(f'2024-{i % 12 + 1:02d}-{i % 28 + 1:02d}T{i % 24:02d}:{i % 60:02d}:00')
-
-start = datetime.datetime(2024, 1, 1)
-weekday_counts = [0, 0, 0, 0, 0, 0, 0]
-cohorts = {}
-total_days = 0
-for _ in range(4):
-    for s in stamps:
-        dt = datetime.datetime.fromisoformat(s)
-        weekday_counts[dt.weekday()] += 1
-        cohorts[dt.strftime('%Y-%m')] = cohorts.get(dt.strftime('%Y-%m'), 0) + 1
-        total_days += (dt - start).days
-weekend = weekday_counts[5] + weekday_counts[6]
-total_days + weekend + len(cohorts)
-";
+const DATETIME_OPS: &str = include_str!("python/datetime_ops.py");
 
 /// Regex extraction over a large string — `finditer` with group capture and
 /// `re.split`. The engine is fancy-regex, but Monty's wrapper (match-object
 /// allocation, group extraction into tracked strings) is what this guards.
-const RE_EXTRACT: &str = "
-import re
-
-parts = []
-for i in range(300):
-    parts.append('name=item' + str(i) + ' qty=' + str(i % 50) + ' price=' + str((i * 7) % 900))
-text = ' '.join(parts)
-
-pattern = re.compile(r'qty=(\\d+) price=(\\d+)')
-total = 0
-for _ in range(5):
-    for m in pattern.finditer(text):
-        total += int(m.group(1)) + int(m.group(2))
-    words = re.split(r'\\s+', text)
-    total += len(words)
-total
-";
+const RE_EXTRACT: &str = include_str!("python/re_extract.py");
 
 /// Single-collection latency benchmark.
 ///
@@ -505,15 +333,7 @@ total
 /// The trailing `0` exists so the runner's `i64` extraction sees a known value:
 /// Monty's `gc.collect()` always returns `0` but CPython returns the count of
 /// unreachable objects collected, which we don't care to assert on.
-const GC_COLLECT: &str = "
-import gc
-gc.disable()
-for _ in range(50_000):
-    a = []
-    a.append(a)
-gc.collect()
-0
-";
+const GC_COLLECT: &str = include_str!("python/gc_collect.py");
 
 /// JSON payload used by the `json_loads` / `json_dumps` benchmarks.
 /// Sourced from `medium_response.json` (a jiter bench fixture).
@@ -523,46 +343,35 @@ const JSON_MEDIUM: &str = include_str!("medium_response.json");
 /// Looping inside Monty amortises per-call VM/import/input-binding overhead so the
 /// measurement reflects steady-state parse cost rather than startup.
 /// Returns the number of top-level keys (2) as the verification value.
-const JSON_LOADS: &str = "
-import json
-r = 0
-for _ in range(1_000):
-    r = len(json.loads(DATA))
-r
-";
+const JSON_LOADS: &str = include_str!("python/json_loads.py");
 
 /// Parses JSON then serialises it back to a string 1,000 times per Monty run.
 /// Loop sits inside Monty for the same reason as `JSON_LOADS`.
 /// Returns the length of the final serialised output so the result can be verified.
-const JSON_DUMPS: &str = "
-import json
-obj = json.loads(DATA)
-r = 0
-for _ in range(1_000):
-    r = len(json.dumps(obj))
-r
-";
+const JSON_DUMPS: &str = include_str!("python/json_dumps.py");
 
 /// A recursive glob: every directory is listed.
-const GLOB_RECURSIVE: &str = "
-from pathlib import Path
-len(list(Path(DATA).glob('**/*.rs')))
-";
+const GLOB_RECURSIVE: &str = include_str!("python/glob_recursive.py");
 
 /// A glob whose wildcards prune: only `src` directories below the top are listed.
-const GLOB_WILDCARD: &str = "
-from pathlib import Path
-len(list(Path(DATA).glob('*/src/*.rs')))
-";
+const GLOB_WILDCARD: &str = include_str!("python/glob_wildcard.py");
 
 /// A top-down walk counting files.
-const WALK_FILES: &str = "
-import os
-count = 0
-for _, _, files in os.walk(DATA):
-    count += len(files)
-count
-";
+const WALK_FILES: &str = include_str!("python/walk_files.py");
+
+/// CSV formatting — how agents hand tabular results back (`writer.writerow`
+/// in a loop, `writerows` under `QUOTE_ALL`, and `DictWriter`). Fields mix
+/// plain values with ones that force quoting (commas, embedded quotes,
+/// newlines), the common shape of real data. The `write()` target is a
+/// class, since Monty has no `io.StringIO`; it counts characters written.
+const CSV_WRITE: &str = include_str!("python/csv_write.py");
+
+/// CSV parsing — reading tabular input with `reader`, `QUOTE_NONNUMERIC`
+/// float conversion and `DictReader`. The lines are formatted once up front
+/// with every string quoted, so all three readers share one input; records
+/// with embedded newlines span several source lines. Exercises the
+/// per-character parser state machine and the per-row dict construction.
+const CSV_READ: &str = include_str!("python/csv_read.py");
 
 /// Benchmarks end-to-end execution (parsing + running) using Monty.
 /// This is different from other benchmarks as it includes parsing in the loop.
@@ -800,6 +609,16 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("re_extract__monty", |b| run_monty(b, RE_EXTRACT, 652_500));
     #[cfg(not(feature = "codspeed"))]
     c.bench_function("re_extract__cpython", |b| run_cpython(b, RE_EXTRACT, 652_500));
+
+    c.bench_function("csv_write__monty", |b| run_monty(b, CSV_WRITE, 265_163));
+    c.bench_function("csv_write_limits__monty", |b| run_monty_limits(b, CSV_WRITE, 265_163));
+    #[cfg(not(codspeed))]
+    c.bench_function("csv_write__cpython", |b| run_cpython(b, CSV_WRITE, 265_163));
+
+    c.bench_function("csv_read__monty", |b| run_monty(b, CSV_READ, 2_629_450));
+    c.bench_function("csv_read_limits__monty", |b| run_monty_limits(b, CSV_READ, 2_629_450));
+    #[cfg(not(codspeed))]
+    c.bench_function("csv_read__cpython", |b| run_cpython(b, CSV_READ, 2_629_450));
 
     c.bench_function("gc_collect__monty", |b| run_monty(b, GC_COLLECT, 0));
     #[cfg(not(feature = "codspeed"))]

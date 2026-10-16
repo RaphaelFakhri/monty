@@ -50,6 +50,7 @@ include = [
 ]
 # Exclude files with intentional syntax errors or special formatting requirements
 extend-exclude = [
+    "crates/monty-bench/benches/python",
     "crates/monty/test_cases/function__err_duplicate_param.py",
     "crates/monty/test_cases/function__err_repeated_keyword.py",
     "crates/monty/test_cases/nonlocal__error_module_level.py",

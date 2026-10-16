@@ -141,10 +141,7 @@ fn session_checkout_run(bench: &mut Bencher) {
 /// 1,000 times in a loop. Each call is a full round trip — the worker
 /// suspends and frames the call, the parent answers with a framed reply —
 /// so this isolates the per-message protobuf encode/decode + framing cost.
-const EXT_CALL_LOOP: &str = "
-for i in range(1000):
-    ext_function(i)
-";
+const EXT_CALL_LOOP: &str = include_str!("python/ext_call_loop.py");
 
 /// Wire-protocol throughput: 1,000 external-call round trips over the framed
 /// protobuf channel on a warm session. The suspension budget is per checkout,
@@ -168,14 +165,7 @@ fn ext_calls_1000(bench: &mut Bencher) {
 
 /// Sums `amount * quantity` over every row of every external-call result —
 /// the aggregation a code-mode agent runs over a SQL tool's rows.
-const EXT_ROWS_LOOP: &str = "
-total = 0
-for i in range(20):
-    rows = fetch_rows(i)
-    for row in rows:
-        total += row['amount'] * row['quantity']
-total
-";
+const EXT_ROWS_LOOP: &str = include_str!("python/ext_rows_loop.py");
 
 /// Builds a 100-row result set shaped like a SQL tool reply: a list of dicts
 /// with string keys and mixed str/int values. This is the payload shape real
