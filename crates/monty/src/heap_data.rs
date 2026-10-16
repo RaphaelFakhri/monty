@@ -169,6 +169,8 @@ macro_rules! heap_payloads {
             HashObject(boxed $crate::types::HashObject),
             /// An `os.DirEntry`, `os.scandir()` iterator or `os.walk()` iterator.
             DirScan(boxed $crate::types::DirScan),
+            /// Any `csv` object: a reader, writer, `DictReader`, `DictWriter` or dialect.
+            Csv(boxed $crate::types::CsvObject),
         }
     };
 }
@@ -255,7 +257,8 @@ impl HeapData {
             | Self::ExternalFuture(_)
             | Self::Partial(_)
             | Self::GenericAlias(_)
-            | Self::Union(_) => true,
+            | Self::Union(_)
+            | Self::Csv(_) => true,
             // Leaf types, plus iterators whose heap refs only point at leaves and so
             // cannot close a cycle. Move one up if it gains a container-valued field.
             Self::Str(_)
@@ -369,6 +372,7 @@ impl HeapData {
             Self::CallableIterator(_) => Type::CallableIterator,
             Self::Itertools(i) => i.py_type(),
             Self::DirScan(scan) => scan.py_type(),
+            Self::Csv(csv) => csv.py_type(),
         }
     }
 }
@@ -675,6 +679,7 @@ macro_rules! heap_read_output_py_trait_forward {
             Self::CallableIterator($value) => $body,
             Self::Itertools($value) => $body,
             Self::DirScan($value) => $body,
+            Self::Csv($value) => $body,
             Self::Partial($value) => $body,
             Self::Random($value) => $body,
             Self::HashObject($value) => $body,
@@ -930,6 +935,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::CallableIterator(value) => value.py_iter(vm),
             Self::Itertools(value) => value.py_iter(vm),
             Self::DirScan(value) => value.py_iter(vm),
+            Self::Csv(value) => value.py_iter(vm),
             Self::Tuple(value) => value.py_iter(vm),
             Self::NamedTuple(value) => value.py_iter(vm),
             Self::Dict(value) => value.py_iter(vm),
@@ -994,6 +1000,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::CallableIterator(value) => value.py_next(vm),
             Self::Itertools(value) => value.py_next(vm),
             Self::DirScan(value) => value.py_next(vm),
+            Self::Csv(value) => value.py_next(vm),
             Self::Tuple(value) => value.py_next(vm),
             Self::NamedTuple(value) => value.py_next(vm),
             Self::Dict(value) => value.py_next(vm),
