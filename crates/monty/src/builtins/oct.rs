@@ -8,7 +8,6 @@ use crate::{
     bytecode::VM,
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunResult},
-    heap::HeapData,
     types::str::allocate_string_no_interning,
     value::Value,
 };
@@ -31,8 +30,8 @@ pub fn builtin_oct(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
             let s = if *b { "0o1" } else { "0o0" };
             Ok(allocate_string_no_interning(s.to_string(), vm.heap))
         }
-        Value::Ref(id) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
-            let oct_str = format_bigint_oct(li.inner());
+        _ if let Some(integer) = value.as_long_int(vm) => {
+            let oct_str = format_bigint_oct(integer);
             Ok(allocate_string_no_interning(oct_str, vm.heap))
         }
         _ => Err(ExcType::type_error_not_integer(&value.py_type_name(vm))),

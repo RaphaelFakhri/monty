@@ -1,5 +1,6 @@
 use std::{cmp::Ordering, fmt::Write, mem};
 
+use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
@@ -477,25 +478,11 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, List> {
         defer_drop!(key, vm);
         defer_drop_mut!(value, vm);
 
-        // Extract integer index, accepting Int, Bool (True=1, False=0), and LongInt.
-        // Note: The LongInt-to-i64 conversion is defensive code. In normal execution,
-        // heap-allocated LongInt values always exceed i64 range because into_value()
-        // demotes i64-fitting values to Value::Int. However, this could be reached via
-        // deserialization of crafted snapshot data.
         let index = match *key {
             Value::Int(i) => i,
             Value::Bool(b) => i64::from(b),
-            Value::Ref(heap_id) => {
-                if let HeapData::LongInt(li) = vm.heap.get(heap_id) {
-                    if let Some(i) = li.to_i64() {
-                        i
-                    } else {
-                        return Err(ExcType::index_error_int_too_large());
-                    }
-                } else {
-                    let key_type = key.py_type_name(vm);
-                    return Err(ExcType::type_error_indices(Type::List, &key_type));
-                }
+            _ if let Some(integer) = key.as_long_int(vm) => {
+                integer.to_i64().ok_or_else(ExcType::index_error_int_too_large)?
             }
             _ => {
                 let key_type = key.py_type_name(vm);

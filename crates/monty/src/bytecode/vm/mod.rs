@@ -1331,14 +1331,7 @@ impl<'h> VM<'h> {
                 Opcode::LoadConst => {
                     let idx = self.current_frame.fetch_u16();
                     let value = self.current_frame.code.constant(idx);
-                    // Handle InternLongInt specially - convert to heap-allocated LongInt
-                    if let Value::InternLongInt(long_int_id) = value {
-                        let bi = self.interns.get_long_int(*long_int_id).clone();
-                        let long_value = LongInt::new(bi).into_value(self.heap);
-                        self.push(long_value);
-                    } else {
-                        self.push(value.clone_with_heap(self));
-                    }
+                    self.push(value.clone_with_heap(self));
                 }
                 Opcode::LoadNone => self.push(Value::None),
                 Opcode::LoadTrue => self.push(Value::Bool(true)),
@@ -1483,18 +1476,11 @@ impl<'h> VM<'h> {
                     match value {
                         Value::Int(n) => self.push(Value::Int(!n)),
                         Value::Bool(b) => self.push(Value::Int(!i64::from(b))),
-                        Value::Ref(id) => {
-                            if let HeapData::LongInt(li) = self.heap.get(id) {
-                                // LongInt bitwise NOT: ~x = -(x + 1)
-                                let inverted = -(li.inner() + 1i32);
-                                value.drop_with(self);
-                                let inverted_value = LongInt::new(inverted).into_value(self.heap);
-                                self.push(inverted_value);
-                            } else {
-                                let value_type = value.py_type_name(self);
-                                value.drop_with(self);
-                                catch!(self, ExcType::unary_type_error("~", &value_type));
-                            }
+                        _ if let Some(integer) = value.as_long_int(self) => {
+                            let inverted = !integer;
+                            value.drop_with(self);
+                            let inverted_value = LongInt::new(inverted).into_value(self.heap);
+                            self.push(inverted_value);
                         }
                         _ => {
                             let value_type = value.py_type_name(self);

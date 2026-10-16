@@ -931,7 +931,7 @@ fn int_init(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
 fn int_convert(x: &Value, vm: &mut VM<'_>) -> RunResult<Value> {
     let interns = vm.interns;
     match x {
-        Value::Int(i) => Ok(Value::Int(*i)),
+        Value::Int(_) | Value::InternLongInt(_) => Ok(x.clone_with_heap(vm.heap)),
         Value::Float(f) => LongInt::value_from_f64(*f, vm.heap),
         Value::Bool(b) => Ok(Value::Int(i64::from(*b))),
         Value::InternString(string_id) => parse_int_from_str(interns.get_str(*string_id), 10, vm.heap),

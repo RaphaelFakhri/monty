@@ -20,9 +20,9 @@ use crate::{
     heap::{ContainsHeap, DropGuard, DropWithContext, HeapData, HeapId, HeapReadOutput},
     heap_data::CellValue,
     intern::{FunctionId, StaticStrings, StringId},
-    logical_value::LogicalValue,
     modules::dataclasses,
     os_dispatch::{PendingEffect, release_pending_effect},
+    py_value::PyValue,
     resource_checks::check_estimated_size,
     types::{Dict, Instance, PyTrait, Type, instance::class_name},
     value::{EitherStr, VALUE_SIZE, Value},
@@ -362,7 +362,7 @@ impl<'h> VM<'h> {
         let args = args_slot.expect("dispatch_dunder returned None without taking args");
 
         defer_drop!(obj, this);
-        LogicalValue::new(obj, this).py_call_attr(this, &attr, args)
+        PyValue::new(obj, this).py_call_attr(this, &attr, args)
     }
 
     /// Evaluates a function in a synchronous position that cannot suspend to the host.

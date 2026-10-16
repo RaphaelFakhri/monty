@@ -67,7 +67,7 @@ pub struct LongInt(pub BigInt);
 
 /// A Python integer view preserving small, interned-big and heap-big storage.
 /// Small-integer operations stay allocation-free unless their result overflows.
-pub(crate) enum IntRead<'h> {
+pub(crate) enum PyInt<'h> {
     Small(i64),
     Interned(LongIntId),
     Heap(HeapObjectRead<'h, LongInt>),
@@ -97,7 +97,7 @@ macro_rules! int_binary {
     };
 }
 
-impl PyObjectIdentity for IntRead<'_> {
+impl PyObjectIdentity for PyInt<'_> {
     fn py_identity(&self) -> Identity {
         match self {
             Self::Small(value) => Identity::Int(*value),
@@ -111,7 +111,7 @@ impl PyObjectIdentity for IntRead<'_> {
     clippy::inline_always,
     reason = "small-int fast paths must fold into `Value`'s operator dispatch to avoid a call per operation"
 )]
-impl<'h> PyTrait<'h> for IntRead<'h> {
+impl<'h> PyTrait<'h> for PyInt<'h> {
     fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::Int
     }
@@ -253,7 +253,8 @@ impl<'h> PyTrait<'h> for IntRead<'h> {
     fn py_rmul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         match self {
             Self::Heap(value) => value.py_rmul_impl(other, vm),
-            Self::Small(_) | Self::Interned(_) => Ok(None),
+            Self::Interned(id) => multiply_bigint(vm.interns.get_long_int(*id), other, vm),
+            Self::Small(_) => Ok(None),
         }
     }
 
@@ -419,14 +420,6 @@ impl LongInt {
         self.0.to_i64()
     }
 
-    /// Tries to convert to f64.
-    ///
-    /// Returns `Some(f64)` if the conversion is possible, `None` if the value
-    /// is too large to represent as f64.
-    pub fn to_f64(&self) -> Option<f64> {
-        self.0.to_f64()
-    }
-
     /// Converts to `f64`, raising `OverflowError` when the magnitude exceeds the float range.
     ///
     /// Mirrors CPython's `PyLong_AsDouble`, which every mixed int/float operation goes through.
@@ -440,29 +433,6 @@ impl LongInt {
     /// result is the ordering of `self` relative to `f`.
     pub fn partial_cmp_f64(&self, f: f64) -> Option<Ordering> {
         bigint_cmp_f64(&self.0, f)
-    }
-
-    /// Tries to convert to usize.
-    ///
-    /// Returns `Some(usize)` if the value fits, `None` otherwise.
-    /// Useful for sequence repetition counts.
-    pub fn to_usize(&self) -> Option<usize> {
-        self.0.to_usize()
-    }
-
-    /// Converts this integer to a Python sequence repetition count.
-    pub(crate) fn repeat_count(&self) -> RunResult<usize> {
-        if self.is_negative() {
-            Ok(0)
-        } else {
-            self.to_usize()
-                .ok_or_else(|| ExcType::overflow_index_sized_int().into())
-        }
-    }
-
-    /// Returns the absolute value as a new `LongInt`.
-    pub fn abs(&self) -> Self {
-        Self(self.0.abs())
     }
 
     /// Returns the number of significant bits in this LongInt.
@@ -519,7 +489,16 @@ pub(crate) fn repeat_count(value: &Value, vm: &VM<'_>) -> RunResult<Option<usize
             usize::try_from(*value).map_err(|_| ExcType::overflow_index_sized_int())?
         })),
         Value::Bool(value) => Ok(Some(usize::from(*value))),
-        Value::Ref(id) if let HeapData::LongInt(value) = vm.heap.get(*id) => Ok(Some(value.repeat_count()?)),
+        _ if let Some(value) = value.as_long_int(vm) => {
+            if value.is_negative() {
+                Ok(Some(0))
+            } else {
+                value
+                    .to_usize()
+                    .map(Some)
+                    .ok_or_else(|| ExcType::overflow_index_sized_int().into())
+            }
+        }
         _ => Ok(None),
     }
 }

@@ -13,7 +13,7 @@ use std::{cmp::Ordering, mem};
 use smallvec::smallvec;
 
 use crate::{
-    args::{ArgValues, KwargsValues},
+    args::{ArgValues, KwargsValues, is_long_int},
     bytecode::VM,
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, ExcTypeExt, RunResult},
@@ -378,13 +378,8 @@ pub(crate) fn counter_most_common<'h>(
         None | Some(Value::None) => None,
         Some(Value::Int(n)) => Some(usize::try_from(n.max(0)).unwrap_or(usize::MAX)),
         Some(Value::Bool(b)) => Some(usize::from(b)),
-        // `value @` binds the whole `Value` (so it is dropped, not plain-`Drop`ped
-        // — the `Ref` owns a heap refcount), while `id` reads the entry.
-        Some(value @ Value::Ref(id)) if matches!(vm.heap.get(id), HeapData::LongInt(_)) => {
-            let negative = match vm.heap.get(id) {
-                HeapData::LongInt(li) => li.is_negative(),
-                _ => unreachable!("guarded by the matches! above"),
-            };
+        Some(value) if is_long_int(&value, vm) => {
+            let negative = value.long_int_is_negative(vm);
             value.drop_with(vm);
             Some(if negative { 0 } else { usize::MAX })
         }

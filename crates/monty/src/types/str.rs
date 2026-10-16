@@ -116,12 +116,12 @@ impl Str {
 ///
 /// Heap reads keep the receiver available across calls such as `__index__` without
 /// holding a Rust borrow of its text during Python execution.
-pub(crate) enum StrRead<'h> {
+pub(crate) enum PyStr<'h> {
     Interned(StringId),
     Heap(HeapObjectRead<'h, Str>),
 }
 
-impl<'h> StrRead<'h> {
+impl<'h> PyStr<'h> {
     /// Extracts a string without copying its contents.
     pub(crate) fn from_value(value: &Value, vm: &VM<'h>) -> Option<Self> {
         match value {
@@ -140,7 +140,7 @@ impl<'h> StrRead<'h> {
     }
 }
 
-impl PyObjectIdentity for StrRead<'_> {
+impl PyObjectIdentity for PyStr<'_> {
     fn py_identity(&self) -> Identity {
         match self {
             Self::Interned(id) => Identity::InternString(id.index()),
@@ -149,7 +149,7 @@ impl PyObjectIdentity for StrRead<'_> {
     }
 }
 
-impl<'h> PyTrait<'h> for StrRead<'h> {
+impl<'h> PyTrait<'h> for PyStr<'h> {
     fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::Str
     }
@@ -453,7 +453,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Str> {
 
 /// Concatenation shared by logical string views and concrete heap dispatch.
 fn str_add(s: &str, other: &Value, vm: &VM<'_>) -> RunResult<Option<Value>> {
-    match StrRead::from_value(other, vm) {
+    match PyStr::from_value(other, vm) {
         Some(other) => Ok(Some(concat_allocate_str(s, other.as_str(vm), vm.heap)?)),
         None => Ok(None),
     }

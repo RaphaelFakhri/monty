@@ -271,12 +271,12 @@ fn repeat_bytes(value: &[u8], count: &Value, vm: &VM<'_>) -> RunResult<Option<Va
 
 /// An allocation-free bytes view retaining its interned or heap identity.
 /// Heap handles can remain live across `__index__` calls without borrowing the buffer.
-pub(crate) enum BytesRead<'h> {
+pub(crate) enum PyBytes<'h> {
     Interned(BytesId),
     Heap(HeapObjectRead<'h, Bytes>),
 }
 
-impl<'h> BytesRead<'h> {
+impl<'h> PyBytes<'h> {
     /// Extracts bytes without copying their contents.
     pub(crate) fn from_value(value: &Value, vm: &VM<'h>) -> Option<Self> {
         match value {
@@ -295,7 +295,7 @@ impl<'h> BytesRead<'h> {
     }
 }
 
-impl PyObjectIdentity for BytesRead<'_> {
+impl PyObjectIdentity for PyBytes<'_> {
     fn py_identity(&self) -> Identity {
         match self {
             Self::Interned(id) => Identity::InternBytes(id.index()),
@@ -304,7 +304,7 @@ impl PyObjectIdentity for BytesRead<'_> {
     }
 }
 
-impl<'h> PyTrait<'h> for BytesRead<'h> {
+impl<'h> PyTrait<'h> for PyBytes<'h> {
     fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::Bytes
     }
@@ -486,7 +486,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Bytes> {
 
 /// Concatenation shared by logical bytes views and concrete heap dispatch.
 fn bytes_add(bytes: &[u8], other: &Value, vm: &VM<'_>) -> RunResult<Option<Value>> {
-    match BytesRead::from_value(other, vm) {
+    match PyBytes::from_value(other, vm) {
         Some(other) => Ok(Some(concat_bytes(bytes, other.as_slice(vm), vm.heap)?)),
         None => Ok(None),
     }

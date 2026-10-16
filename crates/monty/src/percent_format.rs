@@ -13,9 +13,12 @@ use std::ops::Range;
 
 use memchr::memchr;
 use monty_types::ResourceTracker;
+use num_bigint::BigInt;
+use num_traits::{Signed, ToPrimitive};
 use smallvec::{SmallVec, smallvec};
 
 use crate::{
+    args::is_long_int,
     bytecode::VM,
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
@@ -704,7 +707,7 @@ fn star_operand(
     match value {
         Value::Int(n) => Ok(*n),
         Value::Bool(b) => Ok(i64::from(*b)),
-        Value::Ref(id) if matches!(vm.heap.get(*id), HeapData::LongInt(_)) => Err(on_overflow()),
+        _ if is_long_int(value, vm) => Err(on_overflow()),
         _ => Err(ExcType::type_error("* wants int")),
     }
 }
@@ -767,7 +770,7 @@ fn format_integer<T: Target>(
 fn integer_operand(value: &Value, conversion: u8, vm: &mut VM<'_>) -> RunResult<Value> {
     let decimal = matches!(conversion, b'd' | b'i' | b'u');
     match value {
-        Value::Int(_) | Value::Bool(_) => Ok(value.clone_with_heap(vm.heap)),
+        Value::Int(_) | Value::Bool(_) | Value::InternLongInt(_) => Ok(value.clone_with_heap(vm.heap)),
         Value::Float(f) if decimal => LongInt::value_from_f64(*f, vm.heap),
         Value::Ref(id) if matches!(vm.heap.get(*id), HeapData::LongInt(_)) => Ok(value.clone_with_heap(vm.heap)),
         _ => {
@@ -788,9 +791,7 @@ fn magnitude_digits(operand: &Value, base: u32, uppercase: bool, vm: &VM<'_>) ->
     match operand {
         Value::Int(n) => Ok((*n < 0, small_digits(n.unsigned_abs(), base, uppercase))),
         Value::Bool(b) => Ok((false, u64::from(*b).to_string())),
-        Value::Ref(id) if let HeapData::LongInt(li) = vm.heap.get(*id) => {
-            long_digits(li, base, uppercase, &vm.heap.tracker)
-        }
+        _ if let Some(integer) = operand.as_long_int(vm) => long_digits(integer, base, uppercase, &vm.heap.tracker),
         _ => Err(ExcType::type_error(format!(
             "__index__ returned non-int (type {})",
             operand.py_type_name(vm)
@@ -810,7 +811,7 @@ fn small_digits(magnitude: u64, base: u32, uppercase: bool) -> String {
 
 /// Digits of a big integer's magnitude, budgeted before the render like
 /// `format_long_int`; only decimal is bounded by CPython's digit limit.
-fn long_digits(li: &LongInt, base: u32, uppercase: bool, tracker: &ResourceTracker) -> RunResult<(bool, String)> {
+fn long_digits(li: &BigInt, base: u32, uppercase: bool, tracker: &ResourceTracker) -> RunResult<(bool, String)> {
     if base == 10 {
         check_bits_str_digits_limit(li.bits())?;
     }
@@ -820,7 +821,7 @@ fn long_digits(li: &LongInt, base: u32, uppercase: bool, tracker: &ResourceTrack
         usize::try_from(max_digits).unwrap_or(usize::MAX).saturating_add(2),
         tracker,
     )?;
-    let mut digits = li.abs().inner().to_str_radix(base);
+    let mut digits = li.magnitude().to_str_radix(base);
     if uppercase {
         digits.make_ascii_uppercase();
     }
@@ -897,7 +898,7 @@ fn float_operand<T: Target>(value: &Value, vm: &mut VM<'_>) -> RunResult<f64> {
         Value::Float(f) => Ok(*f),
         Value::Int(n) => Ok(*n as f64),
         Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
-        Value::Ref(id) if let HeapData::LongInt(li) = vm.heap.get(*id) => match li.to_f64() {
+        _ if let Some(integer) = value.as_long_int(vm) => match integer.to_f64() {
             Some(f) if f.is_finite() => Ok(f),
             _ => Err(T::float_overflow_error()),
         },
@@ -918,7 +919,7 @@ fn char_text(value: &Value, vm: &mut VM<'_>) -> RunResult<String> {
     match value {
         Value::Int(n) => char_from_code(*n),
         Value::Bool(b) => char_from_code(i64::from(*b)),
-        Value::Ref(id) if matches!(vm.heap.get(*id), HeapData::LongInt(_)) => Err(char_range_error()),
+        _ if is_long_int(value, vm) => Err(char_range_error()),
         _ if value.py_type(vm) == Type::Str => {
             let text = value.to_str(vm)?;
             let mut chars = text.chars();
@@ -965,7 +966,7 @@ fn byte_char(value: &Value, vm: &mut VM<'_>) -> RunResult<u8> {
     match value {
         Value::Int(n) => u8::try_from(*n).map_err(|_| byte_range_error()),
         Value::Bool(b) => Ok(u8::from(*b)),
-        Value::Ref(id) if matches!(vm.heap.get(*id), HeapData::LongInt(_)) => Err(byte_range_error()),
+        _ if is_long_int(value, vm) => Err(byte_range_error()),
         Value::InternBytes(id) => single_byte(vm.interns.get_bytes(*id)),
         Value::Ref(id) if let HeapData::Bytes(bytes) = vm.heap.get(*id) => single_byte(bytes.as_slice()),
         _ => match value.py_index_impl(vm)? {

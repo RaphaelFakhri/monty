@@ -21,6 +21,7 @@ use crate::{
     intern::StaticStrings,
     types::{
         LazyHeapSet, PyTrait, Type,
+        long_int::bigint_to_f64_checked,
         str::{StringRepr, allocate_string},
     },
     value::{EitherStr, Value, eq_f64},
@@ -322,9 +323,9 @@ fn operand(value: &Value, vm: &VM<'_>) -> RunResult<Option<Operand>> {
         Value::Float(f) => Some(Operand::Real(*f)),
         Value::Int(i) => Some(Operand::Real(*i as f64)),
         Value::Bool(b) => Some(Operand::Real(f64::from(*b))),
+        _ if let Some(integer) = value.as_long_int(vm) => Some(Operand::Real(bigint_to_f64_checked(integer)?)),
         Value::Ref(id) => match vm.heap.get(*id) {
             HeapData::Complex(c) => Some(Operand::Complex(*c)),
-            HeapData::LongInt(li) => Some(Operand::Real(li.to_f64_checked()?)),
             _ => None,
         },
         _ => None,

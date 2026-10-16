@@ -713,7 +713,7 @@ macro_rules! heap_read_output_py_trait_forward {
 
 pub(crate) use heap_read_output_py_trait_forward;
 
-// Only unmigrated protocols dispatch here; normalized operations use LogicalValue.
+// Only unmigrated protocols dispatch here; normalized operations use PyValue.
 impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
     fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
         heap_read_output_py_trait_forward!(self, |value| value.py_len(vm), else None)

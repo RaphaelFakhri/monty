@@ -24,23 +24,23 @@ use crate::{
     modules::{ModuleFunctions, collections::defaultdict::defaultdict_missing},
     types::{
         GenericAlias, LazyHeapSet, Property, PyTrait, Type, Union, allocate_string,
-        bytes::BytesRead,
-        long_int::{IntRead, arithmetic::float_binary},
+        bytes::PyBytes,
+        long_int::{PyInt, arithmetic::float_binary},
         py_trait::PyObjectIdentity,
-        str::StrRead,
+        str::PyStr,
     },
     value::{EitherStr, Marker, Value, float_divmod_tuple, float_pow_value, py_float_divmod, py_float_mod},
 };
 
 /// Normalizes the three multi-representation types and keeps every other heap type flat.
-macro_rules! define_logical_value {
+macro_rules! define_py_value {
     (@collect [$($variant:ident($payload:ty),)*]) => {
         /// A scoped Python-type view retaining the original object's identity.
         /// Drop it before releasing the owning `Value`, so no heap reader survives cleanup.
-        pub(crate) enum LogicalValue<'h> {
-            Str(StrRead<'h>),
-            Bytes(BytesRead<'h>),
-            Int(IntRead<'h>),
+        pub(crate) enum PyValue<'h> {
+            Str(PyStr<'h>),
+            Bytes(PyBytes<'h>),
+            Int(PyInt<'h>),
             Undefined,
             Ellipsis,
             NotImplemented,
@@ -55,18 +55,18 @@ macro_rules! define_logical_value {
             $($variant(HeapObjectRead<'h, $payload>),)*
         }
 
-        impl<'h> From<HeapReadOutput<'h>> for LogicalValue<'h> {
+        impl<'h> From<HeapReadOutput<'h>> for PyValue<'h> {
             fn from(value: HeapReadOutput<'h>) -> Self {
                 match value {
-                    HeapReadOutput::Str(value) => Self::Str(StrRead::Heap(value)),
-                    HeapReadOutput::Bytes(value) => Self::Bytes(BytesRead::Heap(value)),
-                    HeapReadOutput::LongInt(value) => Self::Int(IntRead::Heap(value)),
+                    HeapReadOutput::Str(value) => Self::Str(PyStr::Heap(value)),
+                    HeapReadOutput::Bytes(value) => Self::Bytes(PyBytes::Heap(value)),
+                    HeapReadOutput::LongInt(value) => Self::Int(PyInt::Heap(value)),
                     $(HeapReadOutput::$variant(value) => Self::$variant(value),)*
                 }
             }
         }
 
-        impl PyObjectIdentity for LogicalValue<'_> {
+        impl PyObjectIdentity for PyValue<'_> {
             fn py_identity(&self) -> Identity {
                 match self {
                     Self::Str(value) => value.py_identity(),
@@ -88,7 +88,7 @@ macro_rules! define_logical_value {
             }
         }
 
-        impl LogicalValue<'_> {
+        impl PyValue<'_> {
             /// Identifies heap reprs needing cycle tracking; scalar views cannot contain cycles.
             fn repr_heap_id(&self) -> Option<HeapId> {
                 match self {
@@ -102,20 +102,20 @@ macro_rules! define_logical_value {
         }
     };
     (@collect [$($out:tt)*] $(#[$meta:meta])* Str($storage:ident $payload:ty), $($rest:tt)*) => {
-        define_logical_value!(@collect [$($out)*] $($rest)*);
+        define_py_value!(@collect [$($out)*] $($rest)*);
     };
     (@collect [$($out:tt)*] $(#[$meta:meta])* Bytes($storage:ident $payload:ty), $($rest:tt)*) => {
-        define_logical_value!(@collect [$($out)*] $($rest)*);
+        define_py_value!(@collect [$($out)*] $($rest)*);
     };
     (@collect [$($out:tt)*] $(#[$meta:meta])* LongInt($storage:ident $payload:ty), $($rest:tt)*) => {
-        define_logical_value!(@collect [$($out)*] $($rest)*);
+        define_py_value!(@collect [$($out)*] $($rest)*);
     };
     (@collect [$($out:tt)*] $(#[$meta:meta])* $variant:ident($storage:ident $payload:ty), $($rest:tt)*) => {
-        define_logical_value!(@collect [$($out)* $variant($payload),] $($rest)*);
+        define_py_value!(@collect [$($out)* $variant($payload),] $($rest)*);
     };
-    ($($registry:tt)*) => { define_logical_value!(@collect [] $($registry)*); };
+    ($($registry:tt)*) => { define_py_value!(@collect [] $($registry)*); };
 }
-heap_payloads!(define_logical_value);
+heap_payloads!(define_py_value);
 
 /// Combines concrete dispatch and custom arms in one match, allowing exhaustive protocols.
 macro_rules! logical_forward {
@@ -137,7 +137,7 @@ macro_rules! numeric_binary {
     ($method:ident, $reflected:literal, |$lhs:ident, $rhs:ident, $vm:ident| $body:expr) => {
         fn $method(&self, other: &Value, $vm: &mut VM<'h>) -> RunResult<Option<Value>> {
             logical_forward!(self, |value| value.$method(other, $vm), {
-                Self::Bool(value) => IntRead::Small(i64::from(*value)).$method(other, $vm),
+                Self::Bool(value) => PyInt::Small(i64::from(*value)).$method(other, $vm),
                 Self::Float(value) => float_binary(*value, other, $vm, $reflected, |$lhs, $rhs| $body),
                 _ => Ok(None),
             })
@@ -146,21 +146,21 @@ macro_rules! numeric_binary {
     ($method:ident) => {
         fn $method(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
             logical_forward!(self, |value| value.$method(other, vm), {
-                Self::Bool(value) => IntRead::Small(i64::from(*value)).$method(other, vm),
+                Self::Bool(value) => PyInt::Small(i64::from(*value)).$method(other, vm),
                 _ => Ok(None),
             })
         }
     };
 }
 
-impl<'h> LogicalValue<'h> {
+impl<'h> PyValue<'h> {
     /// Copies immediate payloads and opens heap handles without borrowing the owning `Value`.
     pub(crate) fn new(value: &Value, vm: &VM<'h>) -> Self {
         match value {
-            Value::InternString(id) => Self::Str(StrRead::Interned(*id)),
-            Value::InternBytes(id) => Self::Bytes(BytesRead::Interned(*id)),
-            Value::Int(value) => Self::Int(IntRead::Small(*value)),
-            Value::InternLongInt(id) => Self::Int(IntRead::Interned(*id)),
+            Value::InternString(id) => Self::Str(PyStr::Interned(*id)),
+            Value::InternBytes(id) => Self::Bytes(PyBytes::Interned(*id)),
+            Value::Int(value) => Self::Int(PyInt::Small(*value)),
+            Value::InternLongInt(id) => Self::Int(PyInt::Interned(*id)),
             Value::Ref(id) => vm.heap.read(*id).into(),
             Value::Undefined => Self::Undefined,
             Value::Ellipsis => Self::Ellipsis,
@@ -227,7 +227,7 @@ impl<'h> LogicalValue<'h> {
     }
 }
 
-impl<'h> PyTrait<'h> for LogicalValue<'h> {
+impl<'h> PyTrait<'h> for PyValue<'h> {
     fn py_type(&self, vm: &VM<'h>) -> Type {
         logical_forward!(self, |value| value.py_type(vm), {
             Self::Undefined => panic!("Cannot get type of undefined value"),
@@ -321,7 +321,7 @@ impl<'h> PyTrait<'h> for LogicalValue<'h> {
 
     fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         logical_forward!(self, |value| value.py_add_impl(other, vm), {
-            Self::Bool(value) => IntRead::Small(i64::from(*value)).py_add_impl(other, vm),
+            Self::Bool(value) => PyInt::Small(i64::from(*value)).py_add_impl(other, vm),
             Self::Float(lhs) => Ok(match other {
                 Value::Int(rhs) => Some(Value::Float(lhs + *rhs as f64)),
                 Value::Bool(rhs) => Some(Value::Float(lhs + f64::from(*rhs))),
@@ -334,7 +334,7 @@ impl<'h> PyTrait<'h> for LogicalValue<'h> {
 
     fn py_mul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         logical_forward!(self, |value| value.py_mul_impl(other, vm), {
-            Self::Bool(value) => IntRead::Small(i64::from(*value)).py_mul_impl(other, vm),
+            Self::Bool(value) => PyInt::Small(i64::from(*value)).py_mul_impl(other, vm),
             Self::Float(lhs) => Ok(match other {
                 Value::Int(rhs) => Some(Value::Float(lhs * *rhs as f64)),
                 Value::Bool(rhs) => Some(Value::Float(lhs * f64::from(*rhs))),
@@ -419,7 +419,7 @@ impl<'h> PyTrait<'h> for LogicalValue<'h> {
 
     fn py_neg_impl(&self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         logical_forward!(self, |value| value.py_neg_impl(vm), {
-            Self::Bool(value) => IntRead::Small(i64::from(*value)).py_neg_impl(vm),
+            Self::Bool(value) => PyInt::Small(i64::from(*value)).py_neg_impl(vm),
             Self::Float(value) => Ok(Some(Value::Float(-value))),
             _ => Ok(None),
         })
@@ -435,7 +435,7 @@ impl<'h> PyTrait<'h> for LogicalValue<'h> {
 
     fn py_pow_impl(&self, other: &Value, modulus: Option<&Value>, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         logical_forward!(self, |value| value.py_pow_impl(other, modulus, vm), {
-            Self::Bool(value) => IntRead::Small(i64::from(*value)).py_pow_impl(other, modulus, vm),
+            Self::Bool(value) => PyInt::Small(i64::from(*value)).py_pow_impl(other, modulus, vm),
             Self::Float(value) if modulus.is_none() => float_binary(*value, other, vm, false, |base, exp| float_pow_value(base, exp, vm.heap)),
             _ => Ok(None),
         })
@@ -448,7 +448,7 @@ impl<'h> PyTrait<'h> for LogicalValue<'h> {
     fn py_and_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         logical_forward!(self, |value| value.py_and_impl(other, vm), {
             Self::Bool(lhs) if let Value::Bool(rhs) = other => Ok(Some(Value::Bool(*lhs && *rhs))),
-            Self::Bool(value) => IntRead::Small(i64::from(*value)).py_and_impl(other, vm),
+            Self::Bool(value) => PyInt::Small(i64::from(*value)).py_and_impl(other, vm),
             _ => Ok(None),
         })
     }
@@ -456,7 +456,7 @@ impl<'h> PyTrait<'h> for LogicalValue<'h> {
     fn py_or_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         logical_forward!(self, |value| value.py_or_impl(other, vm), {
             Self::Bool(lhs) if let Value::Bool(rhs) = other => Ok(Some(Value::Bool(*lhs || *rhs))),
-            Self::Bool(value) => IntRead::Small(i64::from(*value)).py_or_impl(other, vm),
+            Self::Bool(value) => PyInt::Small(i64::from(*value)).py_or_impl(other, vm),
             Self::Builtin(value) => Union::try_or(&Value::Builtin(*value), other, vm),
             Self::None => Union::try_or(&Value::None, other, vm),
             Self::Marker(value) => Union::try_or(&Value::Marker(*value), other, vm),
@@ -476,7 +476,7 @@ impl<'h> PyTrait<'h> for LogicalValue<'h> {
     fn py_xor_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         logical_forward!(self, |value| value.py_xor_impl(other, vm), {
             Self::Bool(lhs) if let Value::Bool(rhs) = other => Ok(Some(Value::Bool(*lhs ^ *rhs))),
-            Self::Bool(value) => IntRead::Small(i64::from(*value)).py_xor_impl(other, vm),
+            Self::Bool(value) => PyInt::Small(i64::from(*value)).py_xor_impl(other, vm),
             _ => Ok(None),
         })
     }

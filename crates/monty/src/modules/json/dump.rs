@@ -210,6 +210,7 @@ fn parse_indent_value(value: Value, vm: &mut VM<'_>) -> RunResult<Option<String>
         Value::None => Ok(None),
         Value::Bool(flag) => Ok(Some(" ".repeat(usize::from(*flag)))),
         Value::Int(count) => spaces_from_indent_count(*count),
+        Value::InternLongInt(_) => Err(ExcType::overflow_c_ssize_t()),
         Value::InternString(string_id) => Ok(Some(vm.interns.get_str(*string_id).to_owned())),
         Value::Ref(heap_id) => match vm.heap.read(*heap_id) {
             HeapReadOutput::Str(string) => Ok(Some(string.get(vm.heap).as_str().to_owned())),
@@ -622,7 +623,12 @@ fn skip_disallowed_dict_keys(entries: &mut Vec<(Value, Value)>, vm: &mut VM<'_>)
 fn is_json_key_allowed(value: &Value, vm: &VM<'_>) -> bool {
     matches!(
         value,
-        Value::None | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::InternString(_)
+        Value::None
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::InternLongInt(_)
+            | Value::Float(_)
+            | Value::InternString(_)
     ) || matches!(value, Value::Ref(heap_id) if matches!(vm.heap.get(*heap_id), HeapData::Str(_) | HeapData::LongInt(_)))
 }
 
@@ -637,16 +643,16 @@ fn write_json_key(key: &Value, out: &mut String, config: &JsonDumpsConfig, vm: &
         Value::Bool(true) => write_json_ascii_key("true", out),
         Value::Bool(false) => write_json_ascii_key("false", out),
         Value::Int(value) => write_json_display_key(value, out),
+        _ if let Some(integer) = key.as_long_int(vm) => {
+            check_bigint_str_digits_limit(integer)?;
+            write_json_display_key(integer, out);
+        }
         Value::Float(value) => {
             serialize_float_key(*value, out, config)?;
         }
         Value::InternString(string_id) => write_json_string(vm.interns.get_str(*string_id), out, ensure_ascii),
         Value::Ref(heap_id) => match vm.heap.get(*heap_id) {
             HeapData::Str(string) => write_json_string(string.as_str(), out, ensure_ascii),
-            HeapData::LongInt(long_int) => {
-                long_int.check_str_digits_limit()?;
-                write_json_display_key(long_int.inner(), out);
-            }
             _ => return Err(ExcType::json_invalid_key_error(&key.py_type_name(vm))),
         },
         _ => return Err(ExcType::json_invalid_key_error(&key.py_type_name(vm))),

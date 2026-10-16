@@ -414,14 +414,10 @@ fn wrapping_u32(value: &Value, vm: &VM<'_>) -> RunResult<u32> {
     match value {
         Value::Int(int) => Ok(u32::try_from(int.rem_euclid(MODULUS)).expect("reduced below 2**32")),
         Value::Bool(flag) => Ok(u32::from(*flag)),
-        Value::Ref(heap_id) => match vm.heap.get(*heap_id) {
-            HeapData::LongInt(long) => {
-                // `&` on a `BigInt` is two's-complement, so this is Python's
-                // own `value & 0xffffffff` for negatives as well.
-                Ok((&long.0 & BigInt::from(u32::MAX)).to_u32().expect("masked below 2**32"))
-            }
-            _ => Err(ExcType::type_error_not_integer(&value.py_type_name(vm))),
-        },
+        _ if let Some(integer) = value.as_long_int(vm) => {
+            // Two's-complement masking wraps negative integers too.
+            Ok((integer & BigInt::from(u32::MAX)).to_u32().expect("masked below 2**32"))
+        }
         _ => Err(ExcType::type_error_not_integer(&value.py_type_name(vm))),
     }
 }

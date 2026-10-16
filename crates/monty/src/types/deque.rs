@@ -1,5 +1,7 @@
 use std::{cmp::Ordering, collections::VecDeque, fmt::Write, mem};
 
+use num_traits::ToPrimitive;
+
 use super::{CmpOrder, PyTrait, iter::collect_owned_iterable};
 use crate::{
     args::{ArgValues, FromArgs},
@@ -244,7 +246,7 @@ fn read_ssize(value: &Value, vm: &VM<'_>, overflow: fn() -> RunError) -> Option<
     match value {
         Value::Int(i) => Some(Ok(*i)),
         Value::Bool(b) => Some(Ok(i64::from(*b))),
-        Value::Ref(id) if let HeapData::LongInt(li) = vm.heap.get(*id) => Some(li.to_i64().ok_or_else(overflow)),
+        _ if let Some(integer) = value.as_long_int(vm) => Some(integer.to_i64().ok_or_else(overflow)),
         _ => None,
     }
 }

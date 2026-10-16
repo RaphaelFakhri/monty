@@ -34,8 +34,8 @@ pub fn builtin_abs(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
         }
         Value::Float(f) => Ok(Value::Float(f.abs())),
         Value::Bool(b) => Ok(Value::Int(i64::from(*b))),
+        _ if let Some(integer) = value.as_long_int(vm) => Ok(LongInt::new(integer.abs()).into_value(vm.heap)),
         Value::Ref(id) => match vm.heap.get(*id) {
-            HeapData::LongInt(li) => Ok(li.abs().into_value(vm.heap)),
             HeapData::Complex(c) => Ok(Value::Float(c.abs()?)),
             HeapData::TimeDelta(td) => {
                 let total = timedelta::total_microseconds(td);

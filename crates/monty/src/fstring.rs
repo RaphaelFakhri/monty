@@ -10,6 +10,8 @@ use std::{fmt, fmt::Write, iter::Peekable, str, str::FromStr};
 
 pub use monty_types::FormatFloat;
 use monty_types::{LARGE_RESULT_THRESHOLD, ResourceTracker};
+use num_bigint::BigInt;
+use num_traits::{Signed, ToPrimitive};
 use unicode_general_category::{GeneralCategory, get_general_category};
 
 use crate::{
@@ -21,7 +23,7 @@ use crate::{
     intern::StringId,
     resource_checks::check_repeat_size,
     string_builder::StringBuilder,
-    types::{Complex, LongInt, PyTrait, Type, long_int::check_bits_str_digits_limit},
+    types::{Complex, PyTrait, Type, long_int::check_bits_str_digits_limit},
     value::Value,
 };
 
@@ -760,7 +762,7 @@ pub fn format_with_spec(value: &Value, spec: &ParsedFormatSpec, vm: &mut VM<'_>)
         // The number of finite components the precision expands, so the whole
         // output is charged before any of it is built.
         let finite_parts = match value {
-            Value::Int(_) => 1,
+            Value::Int(_) | Value::InternLongInt(_) => 1,
             Value::Float(f) => usize::from(f.is_finite()),
             Value::Ref(id) => match vm.heap.get(*id) {
                 // A big integer formatted as a float is first converted to `f64`,
@@ -784,14 +786,8 @@ pub fn format_with_spec(value: &Value, spec: &ParsedFormatSpec, vm: &mut VM<'_>)
         }
     }
 
-    // Big integers (`LongInt`) live on the heap; route them through the
-    // arbitrary-precision formatter, which mirrors the `i64` integer/float
-    // paths. The validations above (grouping, precision, sign-with-`c`,
-    // alternate) already ran against `value_type == Type::Int`, so only the
-    // value dispatch remains.
-    if let Value::Ref(id) = value
-        && let HeapData::LongInt(li) = vm.heap.get(*id)
-    {
+    // The validations above already ran against Type::Int for both big-integer representations.
+    if let Some(li) = value.as_long_int(vm) {
         return format_long_int(li, &value_type.name(vm.heap, vm.interns), spec, &vm.heap.tracker);
     }
     // A complex formats each part through the float formatters; the checks
@@ -972,7 +968,7 @@ fn type_valid_for_value(type_char: Option<TypeChar>, value_type: Type) -> bool {
 ///
 /// True for the explicit integer codes (`d`/`b`/`o`/`x`/`X`/`c`) and for a
 /// type-less spec on an `int`/`bool` value. Crucially it keys off `value_type`
-/// (not the `Value` variant) so big integers (`LongInt`, stored as a heap ref
+/// (not the `Value` variant) so big integers (interned or stored as a heap ref
 /// but typed `int`) are included. A float or string with one of those codes is
 /// *not* an integer presentation — it's a type error handled at dispatch — so
 /// this returns false there, letting the "Unknown format code" message win.
@@ -1355,7 +1351,7 @@ pub fn format_int_base(
     pad_signed_numeric(sign, prefix, &abs_str, spec, tracker)
 }
 
-/// Formats a big integer ([`LongInt`]) through the numeric mini-language,
+/// Formats a big integer through the numeric mini-language,
 /// mirroring the `i64` paths ([`format_int`] / [`format_int_base`] /
 /// `format_float_*`) but sourcing digits from the arbitrary-precision `BigInt`.
 ///
@@ -1374,7 +1370,7 @@ pub fn format_int_base(
 /// outside the resource limit (`f"{1 << n:b}"`). Each radix render is size-checked
 /// up front against `tracker`.
 fn format_long_int(
-    li: &LongInt,
+    li: &BigInt,
     value_type: &str,
     spec: &ParsedFormatSpec,
     tracker: &ResourceTracker,
@@ -1384,7 +1380,7 @@ fn format_long_int(
     } else {
         positive_sign_prefix(spec.sign)
     };
-    let magnitude = li.abs();
+    let magnitude = li.magnitude();
     // `uppercase` (the `X` type) uppercases the hex digits and the `0x` prefix
     // (`0X`) but never the fill, so it's applied to the digits *before* padding.
     let radix = |base: u32, base_prefix: &'static str, uppercase: bool| -> Result<String, RunError> {
@@ -1398,7 +1394,7 @@ fn format_long_int(
             usize::try_from(max_digits).unwrap_or(usize::MAX).saturating_add(2),
             tracker,
         )?;
-        let mut digits = magnitude.inner().to_str_radix(base);
+        let mut digits = magnitude.to_str_radix(base);
         let prefix = if !spec.alternate {
             ""
         } else if uppercase {

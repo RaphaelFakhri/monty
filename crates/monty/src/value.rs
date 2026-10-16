@@ -21,13 +21,13 @@ use crate::{
     heap::{ContainsHeap, DropWithContext, Heap, HeapData, HeapId, HeapReadOutput},
     identity::Identity,
     intern::{BytesId, FunctionId, Interns, LongIntId, StaticStrings, StringId},
-    logical_value::LogicalValue,
     modules::ModuleFunctions,
+    py_value::PyValue,
     types::{
         BytesIterator, CmpOrder, Complex, LazyHeapSet, Property, PyTrait, StringIterator, Type, host_class_type,
         instance::{instance_dataclass_eq, instance_getattr, instance_str, instance_user_eq},
         long_int::{
-            IntRead, bigint_cmp_f64, bigint_cmp_i64, bigint_divmod_tuple, bigint_eq_f64, bigint_eq_i64, i64_cmp_f64,
+            PyInt, bigint_cmp_f64, bigint_cmp_i64, bigint_divmod_tuple, bigint_eq_f64, bigint_eq_i64, i64_cmp_f64,
         },
         namedtuple::cmp_item_seqs,
         str::allocate_string,
@@ -71,7 +71,7 @@ pub(crate) enum Value {
     #[serde(rename = "R")]
     InternBytes(BytesId),
     /// An interned long integer literal. The `LongIntId` references the `BigInt` in the Interns table.
-    /// Used for integer literals exceeding i64 range. Converted to heap-allocated `LongInt` on load.
+    /// Used for integer literals exceeding i64 range; loading them shares the interned payload.
     #[serde(rename = "L")]
     InternLongInt(LongIntId),
     /// A builtin function or exception type
@@ -200,18 +200,18 @@ pub(crate) const VALUE_SIZE: usize = mem::size_of::<Value>();
 /// Runs a protocol method on the logical view of `$value`.
 ///
 /// Immediate ints dominate arithmetic and truth tests in hot loops, so they open
-/// their `IntRead` view directly instead of building the full `LogicalValue`
-/// (whose wide match the optimizer cannot thread through). `LogicalValue::Int`
-/// forwards every protocol to the same `IntRead`, so semantics are unchanged.
+/// their `PyInt` view directly instead of building the full `PyValue`
+/// (whose wide match the optimizer cannot thread through). `PyValue::Int`
+/// forwards every protocol to the same `PyInt`, so semantics are unchanged.
 macro_rules! logical_dispatch {
     ($value:expr, $vm:expr, |$view:ident| $body:expr) => {
         match $value {
             Value::Int(small) => {
-                let $view = IntRead::Small(*small);
+                let $view = PyInt::Small(*small);
                 $body
             }
             value => {
-                let $view = LogicalValue::new(value, $vm);
+                let $view = PyValue::new(value, $vm);
                 $body
             }
         }
@@ -266,7 +266,7 @@ impl<'h> PyTrait<'h> for Value {
     }
 
     fn py_len(&self, vm: &VM<'_>) -> Option<usize> {
-        LogicalValue::new(self, vm).py_len(vm)
+        PyValue::new(self, vm).py_len(vm)
     }
 
     fn py_eq_impl(&self, other: &Value, vm: &mut VM<'_>) -> RunResult<Option<bool>> {
@@ -280,9 +280,6 @@ impl<'h> PyTrait<'h> for Value {
             Self::Bool(b) => Ok(eq_i64(i64::from(*b), other, vm)),
             Self::Int(a) => Ok(eq_i64(*a, other, vm)),
             Self::Float(f) => Ok(eq_f64(*f, other, vm)),
-            // `InternLongInt` is normally materialised to a heap `LongInt` before
-            // it can be compared, but handle it directly so equality never
-            // silently diverges if one reaches here.
             Self::InternLongInt(id) => Ok(eq_bigint(vm.interns.get_long_int(*id), other, vm)),
             Self::InternString(id) => Ok(match other {
                 // Interned strings are deduplicated, so equal ids ⇔ equal content.
@@ -452,7 +449,7 @@ impl<'h> PyTrait<'h> for Value {
     }
 
     fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'_>, heap_ids: &mut LazyHeapSet) -> RunResult<()> {
-        LogicalValue::new(self, vm).py_repr_fmt(f, vm, heap_ids)
+        PyValue::new(self, vm).py_repr_fmt(f, vm, heap_ids)
     }
 
     /// Overrides the default `py_repr` with allocation-light fast paths for the
@@ -495,7 +492,7 @@ impl<'h> PyTrait<'h> for Value {
             Self::Ref(id) if matches!(vm.heap.get(*id), HeapData::Str(_)) => Ok(self.clone_with_heap(vm.heap)),
             // Instances dispatch to a user `__str__`/`__repr__` (needs the heap id).
             Self::Ref(id) if matches!(vm.heap.get(*id), HeapData::Instance(_)) => instance_str(*id, vm),
-            Self::Ref(id) => LogicalValue::from(vm.heap.read(*id)).py_str(vm),
+            Self::Ref(id) => PyValue::from(vm.heap.read(*id)).py_str(vm),
             _ => self.py_repr(vm),
         }
     }
@@ -693,7 +690,7 @@ impl<'h> PyTrait<'h> for Value {
     }
 
     fn py_getitem(&self, key: &Self, vm: &mut VM<'_>) -> RunResult<Self> {
-        LogicalValue::new(self, vm).subscript(key, vm)
+        PyValue::new(self, vm).subscript(key, vm)
     }
 
     fn py_setitem(&mut self, key: Self, value: Self, vm: &mut VM<'_>) -> RunResult<()> {
@@ -1046,7 +1043,7 @@ impl Value {
     /// containment first (`sq_contains`), then consuming it by iteration
     /// (`tp_iter`), then `TypeError`.
     pub fn py_contains(&self, item: &Self, vm: &mut VM<'_>) -> RunResult<bool> {
-        let result = LogicalValue::new(self, vm).py_contains_impl(item, vm)?;
+        let result = PyValue::new(self, vm).py_contains_impl(item, vm)?;
         match result {
             Some(found) => Ok(found),
             None if self.py_is_iterable(vm) => self.contains_by_iteration(item, vm),
