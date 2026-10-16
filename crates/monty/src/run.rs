@@ -15,7 +15,6 @@ use ruff_python_stdlib::identifiers::is_identifier;
 use crate::{
     bytecode::{Code, CodeBuilder, Compiler, FrameExit, Opcode, VM},
     exception_private::{ExcTypeExt, RunError, RunResult},
-    frozen,
     heap::{DropWithContext, Heap, HeapReader},
     intern::{CompileInterns, Interns, StringId},
     name_map::NameMap,
@@ -366,7 +365,7 @@ impl Executor {
     ) -> Result<Self, MontyException> {
         check_identifier(&input_names)?;
         source_nesting_exception(&code, script_name, options.source_scan_threshold)?;
-        let mut interns = frozen::interns();
+        let mut interns = Interns::new(&code);
         let mut globals = NameMap::new();
         let (module_code, _) = compile_module_source(
             &code,
@@ -853,7 +852,7 @@ pub struct RefCountOutput {
 /// On failure the caller restores provisional global slots or discards a fresh program's tables.
 /// The source must already have passed the nesting scan; `MontyRun::new` and
 /// the REPL feeds run it.
-pub(crate) fn compile_module_source(
+fn compile_module_source(
     code: &str,
     script_name: &str,
     globals: &mut NameMap,

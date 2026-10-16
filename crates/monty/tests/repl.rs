@@ -788,6 +788,82 @@ fn repl_progress_dump_load_roundtrip() {
     assert_eq!(feed_run_print(&mut repl, "z").unwrap(), MontyObject::int(1));
 }
 
+/// Internal implementations are appended only on first use, in either order, and survive dumps.
+#[test]
+fn repl_frozen_functions_are_interned_on_demand() {
+    let calls = [
+        ("FunctoolsReduce", "functools.reduce(add, [1, 2, 3])"),
+        ("CacheMiss", "cached(2, 4)"),
+    ];
+    for calls in [calls, [calls[1], calls[0]]] {
+        let (mut repl, _) =
+            init_repl("import functools\ndef add(a, b):\n    return a + b\ncached = functools.cache(add)");
+        let before = to_value(&repl).unwrap();
+        assert_eq!(before["interns"]["functions"].as_array().unwrap().len(), 1);
+        assert!(before["interns"]["frozen_functions"].as_object().unwrap().is_empty());
+        repl = round_trip_repl(&repl);
+
+        for (index, (name, code)) in calls.into_iter().enumerate() {
+            assert_eq!(feed_run_print(&mut repl, code).unwrap(), MontyObject::int(6));
+            let state = to_value(&repl).unwrap();
+            let functions = state["interns"]["functions"].as_array().unwrap();
+            assert_eq!(functions.len(), index + 2);
+            assert_eq!(functions[0], before["interns"]["functions"][0]);
+            assert_eq!(functions[index + 1]["I"], true);
+            assert_eq!(state["interns"]["frozen_functions"][name], index + 1);
+            assert_eq!(
+                state["interns"]["frozen_functions"].as_object().unwrap().len(),
+                index + 1
+            );
+
+            repl = round_trip_repl(&repl);
+            feed_run_print(&mut repl, "cached.cache_clear()").unwrap();
+            assert_eq!(feed_run_print(&mut repl, code).unwrap(), MontyObject::int(6));
+            let after = to_value(&repl).unwrap();
+            assert_eq!(after["interns"]["functions"], state["interns"]["functions"]);
+            assert_eq!(
+                after["interns"]["frozen_functions"],
+                state["interns"]["frozen_functions"]
+            );
+        }
+    }
+}
+
+/// Rejecting a first-use frozen frame must discard its provisional code and interned names.
+#[test]
+fn repl_rejected_frozen_admission_keeps_no_products() {
+    for call in ["functools.reduce(add, [1, 2, 3])", "cached(2, 4)"] {
+        let (mut repl, _) = init_repl(&format!(
+            "import functools\ndef add(a, b):\n    return a + b\ncached = functools.cache(add)\ndef attempt():\n    try:\n        {call}\n    except RecursionError as exc:\n        return str(exc)"
+        ));
+        *repl.tracker_mut() = ResourceTracker::new(ResourceLimits::default().max_recursion_depth(1));
+        let before = to_value(&repl).unwrap();
+        for _ in 0..3 {
+            let result = repl.call_function("attempt", vec![], PrintWriter::Disabled).unwrap();
+            assert_eq!(result, MontyObject::string("maximum recursion depth exceeded"));
+            let after = to_value(&repl).unwrap();
+            assert_eq!(after["interns"]["functions"], before["interns"]["functions"]);
+            assert_eq!(
+                after["interns"]["frozen_functions"],
+                before["interns"]["frozen_functions"]
+            );
+            // Host-call filenames are admitted independently; none of the internal source's names are.
+            let strings = after["interns"]["strings"].as_array().unwrap();
+            assert!(strings.iter().all(|value| value.as_str() != Some("<monty-frozen>")));
+        }
+        *repl.tracker_mut() = ResourceTracker::default();
+        let mut repl = round_trip_repl(&repl);
+        assert_eq!(feed_run_print(&mut repl, call).unwrap(), MontyObject::int(6));
+        assert_eq!(
+            to_value(&repl).unwrap()["interns"]["frozen_functions"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
 /// Frozen code survives in-place compilation, idle dumps, and suspended REPL dumps.
 #[test]
 fn repl_frozen_reduce_survives_incremental_compilation_and_dumps() {

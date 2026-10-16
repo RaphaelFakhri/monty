@@ -1,85 +1,79 @@
-//! Python implementations of interpreter functions captured with each program.
+//! Python implementations of interpreter functions compiled on first use.
 //!
 //! Internal functions use ordinary VM frames and suspension but are hidden from
 //! tracebacks and namespace introspection. Private native helpers arrive as
 //! explicit arguments, never through user globals or importable modules.
-
-use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use monty_types::CompileOptions;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     args::{ArgValues, FromArgs},
-    bytecode::{Opcode, VM},
+    bytecode::{Compiler, VM},
     defer_drop,
     exception_private::RunResult,
     intern::{CompileInterns, FunctionId, Interns},
     name_map::NameMap,
-    run::compile_module_source,
+    parse::parse_with_interner,
+    prepare::prepare_with_existing_names,
     types::lru_cache,
     value::Value,
 };
 
-const FROZEN_FILENAME: &str = "<monty-frozen>";
-const REDUCE_LOOP_ENTRY: usize = 2;
-const FROZEN_SOURCE: &str = r"
-def __monty_functools_reduce(function, iterator, accumulator):
-    for item in iterator:
-        accumulator = function(accumulator, item)
-    return accumulator
+/// Selects a trusted implementation whose ordinary function ID is cached per session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) enum FrozenFunction {
+    /// Suspendable fold loop behind `functools.reduce`.
+    FunctoolsReduce,
+    /// Store a cached call's result only after it returns successfully.
+    CacheMiss,
+}
 
+impl FrozenFunction {
+    /// Prepares an unpublished implementation using this session's intern IDs.
+    /// The caller must admit the frame before committing the overlay and caching its ID.
+    pub(crate) fn compile(self, interns: &Interns) -> RunResult<(FunctionId, CompileInterns<'_>)> {
+        let source = self.source();
+        let mut overlay = CompileInterns::for_frozen(interns);
+        let index = overlay.functions_len();
+        let mut globals = NameMap::new();
+        let nodes =
+            parse_with_interner(source, "<monty-frozen>", &mut overlay).map_err(|e| e.into_run_error(source))?;
+        let nodes = prepare_with_existing_names(nodes, &overlay, &mut globals).map_err(|e| e.into_run_error(source))?;
+        Compiler::compile_module(&nodes, &mut overlay, &globals, CompileOptions::default())
+            .map_err(|e| e.into_run_error(source))?;
+        assert_eq!(
+            overlay.functions_len(),
+            index + 1,
+            "frozen source must define one function"
+        );
+        // Successful compilation checked the bytecode's function-ID limit.
+        let id = FunctionId::from_index(u16::try_from(index).expect("compiled function ID fits u16"));
+        Ok((id, overlay))
+    }
+
+    /// Self-contained bodies: any global slot would address the user's module.
+    fn source(self) -> &'static str {
+        match self {
+            Self::FunctoolsReduce => {
+                r"
+def __monty_functools_reduce(function, iterator, accumulator, next_, stop_iteration):
+    while True:
+        try:
+            item = next_(iterator)
+        except stop_iteration:
+            return accumulator
+        accumulator = function(accumulator, item)
+"
+            }
+            Self::CacheMiss => {
+                r"
 def __monty_cache_miss(store, cache, key, function, args, kwargs):
     result = function(*args, **kwargs)
     store(cache, key, result)
     return result
-";
-
-/// Selects an entry in the program's captured frozen-function mapping.
-/// Append variants: their indices select metadata in existing dumps.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum FrozenFunction {
-    /// Suspendable fold loop behind `functools.reduce`.
-    FunctoolsReduce = 0,
-    /// Store a cached call's result only after it returns successfully.
-    CacheMiss = 1,
-}
-
-impl FrozenFunction {
-    /// Returns this frozen function's stable index in captured metadata.
-    pub(crate) fn index(self) -> usize {
-        self as usize
-    }
-}
-
-/// Captured entry metadata for an ordinary function in `Interns`.
-/// Bodies must be self-contained: global slots would address the user module.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct FrozenEntry {
-    /// Function ID in the same table as user-defined functions.
-    pub function_id: FunctionId,
-    /// Bytecode offset after any native setup.
-    pub entry_ip: usize,
-    /// Optional local iterator to copy onto the initial operand stack.
-    pub iterator_slot: Option<u16>,
-}
-
-impl FrozenEntry {
-    /// Captures an entry point with fixed positional arguments and no closure cells.
-    fn new(function_id: FunctionId, interns: &Interns, entry_ip: usize, iterator_slot: Option<u16>) -> Self {
-        let function = interns.get_function(function_id);
-        assert!(function.is_internal);
-        assert!(function.signature.exact_positional_count().is_some());
-        assert!(function.cell_var_slots.is_empty() && function.free_var_slots.is_empty());
-        if let Some(slot) = iterator_slot {
-            assert!(usize::from(slot) < function.signature.exact_positional_count().unwrap());
-            assert_eq!(function.code.bytecode()[entry_ip], Opcode::ForIter as u8);
-        }
-        Self {
-            function_id,
-            entry_ip,
-            iterator_slot,
+"
+            }
         }
     }
 }
@@ -116,45 +110,4 @@ struct StoreArgs {
     key: Value,
     #[from_args(pos_only)]
     value: Value,
-}
-
-/// Seeds a program or REPL with captured frozen code and its interned literals.
-pub(crate) fn interns() -> Interns {
-    frozen_interns().clone()
-}
-
-/// Returns the process-wide bundle, compiling trusted source once.
-fn frozen_interns() -> MutexGuard<'static, Interns> {
-    static INTERNS: OnceLock<Mutex<Interns>> = OnceLock::new();
-    INTERNS
-        .get_or_init(|| Mutex::new(compile_frozen_interns()))
-        .lock()
-        .expect("frozen intern lock should not be poisoned")
-}
-
-/// Compiles trusted source before user functions are added to the same tables.
-fn compile_frozen_interns() -> Interns {
-    let mut interns = Interns::new(FROZEN_SOURCE);
-    compile_module_source(
-        FROZEN_SOURCE,
-        FROZEN_FILENAME,
-        &mut NameMap::new(),
-        CompileInterns::for_frozen(&mut interns),
-        Vec::<String>::new(),
-        CompileOptions::default(),
-    )
-    .expect("frozen Python source should compile");
-    let reduce = FunctionId::from_index(0);
-    let cache_miss = FunctionId::from_index(1);
-    assert_eq!(
-        interns.get_function(reduce).code.bytecode().get(..REDUCE_LOOP_ENTRY),
-        Some([Opcode::LoadLocal1 as u8, Opcode::GetIter as u8].as_slice()),
-        "frozen reduce setup changed without updating its entry point"
-    );
-    let entries = vec![
-        FrozenEntry::new(reduce, &interns, REDUCE_LOOP_ENTRY, Some(1)),
-        FrozenEntry::new(cache_miss, &interns, 0, None),
-    ];
-    interns.set_frozen_entries(entries);
-    interns
 }

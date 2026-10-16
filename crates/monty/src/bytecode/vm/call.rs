@@ -851,43 +851,51 @@ impl<'h> VM<'h> {
         CallResult::Value(Value::Ref(coroutine_id))
     }
 
-    /// Transfers prepared arguments into a resumable frozen frame without Python binding.
-    /// Captured entry metadata optionally seeds an iterator for native-prepared loops.
+    /// Calls an internal function, compiling it on first use without publishing rejected calls.
+    /// Prepared arguments transfer directly into ordinary frame locals.
     pub(crate) fn call_frozen_exact<const N: usize>(
         &mut self,
         function: FrozenFunction,
         args: [Value; N],
     ) -> Result<CallResult, RunError> {
-        let call_offset = self.current_offset();
-        let stack_base = self.stack.len();
-        let frozen = self.interns.frozen_entry(function);
-        let func = self.interns.get_function(frozen.function_id);
+        let mut args_guard = DropGuard::new(args, self);
+        let (_, vm) = args_guard.as_parts_mut();
+        let interns = vm.interns;
+        let (function_id, overlay) = if let Some(id) = interns.frozen_function(function) {
+            (id, None)
+        } else {
+            let (id, overlay) = function.compile(interns)?;
+            (id, Some(overlay))
+        };
+        if !vm.current_frame.is_parked {
+            vm.incr_recursion()?;
+        }
+        // No fallible operation or Python execution may intervene between publication and frame installation.
+        if let Some(overlay) = overlay {
+            overlay.commit();
+            interns.set_frozen_function(function, function_id);
+        }
+        let (args, vm) = args_guard.into_parts();
+        let func = interns.get_function(function_id);
+        assert!(func.is_internal);
+        assert_eq!(func.signature.exact_positional_count(), Some(N));
+        assert!(func.cell_var_slots.is_empty() && func.free_var_slots.is_empty());
         let namespace_size = func.namespace_size;
         let locals_count = u16::try_from(namespace_size).expect("frozen function namespace exceeds u16");
-        assert!(namespace_size >= args.len(), "frozen function has too few local slots");
-
-        assert_eq!(func.signature.exact_positional_count(), Some(N));
-        let iterator = frozen
-            .iterator_slot
-            .map(|slot| args[usize::from(slot)].clone_with_heap(self.heap));
-        self.stack.extend(args);
-        self.stack.resize_with(stack_base + namespace_size, || Value::Undefined);
-        if let Some(iterator) = iterator {
-            self.stack.push(iterator);
-        }
-
-        let exc_stack_base = self.exception_stack.len();
-        let mut frame = CallFrame::new_function(
+        assert!(namespace_size >= N, "frozen function has too few local slots");
+        let stack_base = vm.stack.len();
+        vm.stack.extend(args);
+        vm.stack.resize_with(stack_base + namespace_size, || Value::Undefined);
+        let frame = CallFrame::new_function(
             &func.code,
             stack_base,
             locals_count,
-            exc_stack_base,
-            frozen.function_id,
-            call_offset,
+            vm.exception_stack.len(),
+            function_id,
+            vm.current_offset(),
             None,
         );
-        frame.ip = frozen.entry_ip;
-        self.push_frame(frame)?;
+        vm.push_admitted_frame(frame);
 
         Ok(CallResult::FramePushed)
     }

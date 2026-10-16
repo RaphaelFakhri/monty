@@ -40,6 +40,30 @@ class Iterator:
 iterator = Iterator()
 assert functools.reduce(lambda a, b: a + b, iterator) == 6
 assert iterator.iter_calls == 1
+iterator = Iterator()
+assert functools.reduce(lambda a, b: a + b, iterator, 10) == 16
+assert iterator.iter_calls == 1
+
+
+# StopIteration from the callback is not iterator exhaustion.
+def stop_in_callback(a, b):
+    raise StopIteration('callback stopped')
+
+
+try:
+    functools.reduce(stop_in_callback, [1, 2])
+    assert False, 'expected the callback exception to propagate'
+except StopIteration as exc:
+    assert str(exc) == 'callback stopped'
+
+# The frozen loop uses the actual builtins, not user globals.
+original_stop_iteration = StopIteration
+original_next = next
+next = None
+StopIteration = ValueError
+assert functools.reduce(lambda a, b: a + b, [1, 2, 3]) == 6
+StopIteration = original_stop_iteration
+next = original_next
 
 
 # an exception from the function propagates unchanged

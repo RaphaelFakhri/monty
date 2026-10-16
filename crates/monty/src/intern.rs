@@ -35,7 +35,7 @@ use storage::Entries;
 use strum::{EnumString, FromRepr, IntoStaticStr};
 
 use crate::{
-    frozen::{FrozenEntry, FrozenFunction},
+    frozen::FrozenFunction,
     function::Function,
     hash::{HashValue, RESERVED_STRING_HASHES, WithHash, hash_python_str},
 };
@@ -2506,8 +2506,8 @@ pub(crate) struct Interns {
     long_ints: Entries<WithHash<BigInt>>,
     /// Boxes keep a mostly empty storage page from reserving hundreds of function bodies.
     functions: Entries<Box<Function>>,
-    /// Captured entry points into the ordinary function table.
-    frozen_entries: Vec<FrozenEntry>,
+    /// Lazily compiled interpreter functions, retained with their code in session dumps.
+    frozen_functions: RefCell<AHashMap<FrozenFunction, FunctionId>>,
     eval_sources: Entries<Arc<str>>,
     #[serde(skip)]
     string_id_by_name: RefCell<AHashMap<String, StringId>>,
@@ -2531,7 +2531,8 @@ struct InternsWire {
     bytes: Entries<WithHash<Vec<u8>>>,
     long_ints: Entries<WithHash<BigInt>>,
     functions: Entries<Box<Function>>,
-    frozen_entries: Vec<FrozenEntry>,
+    #[serde(default)]
+    frozen_functions: RefCell<AHashMap<FrozenFunction, FunctionId>>,
     eval_sources: Entries<Arc<str>>,
 }
 
@@ -2559,7 +2560,7 @@ impl TryFrom<InternsWire> for Interns {
             bytes: wire.bytes,
             long_ints: wire.long_ints,
             functions: wire.functions,
-            frozen_entries: wire.frozen_entries,
+            frozen_functions: wire.frozen_functions,
             eval_sources: wire.eval_sources,
             string_id_by_name: RefCell::new(string_id_by_name),
             static_string_ids: RefCell::new(static_string_ids),
@@ -2585,7 +2586,7 @@ impl Interns {
             bytes: Entries::default(),
             long_ints: Entries::default(),
             functions: Entries::default(),
-            frozen_entries: Vec::new(),
+            frozen_functions: RefCell::default(),
             eval_sources: Entries::default(),
             string_id_by_name: RefCell::default(),
             static_string_ids: RefCell::default(),
@@ -2601,7 +2602,7 @@ impl Interns {
             bytes: Entries::default(),
             long_ints: Entries::default(),
             functions: Entries::default(),
-            frozen_entries: Vec::new(),
+            frozen_functions: RefCell::default(),
             eval_sources: Entries::default(),
             string_id_by_name: RefCell::new(AHashMap::with_capacity(capacity)),
             static_string_ids: RefCell::new(AHashMap::with_capacity(CORE_STATIC_STRINGS.len())),
@@ -2695,15 +2696,14 @@ impl Interns {
         self.long_ints[id.index()].hash()
     }
 
-    /// Returns the captured entry point selected by its stable identity.
-    pub(crate) fn frozen_entry(&self, function: FrozenFunction) -> &FrozenEntry {
-        &self.frozen_entries[function.index()]
+    /// Returns the captured implementation if this session has already compiled it.
+    pub(crate) fn frozen_function(&self, function: FrozenFunction) -> Option<FunctionId> {
+        self.frozen_functions.borrow().get(&function).copied()
     }
 
-    /// Records the entry points of a freshly compiled interpreter bundle.
-    pub(crate) fn set_frozen_entries(&mut self, entries: Vec<FrozenEntry>) {
-        assert_eq!(self.functions.len(), entries.len());
-        self.frozen_entries = entries;
+    /// Records an admitted implementation after its compilation overlay is committed.
+    pub(crate) fn set_frozen_function(&self, function: FrozenFunction, id: FunctionId) {
+        self.frozen_functions.borrow_mut().insert(function, id);
     }
 
     /// Finds canonical text already interned, excluding snippet filename IDs.

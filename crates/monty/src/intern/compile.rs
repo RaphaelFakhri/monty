@@ -53,9 +53,9 @@ impl<'i> CompileInterns<'i> {
         }
     }
 
-    /// Compiles a fresh bundle of trusted interpreter functions, not sandbox source.
-    pub(crate) fn for_frozen(base: &'i mut Interns) -> Self {
-        let mut interns = Self::direct(base);
+    /// Prepares trusted interpreter functions in a private compilation overlay.
+    pub(crate) fn for_frozen(base: &'i Interns) -> Self {
+        let mut interns = Self::new(base);
         interns.internal = true;
         interns
     }

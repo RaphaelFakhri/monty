@@ -7,7 +7,7 @@
 
 use crate::{
     args::{ArgValues, FromArgs},
-    builtins::Builtins,
+    builtins::{Builtins, BuiltinsFunctions},
     bytecode::{CallResult, VM},
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
@@ -119,7 +119,16 @@ fn call_reduce(vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult> {
 
     let ((function, (iterator, initial)), vm) = guard.into_parts();
     debug_assert!(initial.is_none());
-    vm.call_frozen_exact(FrozenFunction::FunctoolsReduce, [function, iterator, accumulator])
+    vm.call_frozen_exact(
+        FrozenFunction::FunctoolsReduce,
+        [
+            function,
+            iterator,
+            accumulator,
+            Value::Builtin(Builtins::Function(BuiltinsFunctions::Next)),
+            Value::Builtin(Builtins::ExcType(ExcType::StopIteration)),
+        ],
+    )
 }
 
 /// Arguments to the unbounded caching decorator.
