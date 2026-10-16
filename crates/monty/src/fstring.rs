@@ -21,9 +21,13 @@ use crate::{
     expressions::ExprLoc,
     heap::HeapData,
     intern::StringId,
+    py_value::PyValue,
     resource_checks::check_repeat_size,
     string_builder::StringBuilder,
-    types::{Complex, PyTrait, Type, long_int::check_bits_str_digits_limit},
+    types::{
+        Complex, PyTrait, Type,
+        long_int::{PyInt, check_bits_str_digits_limit},
+    },
     value::Value,
 };
 
@@ -761,16 +765,13 @@ pub fn format_with_spec(value: &Value, spec: &ParsedFormatSpec, vm: &mut VM<'_>)
     {
         // The number of finite components the precision expands, so the whole
         // output is charged before any of it is built.
-        let finite_parts = match value {
-            Value::Int(_) | Value::InternLongInt(_) => 1,
-            Value::Float(f) => usize::from(f.is_finite()),
-            Value::Ref(id) => match vm.heap.get(*id) {
-                // A big integer formatted as a float is first converted to `f64`,
-                // so an attacker-chosen precision applies to it too — guard it.
-                HeapData::LongInt(_) => 1,
-                HeapData::Complex(c) => usize::from(c.real.is_finite()) + usize::from(c.imag.is_finite()),
-                _ => 0,
-            },
+        let finite_parts = match value.py_value(vm) {
+            PyValue::Int(_) => 1,
+            PyValue::Float(value) => usize::from(value.is_finite()),
+            PyValue::Complex(value) => {
+                let value = value.get(vm.heap);
+                usize::from(value.real.is_finite()) + usize::from(value.imag.is_finite())
+            }
             _ => 0,
         };
         if finite_parts > 0 {
@@ -786,48 +787,23 @@ pub fn format_with_spec(value: &Value, spec: &ParsedFormatSpec, vm: &mut VM<'_>)
         }
     }
 
-    // The validations above already ran against Type::Int for both big-integer representations.
-    if let Some(li) = value.as_long_int(vm) {
-        return format_long_int(li, &value_type.name(vm.heap, vm.interns), spec, &vm.heap.tracker);
-    }
-    // A complex formats each part through the float formatters; the checks
-    // above have already validated the spec against `Type::Complex`.
-    if let Value::Ref(id) = value
-        && let HeapData::Complex(c) = vm.heap.get(*id)
-    {
-        return format_complex(*c, spec, &vm.heap.tracker);
-    }
-
-    match (value, spec.type_char) {
-        // Integer formatting. `n` (locale number) formats an integer like `d`;
-        // Monty has no locale, so the C-locale form — no grouping — applies.
-        (Value::Int(n), None | Some(TypeChar::D | TypeChar::N)) => format_int(*n, spec, &vm.heap.tracker),
-        (Value::Int(n), Some(TypeChar::B)) => format_int_base(*n, 2, false, spec, &vm.heap.tracker),
-        (Value::Int(n), Some(TypeChar::O)) => format_int_base(*n, 8, false, spec, &vm.heap.tracker),
-        (Value::Int(n), Some(TypeChar::X)) => format_int_base(*n, 16, false, spec, &vm.heap.tracker),
-        (Value::Int(n), Some(TypeChar::XUpper)) => format_int_base(*n, 16, true, spec, &vm.heap.tracker),
-        (Value::Int(n), Some(TypeChar::C)) => format_char(*n, spec, &vm.heap.tracker),
+    match (value.py_value(vm), spec.type_char) {
+        (PyValue::Int(integer), _) => integer.format_spec(spec, vm),
+        (PyValue::Complex(value), _) => format_complex(*value.get(vm.heap), spec, &vm.heap.tracker),
 
         // Float formatting. A type-less spec with no precision uses the repr
         // (shortest) digits, *not* `g` — only an explicit `g`/`G` or a type-less
         // spec that carries a precision selects the `g` algorithm.
-        (Value::Float(f), None) if spec.precision.is_none() => format_float_default(*f, spec, &vm.heap.tracker),
+        (PyValue::Float(f), None) if spec.precision.is_none() => format_float_default(f, spec, &vm.heap.tracker),
         // `n` on a float behaves like `g` (locale-aware in CPython; C-locale
         // here, so plain `g`).
-        (Value::Float(f), None | Some(TypeChar::G | TypeChar::GUpper | TypeChar::N)) => {
-            format_float_g(*f, spec, &vm.heap.tracker)
+        (PyValue::Float(f), None | Some(TypeChar::G | TypeChar::GUpper | TypeChar::N)) => {
+            format_float_g(f, spec, &vm.heap.tracker)
         }
-        (Value::Float(f), Some(TypeChar::F | TypeChar::FUpper)) => format_float_f(*f, spec, &vm.heap.tracker),
-        (Value::Float(f), Some(TypeChar::E)) => format_float_e(*f, spec, false, &vm.heap.tracker),
-        (Value::Float(f), Some(TypeChar::EUpper)) => format_float_e(*f, spec, true, &vm.heap.tracker),
-        (Value::Float(f), Some(TypeChar::Percent)) => format_float_percent(*f, spec, &vm.heap.tracker),
-
-        // Int to float formatting (Python allows this)
-        (Value::Int(n), Some(TypeChar::F | TypeChar::FUpper)) => format_float_f(*n as f64, spec, &vm.heap.tracker),
-        (Value::Int(n), Some(TypeChar::E)) => format_float_e(*n as f64, spec, false, &vm.heap.tracker),
-        (Value::Int(n), Some(TypeChar::EUpper)) => format_float_e(*n as f64, spec, true, &vm.heap.tracker),
-        (Value::Int(n), Some(TypeChar::G | TypeChar::GUpper)) => format_float_g(*n as f64, spec, &vm.heap.tracker),
-        (Value::Int(n), Some(TypeChar::Percent)) => format_float_percent(*n as f64, spec, &vm.heap.tracker),
+        (PyValue::Float(f), Some(TypeChar::F | TypeChar::FUpper)) => format_float_f(f, spec, &vm.heap.tracker),
+        (PyValue::Float(f), Some(TypeChar::E)) => format_float_e(f, spec, false, &vm.heap.tracker),
+        (PyValue::Float(f), Some(TypeChar::EUpper)) => format_float_e(f, spec, true, &vm.heap.tracker),
+        (PyValue::Float(f), Some(TypeChar::Percent)) => format_float_percent(f, spec, &vm.heap.tracker),
 
         // No type specifier on a non-string value: convert to string and
         // format. (`str` values are handled by the short-circuit above.)
@@ -847,6 +823,31 @@ pub fn format_with_spec(value: &Value, spec: &ParsedFormatSpec, vm: &mut VM<'_>)
             ),
         )
         .into()),
+    }
+}
+
+impl<'h> PyInt<'h> {
+    /// Formats an integer after the caller has validated its numeric presentation.
+    fn format_spec(&self, spec: &ParsedFormatSpec, vm: &VM<'h>) -> RunResult<String> {
+        let tracker = &vm.heap.tracker;
+        self.with_value(
+            vm,
+            |value| match spec.type_char {
+                None | Some(TypeChar::D | TypeChar::N) => format_int(value, spec, tracker),
+                Some(TypeChar::B) => format_int_base(value, 2, false, spec, tracker),
+                Some(TypeChar::O) => format_int_base(value, 8, false, spec, tracker),
+                Some(TypeChar::X) => format_int_base(value, 16, false, spec, tracker),
+                Some(TypeChar::XUpper) => format_int_base(value, 16, true, spec, tracker),
+                Some(TypeChar::C) => format_char(value, spec, tracker),
+                Some(TypeChar::F | TypeChar::FUpper) => format_float_f(value as f64, spec, tracker),
+                Some(TypeChar::E) => format_float_e(value as f64, spec, false, tracker),
+                Some(TypeChar::EUpper) => format_float_e(value as f64, spec, true, tracker),
+                Some(TypeChar::G | TypeChar::GUpper) => format_float_g(value as f64, spec, tracker),
+                Some(TypeChar::Percent) => format_float_percent(value as f64, spec, tracker),
+                Some(TypeChar::S) => unreachable!("integer presentation was validated"),
+            },
+            |value| format_long_int(value, "int", spec, tracker),
+        )
     }
 }
 

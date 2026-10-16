@@ -24,13 +24,15 @@ use crate::{
     modules::ModuleFunctions,
     py_value::PyValue,
     types::{
-        BytesIterator, CmpOrder, Complex, LazyHeapSet, Property, PyTrait, StringIterator, Type, host_class_type,
+        BytesIterator, CmpOrder, Complex, LazyHeapSet, Property, PyTrait, StringIterator, Type,
+        bytes::PyBytes,
+        host_class_type,
         instance::{instance_dataclass_eq, instance_getattr, instance_str, instance_user_eq},
         long_int::{
             PyInt, bigint_cmp_f64, bigint_cmp_i64, bigint_divmod_tuple, bigint_eq_f64, bigint_eq_i64, i64_cmp_f64,
         },
         namedtuple::cmp_item_seqs,
-        str::allocate_string,
+        str::{PyStr, allocate_string},
         tuple::allocate_tuple,
     },
 };
@@ -211,7 +213,7 @@ macro_rules! logical_dispatch {
                 $body
             }
             value => {
-                let $view = PyValue::new(value, $vm);
+                let $view = value.py_value($vm);
                 $body
             }
         }
@@ -266,7 +268,7 @@ impl<'h> PyTrait<'h> for Value {
     }
 
     fn py_len(&self, vm: &VM<'_>) -> Option<usize> {
-        PyValue::new(self, vm).py_len(vm)
+        self.py_value(vm).py_len(vm)
     }
 
     fn py_eq_impl(&self, other: &Value, vm: &mut VM<'_>) -> RunResult<Option<bool>> {
@@ -449,7 +451,7 @@ impl<'h> PyTrait<'h> for Value {
     }
 
     fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'_>, heap_ids: &mut LazyHeapSet) -> RunResult<()> {
-        PyValue::new(self, vm).py_repr_fmt(f, vm, heap_ids)
+        self.py_value(vm).py_repr_fmt(f, vm, heap_ids)
     }
 
     /// Overrides the default `py_repr` with allocation-light fast paths for the
@@ -690,7 +692,7 @@ impl<'h> PyTrait<'h> for Value {
     }
 
     fn py_getitem(&self, key: &Self, vm: &mut VM<'_>) -> RunResult<Self> {
-        PyValue::new(self, vm).subscript(key, vm)
+        self.py_value(vm).subscript(key, vm)
     }
 
     fn py_setitem(&mut self, key: Self, value: Self, vm: &mut VM<'_>) -> RunResult<()> {
@@ -756,6 +758,31 @@ impl<C: ContainsHeap> DropWithContext<C> for Value {
 }
 
 impl Value {
+    /// Opens a Python-type view without copying heap payloads or borrowing this owner.
+    /// Drop the view before releasing the owning `Value`, so its heap readers are gone at cleanup.
+    pub(crate) fn py_value<'h>(&self, vm: &VM<'h>) -> PyValue<'h> {
+        match self {
+            Self::InternString(id) => PyValue::Str(PyStr::Interned(*id)),
+            Self::InternBytes(id) => PyValue::Bytes(PyBytes::Interned(*id)),
+            Self::Int(value) => PyValue::Int(PyInt::Small(*value)),
+            Self::InternLongInt(id) => PyValue::Int(PyInt::Interned(*id)),
+            Self::Ref(id) => vm.heap.read(*id).into(),
+            Self::Undefined => PyValue::Undefined,
+            Self::Ellipsis => PyValue::Ellipsis,
+            Self::NotImplemented => PyValue::NotImplemented,
+            Self::None => PyValue::None,
+            Self::Bool(value) => PyValue::Bool(*value),
+            Self::Float(value) => PyValue::Float(*value),
+            Self::Builtin(value) => PyValue::Builtin(*value),
+            Self::ModuleFunction(value) => PyValue::ModuleFunction(*value),
+            Self::DefFunction(id) => PyValue::DefFunction(*id),
+            Self::Marker(value) => PyValue::Marker(*value),
+            Self::Property(value) => PyValue::Property(*value),
+            #[cfg(feature = "memory-model-checks")]
+            Self::Dereferenced => panic!("Cannot access Dereferenced object"),
+        }
+    }
+
     /// Returns the Python `Type` for this value using only `&Heap` (no full VM borrow).
     ///
     /// Wraps [`py_type_shallow`](Self::py_type_shallow) for immediate values and
@@ -1043,7 +1070,7 @@ impl Value {
     /// containment first (`sq_contains`), then consuming it by iteration
     /// (`tp_iter`), then `TypeError`.
     pub fn py_contains(&self, item: &Self, vm: &mut VM<'_>) -> RunResult<bool> {
-        let result = PyValue::new(self, vm).py_contains_impl(item, vm)?;
+        let result = self.py_value(vm).py_contains_impl(item, vm)?;
         match result {
             Some(found) => Ok(found),
             None if self.py_is_iterable(vm) => self.contains_by_iteration(item, vm),

@@ -32,6 +32,7 @@ use crate::{
     heap::{Heap, HeapData, HeapObjectRead},
     identity::Identity,
     intern::LongIntId,
+    py_value::PyValue,
     resource_checks::{check_div_size, check_lshift_size, check_mult_size, check_pow_size},
     types::{LazyHeapSet, PyTrait, Type, py_trait::PyObjectIdentity, str::allocate_string, tuple::allocate_tuple},
     value::{Value, eq_bigint, float_pow_value},
@@ -71,6 +72,118 @@ pub(crate) enum PyInt<'h> {
     Small(i64),
     Interned(LongIntId),
     Heap(HeapObjectRead<'h, LongInt>),
+}
+
+impl<'h> PyInt<'h> {
+    /// Formats the signed, prefixed representation used by `bin`, `oct` and `hex`.
+    /// Panics for radices other than 2, 8 and 16.
+    pub(crate) fn radix_repr(&self, radix: u32, vm: &VM<'h>) -> String {
+        let prefix = match radix {
+            2 => "0b",
+            8 => "0o",
+            16 => "0x",
+            _ => panic!("unsupported integer repr radix"),
+        };
+        let (negative, digits) = self.with_value(
+            vm,
+            |value| {
+                let magnitude = value.unsigned_abs();
+                let digits = match radix {
+                    2 => format!("{magnitude:b}"),
+                    8 => format!("{magnitude:o}"),
+                    _ => format!("{magnitude:x}"),
+                };
+                (value < 0, digits)
+            },
+            |value| (value.is_negative(), value.magnitude().to_str_radix(radix)),
+        );
+        let sign = if negative { "-" } else { "" };
+        format!("{sign}{prefix}{digits}")
+    }
+
+    /// Writes decimal digits without an intermediate string, enforcing the integer digit limit.
+    pub(crate) fn write_decimal(&self, out: &mut impl Write, vm: &VM<'h>) -> RunResult<()> {
+        match self {
+            Self::Small(value) => Ok(out.write_str(itoa::Buffer::new().format(*value))?),
+            Self::Interned(id) => bigint_repr_fmt(vm.interns.get_long_int(*id), out),
+            Self::Heap(value) => bigint_repr_fmt(value.get(vm.heap).inner(), out),
+        }
+    }
+
+    /// Returns the absolute value, promoting `i64::MIN` without overflowing.
+    pub(crate) fn abs(&self, vm: &VM<'h>) -> Value {
+        self.with_value(
+            vm,
+            |value| match value.checked_abs() {
+                Some(value) => Value::Int(value),
+                None => wide_i128_into_value(i128::from(value).abs(), vm.heap),
+            },
+            |value| LongInt::new(value.abs()).into_value(vm.heap),
+        )
+    }
+
+    /// Computes Python's bitwise complement at the integer's full precision.
+    pub(crate) fn invert(&self, vm: &VM<'h>) -> Value {
+        self.with_value(
+            vm,
+            |value| Value::Int(!value),
+            |value| LongInt::new(!value).into_value(vm.heap),
+        )
+    }
+
+    /// Narrows an integer for consumers which choose their own overflow error.
+    pub(crate) fn to_i64(&self, vm: &VM<'h>) -> Option<i64> {
+        self.with_value(vm, Some, ToPrimitive::to_i64)
+    }
+
+    /// Converts to float, leaving non-finite results for the consumer to reject.
+    pub(crate) fn to_f64(&self, vm: &VM<'h>) -> Option<f64> {
+        self.with_value(vm, |value| Some(value as f64), ToPrimitive::to_f64)
+    }
+
+    /// Converts to a finite float with Python's integer-overflow error.
+    pub(crate) fn to_f64_checked(&self, vm: &VM<'h>) -> RunResult<f64> {
+        self.to_f64(vm)
+            .filter(|value| value.is_finite())
+            .ok_or_else(ExcType::overflow_int_to_float)
+    }
+
+    /// Truncates to the low 32 bits for wrapping consumers such as CRC seeds.
+    pub(crate) fn wrapping_u32(&self, vm: &VM<'h>) -> u32 {
+        self.with_value(
+            vm,
+            |value| u32::try_from(value.rem_euclid(1_i64 << 32)).expect("reduced below 2**32"),
+            |value| (value & BigInt::from(u32::MAX)).to_u32().expect("masked below 2**32"),
+        )
+    }
+
+    /// Clamps a collection limit to `0..=usize::MAX` instead of raising on overflow.
+    pub(crate) fn collection_limit(&self, vm: &VM<'h>) -> usize {
+        self.with_value(
+            vm,
+            |value| usize::try_from(value.max(0)).unwrap_or(usize::MAX),
+            |value| if value.is_negative() { 0 } else { usize::MAX },
+        )
+    }
+
+    /// Resolves a sequence repetition count, treating negatives as zero.
+    pub(crate) fn repeat_count(&self, vm: &VM<'h>) -> RunResult<usize> {
+        self.with_value(
+            vm,
+            |value| usize::try_from(value.max(0)).ok(),
+            |value| if value.is_negative() { Some(0) } else { value.to_usize() },
+        )
+        .ok_or_else(|| ExcType::overflow_index_sized_int().into())
+    }
+
+    /// Runs size-specific integer operations without materializing or cloning a BigInt.
+    pub(crate) fn with_value<R>(&self, vm: &VM<'h>, small: impl FnOnce(i64) -> R, big: impl FnOnce(&BigInt) -> R) -> R {
+        match self {
+            Self::Small(value) => small(*value),
+            Self::Interned(id) => big(vm.interns.get_long_int(*id)),
+            Self::Heap(value) => big(value.get(vm.heap).inner()),
+        }
+    }
 }
 
 /// Keeps storage selection here; a heap integer forwards to its concrete protocol.
@@ -139,11 +252,7 @@ impl<'h> PyTrait<'h> for PyInt<'h> {
     }
 
     fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, _heap_ids: &mut LazyHeapSet) -> RunResult<()> {
-        match self {
-            Self::Small(value) => Ok(f.write_str(itoa::Buffer::new().format(*value))?),
-            Self::Interned(id) => bigint_repr_fmt(vm.interns.get_long_int(*id), f),
-            Self::Heap(value) => bigint_repr_fmt(value.get(vm.heap).inner(), f),
-        }
+        self.write_decimal(f, vm)
     }
 
     fn py_str(&self, vm: &mut VM<'h>) -> RunResult<Value> {
@@ -482,23 +591,9 @@ impl LongInt {
 
 /// Extracts a Python integer as a sequence repetition count.
 pub(crate) fn repeat_count(value: &Value, vm: &VM<'_>) -> RunResult<Option<usize>> {
-    match value {
-        Value::Int(value) => Ok(Some(if *value <= 0 {
-            0
-        } else {
-            usize::try_from(*value).map_err(|_| ExcType::overflow_index_sized_int())?
-        })),
-        Value::Bool(value) => Ok(Some(usize::from(*value))),
-        _ if let Some(value) = value.as_long_int(vm) => {
-            if value.is_negative() {
-                Ok(Some(0))
-            } else {
-                value
-                    .to_usize()
-                    .map(Some)
-                    .ok_or_else(|| ExcType::overflow_index_sized_int().into())
-            }
-        }
+    match value.py_value(vm) {
+        PyValue::Int(value) => value.repeat_count(vm).map(Some),
+        PyValue::Bool(value) => Ok(Some(usize::from(value))),
         _ => Ok(None),
     }
 }

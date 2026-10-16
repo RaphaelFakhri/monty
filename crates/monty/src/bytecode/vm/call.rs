@@ -22,7 +22,6 @@ use crate::{
     intern::{FunctionId, StaticStrings, StringId},
     modules::dataclasses,
     os_dispatch::{PendingEffect, release_pending_effect},
-    py_value::PyValue,
     resource_checks::check_estimated_size,
     types::{Dict, Instance, PyTrait, Type, instance::class_name},
     value::{EitherStr, VALUE_SIZE, Value},
@@ -362,7 +361,7 @@ impl<'h> VM<'h> {
         let args = args_slot.expect("dispatch_dunder returned None without taking args");
 
         defer_drop!(obj, this);
-        PyValue::new(obj, this).py_call_attr(this, &attr, args)
+        obj.py_value(this).py_call_attr(this, &attr, args)
     }
 
     /// Evaluates a function in a synchronous position that cannot suspend to the host.

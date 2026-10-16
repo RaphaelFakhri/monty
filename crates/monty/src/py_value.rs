@@ -154,30 +154,6 @@ macro_rules! numeric_binary {
 }
 
 impl<'h> PyValue<'h> {
-    /// Copies immediate payloads and opens heap handles without borrowing the owning `Value`.
-    pub(crate) fn new(value: &Value, vm: &VM<'h>) -> Self {
-        match value {
-            Value::InternString(id) => Self::Str(PyStr::Interned(*id)),
-            Value::InternBytes(id) => Self::Bytes(PyBytes::Interned(*id)),
-            Value::Int(value) => Self::Int(PyInt::Small(*value)),
-            Value::InternLongInt(id) => Self::Int(PyInt::Interned(*id)),
-            Value::Ref(id) => vm.heap.read(*id).into(),
-            Value::Undefined => Self::Undefined,
-            Value::Ellipsis => Self::Ellipsis,
-            Value::NotImplemented => Self::NotImplemented,
-            Value::None => Self::None,
-            Value::Bool(value) => Self::Bool(*value),
-            Value::Float(value) => Self::Float(*value),
-            Value::Builtin(value) => Self::Builtin(*value),
-            Value::ModuleFunction(value) => Self::ModuleFunction(*value),
-            Value::DefFunction(id) => Self::DefFunction(*id),
-            Value::Marker(value) => Self::Marker(*value),
-            Value::Property(value) => Self::Property(*value),
-            #[cfg(feature = "memory-model-checks")]
-            Value::Dereferenced => panic!("Cannot access Dereferenced object"),
-        }
-    }
-
     /// Includes the mutating `defaultdict.__missing__` path outside `PyTrait`.
     pub(crate) fn subscript(self, key: &Value, vm: &mut VM<'h>) -> RunResult<Value> {
         match self {

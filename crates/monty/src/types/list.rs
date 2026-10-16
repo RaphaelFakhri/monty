@@ -1,6 +1,5 @@
 use std::{cmp::Ordering, fmt::Write, mem};
 
-use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
@@ -16,6 +15,7 @@ use crate::{
     },
     intern::StaticStrings,
     modules::copy::{Memo, PyDeepCopy, deep_copy},
+    py_value::PyValue,
     resource_checks::{check_repeat_size, check_value_buffer_growth},
     sorting::parse_and_sort,
     types::{
@@ -478,12 +478,9 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, List> {
         defer_drop!(key, vm);
         defer_drop_mut!(value, vm);
 
-        let index = match *key {
-            Value::Int(i) => i,
-            Value::Bool(b) => i64::from(b),
-            _ if let Some(integer) = key.as_long_int(vm) => {
-                integer.to_i64().ok_or_else(ExcType::index_error_int_too_large)?
-            }
+        let index = match key.py_value(vm) {
+            PyValue::Int(integer) => integer.to_i64(vm).ok_or_else(ExcType::index_error_int_too_large)?,
+            PyValue::Bool(value) => i64::from(value),
             _ => {
                 let key_type = key.py_type_name(vm);
                 return Err(ExcType::type_error_indices(Type::List, &key_type));

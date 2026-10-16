@@ -48,9 +48,10 @@ use crate::{
         PendingEffect, PostConversionEffect, Reshaped, release_pending_effect, resolve_call_paths, urandom_reply_error,
     },
     parse::CodeRange,
+    py_value::PyValue,
     run::{Program, SessionTables, VmEnv},
     types::{
-        Dict, LongInt, PyTrait, SessionRandom,
+        Dict, PyTrait, SessionRandom,
         file::{apply_buffer_load, apply_buffer_store, apply_file_next, apply_open_name, apply_write_position},
         random::SEED_BYTES,
         str::allocate_string,
@@ -1476,16 +1477,16 @@ impl<'h> VM<'h> {
                     match value {
                         Value::Int(n) => self.push(Value::Int(!n)),
                         Value::Bool(b) => self.push(Value::Int(!i64::from(b))),
-                        _ if let Some(integer) = value.as_long_int(self) => {
-                            let inverted = !integer;
-                            value.drop_with(self);
-                            let inverted_value = LongInt::new(inverted).into_value(self.heap);
-                            self.push(inverted_value);
-                        }
                         _ => {
-                            let value_type = value.py_type_name(self);
+                            let result = match value.py_value(self) {
+                                PyValue::Int(integer) => Ok(integer.invert(self)),
+                                _ => Err(ExcType::unary_type_error("~", &value.py_type_name(self))),
+                            };
                             value.drop_with(self);
-                            catch!(self, ExcType::unary_type_error("~", &value_type));
+                            match result {
+                                Ok(inverted) => self.push(inverted),
+                                Err(error) => catch!(self, error),
+                            }
                         }
                     }
                 }
