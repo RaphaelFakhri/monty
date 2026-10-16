@@ -493,7 +493,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("loop_mod_13__cpython", |b| run_cpython(b, LOOP_MOD_13, 77));
 
     c.bench_function("reduce__monty", |b| run_monty(b, REDUCE, 49_995_000));
-    #[cfg(not(codspeed))]
+    #[cfg(not(feature = "codspeed"))]
     c.bench_function("reduce__cpython", |b| run_cpython(b, REDUCE, 49_995_000));
 
     c.bench_function("end_to_end__monty", end_to_end_monty);
