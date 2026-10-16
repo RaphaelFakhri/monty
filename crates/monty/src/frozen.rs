@@ -21,7 +21,7 @@ use crate::{
 };
 
 /// Selects a trusted implementation whose ordinary function ID is cached per session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum FrozenFunction {
     /// Suspendable fold loop behind `functools.reduce`.
     FunctoolsReduce,

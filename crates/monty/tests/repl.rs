@@ -829,6 +829,24 @@ fn repl_frozen_functions_are_interned_on_demand() {
     }
 }
 
+/// Both frozen implementations retain a stable serialization order across repeated dump loads.
+#[test]
+fn repl_frozen_function_dump_bytes_are_stable() {
+    let calls = ["functools.reduce(add, [1, 2, 3])", "cached(2, 4)"];
+    for calls in [calls, [calls[1], calls[0]]] {
+        let (mut repl, result) = init_repl(&format!(
+            "import functools\ndef add(a, b):\n    return a + b\ncached = functools.cache(add)\n{}\n{}",
+            calls[0], calls[1]
+        ));
+        assert_eq!(result, MontyObject::int(6));
+        let bytes = dump("repl.py", None, &[], SessionRef::Idle(&repl)).unwrap();
+        for _ in 0..32 {
+            repl = round_trip_repl(&repl);
+            assert_eq!(dump("repl.py", None, &[], SessionRef::Idle(&repl)).unwrap(), bytes);
+        }
+    }
+}
+
 /// Rejecting a first-use frozen frame must discard its provisional code and interned names.
 #[test]
 fn repl_rejected_frozen_admission_keeps_no_products() {

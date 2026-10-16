@@ -22,6 +22,7 @@ mod storage;
 
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeMap,
     mem,
     slice::from_ref,
     str::FromStr,
@@ -2506,8 +2507,8 @@ pub(crate) struct Interns {
     long_ints: Entries<WithHash<BigInt>>,
     /// Boxes keep a mostly empty storage page from reserving hundreds of function bodies.
     functions: Entries<Box<Function>>,
-    /// Lazily compiled interpreter functions, retained with their code in session dumps.
-    frozen_functions: RefCell<AHashMap<FrozenFunction, FunctionId>>,
+    /// Lazily compiled interpreter functions, ordered so dump round trips preserve their bytes.
+    frozen_functions: RefCell<BTreeMap<FrozenFunction, FunctionId>>,
     eval_sources: Entries<Arc<str>>,
     #[serde(skip)]
     string_id_by_name: RefCell<AHashMap<String, StringId>>,
@@ -2532,7 +2533,7 @@ struct InternsWire {
     long_ints: Entries<WithHash<BigInt>>,
     functions: Entries<Box<Function>>,
     #[serde(default)]
-    frozen_functions: RefCell<AHashMap<FrozenFunction, FunctionId>>,
+    frozen_functions: RefCell<BTreeMap<FrozenFunction, FunctionId>>,
     eval_sources: Entries<Arc<str>>,
 }
 
