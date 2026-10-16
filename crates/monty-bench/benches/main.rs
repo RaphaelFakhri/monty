@@ -252,11 +252,6 @@ const FUNC_CALL_KWARGS: &str = include_str!("python/func_call_kwargs.py");
 /// FromArgs binding path against regressions.
 const BUILTIN_ARGS: &str = include_str!("python/builtin_args.py");
 
-/// Mixed list, dict and str method workload, including scanning and allocation.
-/// Kept for continuity with existing measurements; it does not isolate dispatch.
-/// Compare with [`ATTR_DISPATCH_MINIMAL`] to distinguish method costs from dispatch.
-const ATTR_DISPATCH: &str = include_str!("python/attr_dispatch.py");
-
 /// Exercises several attribute names with cheap, non-allocating method bodies:
 /// operations on an empty list, a one-entry dict and a single-character string.
 /// Loop, argument binding, branching and arithmetic remain part of the measurement.
@@ -267,9 +262,6 @@ const LIST_APPEND_STR: &str = include_str!("python/list_append_str.py");
 const LIST_APPEND_INT: &str = include_str!("python/list_append_int.py");
 
 const FIB_25: &str = include_str!("python/fib_25.py");
-
-/// List comprehension benchmark - creates 1000 elements.
-const LIST_COMP: &str = include_str!("python/list_comp.py");
 
 /// Dict comprehension benchmark - creates 500 unique keys (i // 2 deduplicates pairs).
 const DICT_COMP: &str = include_str!("python/dict_comp.py");
@@ -514,7 +506,6 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("end_to_end__cpython", end_to_end_cpython);
 
     c.bench_function("kitchen_sink__monty", |b| run_monty(b, KITCHEN_SINK, 373));
-    c.bench_function("kitchen_sink_limits__monty", |b| run_monty_limits(b, KITCHEN_SINK, 373));
     #[cfg(not(feature = "codspeed"))]
     c.bench_function("kitchen_sink__cpython", |b| run_cpython(b, KITCHEN_SINK, 373));
 
@@ -525,10 +516,6 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("builtin_args__monty", |b| run_monty(b, BUILTIN_ARGS, 60_000));
     #[cfg(not(feature = "codspeed"))]
     c.bench_function("builtin_args__cpython", |b| run_cpython(b, BUILTIN_ARGS, 60_000));
-
-    c.bench_function("attr_dispatch__monty", |b| run_monty(b, ATTR_DISPATCH, 50_715_000));
-    #[cfg(not(feature = "codspeed"))]
-    c.bench_function("attr_dispatch__cpython", |b| run_cpython(b, ATTR_DISPATCH, 50_715_000));
 
     c.bench_function("attr_dispatch_minimal__monty", |b| {
         run_monty(b, ATTR_DISPATCH_MINIMAL, 30_000);
@@ -553,10 +540,6 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("fib__monty", |b| run_monty(b, FIB_25, 75_025));
     #[cfg(not(feature = "codspeed"))]
     c.bench_function("fib__cpython", |b| run_cpython(b, FIB_25, 75_025));
-
-    c.bench_function("list_comp__monty", |b| run_monty(b, LIST_COMP, 1000));
-    #[cfg(not(feature = "codspeed"))]
-    c.bench_function("list_comp__cpython", |b| run_cpython(b, LIST_COMP, 1000));
 
     c.bench_function("dict_comp__monty", |b| run_monty(b, DICT_COMP, 500));
     #[cfg(not(feature = "codspeed"))]
@@ -612,12 +595,12 @@ fn criterion_benchmark(c: &mut Criterion) {
 
     c.bench_function("csv_write__monty", |b| run_monty(b, CSV_WRITE, 265_163));
     c.bench_function("csv_write_limits__monty", |b| run_monty_limits(b, CSV_WRITE, 265_163));
-    #[cfg(not(codspeed))]
+    #[cfg(not(feature = "codspeed"))]
     c.bench_function("csv_write__cpython", |b| run_cpython(b, CSV_WRITE, 265_163));
 
     c.bench_function("csv_read__monty", |b| run_monty(b, CSV_READ, 2_629_450));
     c.bench_function("csv_read_limits__monty", |b| run_monty_limits(b, CSV_READ, 2_629_450));
-    #[cfg(not(codspeed))]
+    #[cfg(not(feature = "codspeed"))]
     c.bench_function("csv_read__cpython", |b| run_cpython(b, CSV_READ, 2_629_450));
 
     c.bench_function("gc_collect__monty", |b| run_monty(b, GC_COLLECT, 0));
@@ -640,10 +623,6 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
     c.bench_function("glob_wildcard__monty", |b| {
         run_monty_mounted(b, GLOB_WILDCARD, tree.path(), MountMode::ReadOnly, 20);
-    });
-    c.bench_function("glob_wildcard_overlay__monty", |b| {
-        let mode = MountMode::OverlayMemory(OverlayState::new());
-        run_monty_mounted(b, GLOB_WILDCARD, tree.path(), mode, 20);
     });
     #[cfg(not(feature = "codspeed"))]
     c.bench_function("glob_wildcard__cpython", |b| {
