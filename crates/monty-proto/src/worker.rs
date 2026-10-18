@@ -597,6 +597,8 @@ impl Child {
                     && !CHECKER_MODULE_NAMES.contains(&name)
                     && !state.asked_modules.iter().any(|asked| asked == name)
             };
+            // TODO(site-packages): resolve modules imported from `.py` files against
+            // the same files the import reads, rather than only host stubs.
             if let Some(first) = imports.modules.iter().find(|module| unasked(&module.name)) {
                 let asked: Vec<String> = imports
                     .modules

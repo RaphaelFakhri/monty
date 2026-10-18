@@ -13,6 +13,7 @@ mod context_manager;
 mod exceptions;
 mod format;
 mod module_cache;
+mod module_finder;
 mod namespace;
 mod pattern;
 mod recursion;
@@ -24,6 +25,8 @@ pub(crate) use attr::PendingLookupEffect;
 pub(crate) use call::CallResult;
 pub(crate) use collections::unpack_exact;
 pub(crate) use module_cache::ModuleCache;
+pub(crate) use module_finder::ImportProbe;
+use module_finder::is_missing_file;
 use monty_types::{InvalidInputError, MontyObject, MontyUuid, OsFunctionCall, PrintWriter, SourceRange};
 pub(crate) use namespace::{FrameNamespace, function_namespace};
 pub(crate) use recursion::{ContainsVM, RecursionToken, RunReentryGuard};
@@ -349,13 +352,14 @@ pub struct CallFrame<'code> {
     /// `cleanup_frame_state`, or taken by `serialize` for a snapshot.
     namespace: Option<Box<FrameNamespace>>,
 
-    /// Whether this frame is a class `__init__` running for `Foo(...)`.
+    /// Whether this frame is a class `__init__` running for `Foo(...)`, or the
+    /// body of a module imported from a file.
     ///
     /// When `true`, the `ReturnValue` handler discards the frame's return value
-    /// (`__init__` returns `None`) and leaves the instance — pushed onto the
-    /// caller's operand stack before this frame was created — as the result of the
-    /// construction. Threaded through serialization (`SerializedFrame`) so a
-    /// suspended initializer resumes correctly.
+    /// (`None`) and leaves the instance or module — pushed onto the caller's
+    /// operand stack before this frame was created — as the result of the
+    /// construction or import. Threaded through serialization (`SerializedFrame`)
+    /// so a suspended initializer resumes correctly.
     is_initializer: bool,
 
     /// Module name for `LoadAttrImport` errors, set by `LoadModule`/`LoadSubmodule`.
@@ -593,7 +597,7 @@ pub struct SerializedFrame {
     #[serde(rename = "C")]
     call_offset: Option<u32>,
 
-    /// Whether this frame is a class `__init__` (see `CallFrame.is_initializer`).
+    /// Whether this frame is a class `__init__` or an imported module body (see `CallFrame.is_initializer`).
     ///
     /// Unlike `should_return`, an initializer frame can legitimately be live
     /// across a suspend (an `__init__` that calls an external/OS function), so it
@@ -2060,7 +2064,9 @@ impl<'h> VM<'h> {
                             let instance = self.pop();
                             return Ok(FrameExit::Return(instance));
                         }
-                        // Instance already on the caller's stack — push nothing.
+                        // Instance (or imported module) already on the caller's
+                        // stack — push nothing.
+                        try_catch!(self, self.finish_module_init());
                     } else if stop {
                         // This frame indicated evaluation should stop - return to host with value
                         // e.g. `evaluate_function`
@@ -2141,14 +2147,15 @@ impl<'h> VM<'h> {
         }
     }
 
-    /// Loads a top-level built-in or suspends with [`OsFunctionCall::Import`].
-    /// The host's value becomes the module; `NotFound` raises `ModuleNotFoundError`.
+    /// Loads a top-level built-in or a cached file module, or suspends with
+    /// [`OsFunctionCall::Import`]: the host's value becomes the module, and a
+    /// host with no such module falls back to a `.py` file (see `module_finder`).
     /// `LoadSubmodule` resolves the remaining dotted components.
     fn load_module(&mut self, module_id: u16) -> CallResult {
         let name_id = StringId::from_index(module_id);
         match self.interns.static_string(name_id).and_then(StandardLib::from_static) {
             Some(module) => CallResult::Value(Value::Ref(module.create(self))),
-            None => CallResult::OsCall(OsFunctionCall::Import(self.interns.get_str(name_id).to_owned())),
+            None => self.import_top_level(self.interns.get_str(name_id)),
         }
     }
 
@@ -2163,6 +2170,8 @@ impl<'h> VM<'h> {
         // Pre-conversion effects reshape the raw host object; a post-conversion
         // effect waits in the slot until the value exists to apply it to.
         let obj = match self.pending_effect.take() {
+            // The file was found: run it as the module.
+            Some(PendingEffect::Import(probe)) => return self.resume_import_found(probe, &obj),
             Some(PendingEffect::Pre(effect)) => match effect.reshape(obj, self) {
                 Ok(Reshaped::Value(obj)) => obj,
                 Ok(Reshaped::Call { call, effect }) => return self.suspend_again(call, effect),
@@ -2267,7 +2276,8 @@ impl<'h> VM<'h> {
             Some(
                 PendingEffect::Post(PostConversionEffect::DiscardResult | PostConversionEffect::SleepResult { .. })
                 | PendingEffect::Pre(_)
-                | PendingEffect::Scan(_),
+                | PendingEffect::Scan(_)
+                | PendingEffect::Import(_),
             )
             | None => Ok(Some(value)),
         };
@@ -2401,6 +2411,9 @@ impl<'h> VM<'h> {
                     };
                 }
                 PendingEffect::Scan(effect) => effect.release(self.heap),
+                // A missing file moves the search on; any other error raises at the import.
+                PendingEffect::Import(probe) if is_missing_file(&error) => return self.resume_import_miss(probe),
+                PendingEffect::Import(_) => {}
                 // Hold no state or heap references — nothing to roll back.
                 PendingEffect::Pre(_)
                 | PendingEffect::Post(

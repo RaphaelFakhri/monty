@@ -890,6 +890,8 @@ impl<'a, 'i> Parser<'a, 'i> {
                     };
                 }
                 // We only support absolute imports (level 0)
+                // TODO(site-packages): relative imports in modules imported from files,
+                // resolved against the importing module's `__package__`.
                 if level != 0 {
                     return Err(ParseError::import_error(
                         "attempted relative import with no known parent package",

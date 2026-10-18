@@ -1664,15 +1664,16 @@ pub(crate) trait ExcTypeExt: Sized {
 
     /// Creates an ImportError for when a name cannot be imported from a module.
     ///
-    /// Matches CPython's format for built-in modules:
+    /// Matches CPython's format, which names the file a module was loaded from:
     /// `ImportError: cannot import name 'name' from 'module' (unknown location)`
     ///
     /// Sets `hide_caret: true` because CPython doesn't show carets for import errors.
     #[must_use]
-    fn cannot_import_name(name: &str, module_name: &str) -> RunError {
+    fn cannot_import_name(name: &str, module_name: &str, origin: Option<&str>) -> RunError {
+        let origin = origin.unwrap_or("unknown location");
         let exc = SimpleException::new_msg(
             ExcType::ImportError,
-            format!("cannot import name '{name}' from '{module_name}' (unknown location)"),
+            format!("cannot import name '{name}' from '{module_name}' ({origin})"),
         );
         RunError::Exc(ExceptionRaise {
             exc,
