@@ -12,6 +12,7 @@ mod compare;
 mod context_manager;
 mod exceptions;
 mod format;
+mod module_cache;
 mod namespace;
 mod pattern;
 mod recursion;
@@ -22,6 +23,7 @@ use std::{borrow::Cow, mem};
 pub(crate) use attr::PendingLookupEffect;
 pub(crate) use call::CallResult;
 pub(crate) use collections::unpack_exact;
+pub(crate) use module_cache::ModuleCache;
 use monty_types::{InvalidInputError, MontyObject, MontyUuid, OsFunctionCall, PrintWriter, SourceRange};
 pub(crate) use namespace::{FrameNamespace, function_namespace};
 pub(crate) use recursion::{ContainsVM, RecursionToken, RunReentryGuard};
@@ -684,16 +686,28 @@ pub struct VMSnapshot {
     cwd: String,
     /// The session's `random` state at the pause.
     random: SessionRandom,
+    /// The session's file modules at the pause.
+    #[serde(default)]
+    modules: ModuleCache,
+}
+
+/// What an abandoned snapshot hands back to its REPL session: the state that
+/// outlives a snippet.
+pub(crate) struct AbandonedState {
+    pub globals: Vec<Value>,
+    pub cwd: String,
+    pub random: SessionRandom,
+    pub modules: ModuleCache,
 }
 
 impl VMSnapshot {
     /// Discards the in-flight execution state of a snapshot that will never be
     /// restored, releasing every heap reference it holds (operand and exception
     /// stacks, scheduler tasks, pending resume effects), and returns the
-    /// globals, working directory and `random` generator so an abandoned REPL
-    /// snippet keeps its namespace, any `os.chdir` it made and any seed it
-    /// set. Mirrors `VM::drop`.
-    pub(crate) fn abandon(self, heap: &mut Heap) -> (Vec<Value>, String, SessionRandom) {
+    /// globals, working directory, `random` generator and file modules so an
+    /// abandoned REPL snippet keeps its namespace, any `os.chdir` it made, any
+    /// seed it set and any module it imported. Mirrors `VM::drop`.
+    pub(crate) fn abandon(self, heap: &mut Heap) -> AbandonedState {
         let Self {
             stack,
             globals,
@@ -704,6 +718,7 @@ impl VMSnapshot {
             pending_lookup_effect,
             cwd,
             random,
+            modules,
             ..
         } = self;
         HeapReader::with(heap, &mut (), |heap, ()| {
@@ -716,7 +731,12 @@ impl VMSnapshot {
             }
             scheduler.cleanup(heap);
         });
-        (globals, cwd, random)
+        AbandonedState {
+            globals,
+            cwd,
+            random,
+            modules,
+        }
     }
 
     /// Number of tasks the scheduler held when this snapshot was taken.
@@ -858,6 +878,9 @@ pub struct VM<'h> {
     /// Preserved across snapshots and REPL feeds, including `random.seed()` changes.
     pub(crate) random: SessionRandom,
 
+    /// Modules imported from files, preserved across snapshots and REPL feeds.
+    pub(crate) modules: ModuleCache,
+
     /// Working directory, `__file__` inputs and the assert-repr cap for this
     /// run. Rebuilt from the executor on restore, except the working
     /// directory, which travels in the snapshot because `os.chdir` may have
@@ -900,6 +923,7 @@ impl<'h> VM<'h> {
             run_reentry_depth: recursion::MAX_RUN_REENTRY_DEPTH,
             re_pattern_cache: RePatternCache::default(),
             random: SessionRandom::default(),
+            modules: ModuleCache::default(),
             env: program.vm_env(),
         }
     }
@@ -973,6 +997,7 @@ impl<'h> VM<'h> {
             run_reentry_depth: recursion::MAX_RUN_REENTRY_DEPTH,
             re_pattern_cache: RePatternCache::default(),
             random: snapshot.random,
+            modules: snapshot.modules,
             env: {
                 let mut env = program.vm_env();
                 env.cwd = Cow::Owned(snapshot.cwd);
@@ -1029,6 +1054,7 @@ impl<'h> VM<'h> {
             // string), so a later `take_changed_cwd` on this VM stays honest.
             cwd: mem::replace(&mut self.env.cwd, Cow::Borrowed(self.env.initial_cwd)).into_owned(),
             random: mem::take(&mut self.random),
+            modules: mem::take(&mut self.modules),
         }
     }
 
@@ -2961,6 +2987,7 @@ impl Drop for VM<'_> {
         self.cleanup_current_task();
         self.scheduler.cleanup(self.heap);
         self.globals.drain(..).drop_with(self.heap);
+        mem::take(&mut self.modules).drop_with(self.heap);
         self.json_string_cache.drop_all(self.heap);
     }
 }
