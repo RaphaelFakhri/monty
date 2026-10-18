@@ -2776,8 +2776,10 @@ impl ExceptionRaise {
                     let sm_idx = if let Some(i) = cache.iter().position(|(k, _)| *k == fname_id) {
                         i
                     } else {
-                        let src =
-                            eval_source.unwrap_or_else(|| source_for(interns.get_filename(fname_id)).unwrap_or(""));
+                        // An imported file also carries its own source, but shows its lines.
+                        let src = eval_source
+                            .or_else(|| interns.file_source(fname_id))
+                            .unwrap_or_else(|| source_for(interns.get_filename(fname_id)).unwrap_or(""));
                         cache.push((fname_id, SourceMap::new(src)));
                         cache.len() - 1
                     };
