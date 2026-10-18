@@ -999,7 +999,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
                 match self {
                     Self::Cell(cell) => Ok(write!(f, "<cell: {} object>", cell.get(vm.heap).0.py_type_name(vm))?),
                     Self::Exception(e) => Ok(e.get(vm.heap).py_repr_fmt(f)?),
-                    Self::Module(m) => Ok(write!(f, "<module '{}'>", m.get(vm.heap).name_str(vm.interns))?),
+                    Self::Module(m) => Ok(f.write_str(&m.get(vm.heap).repr(vm.interns))?),
                     Self::Coroutine(coro) => {
                         let func = vm.interns.get_function(coro.get(vm.heap).func_id);
                         let name = vm.interns.get_str(func.name.name_id);
@@ -1097,6 +1097,9 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
     }
 
     fn py_set_attr(&mut self, name: &EitherStr, value: Value, vm: &mut VM<'h>) -> RunResult<()> {
+        if let Self::Module(module) = self {
+            return module.py_set_attr(name, value, vm);
+        }
         heap_read_output_py_trait_forward!(
             self,
             |item| item.py_set_attr(name, value, vm),
