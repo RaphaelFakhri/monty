@@ -78,8 +78,9 @@ export interface CheckoutOptions {
   /** Global type-checking stubs. Supply module stubs through `ExternalModule.stubs` in `externalModules`. */
   typeCheckStubs?: string
   /**
-   * Importable host modules for every feed of the session (see [`ExternalModules`]); missing
-   * imports raise `ModuleNotFoundError`. The record is read live, each entry validated when a
+   * Importable host modules for every feed of the session (see [`ExternalModules`]); other
+   * imports read `<cwd>/name.py` through the mounts and `os` handler, and raise
+   * `ModuleNotFoundError` without one. The record is read live, each entry validated when a
    * snippet first imports it, so modules may be added later; a factory runs once per session.
    */
   externalModules?: ExternalModules
