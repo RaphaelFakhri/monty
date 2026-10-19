@@ -783,7 +783,15 @@ pub enum Operand<'a> {
     I8(i8),
     /// Single u16 operand, little-endian (e.g. `LoadConst`, `BuildList`).
     U16(u16),
-    /// Relative jump offset encoded as a little-endian i16.
+    /// Absolute jump target. `emit_with_operand` computes the signed i16
+    /// relative offset (`target - (jump_start + 3)`) and writes it to bytecode
+    /// as a little-endian i16. Required for jump opcodes: `Jump`, `JumpIfTrue`,
+    /// `JumpIfFalse`, `JumpIfTrueOrPop`, `JumpIfFalseOrPop`, `ForIter`.
+    ///
+    /// Forward jumps pass `current_offset()` as a self-referential placeholder
+    /// (yielding a -3 relative offset); `patch_jump` overwrites it once the
+    /// real target is known. The placeholder is harmless because `#[must_use]`
+    /// on `JumpLabel` catches the "forgot to patch" case at compile time.
     Offset(RelativeOffset),
     /// Two u8 operands (e.g. `UnpackEx`, `CallBuiltinFunction`).
     U8U8(u8, u8),

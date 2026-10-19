@@ -19,6 +19,17 @@ use crate::{
     value::Value,
 };
 
+/// Suspendable reduce loop over the iterator and accumulator prepared by native setup.
+pub(crate) const REDUCE_SOURCE: &str = r"
+def __monty_functools_reduce(function, iterator, accumulator, next_, stop_iteration):
+    while True:
+        try:
+            item = next_(iterator)
+        except stop_iteration:
+            return accumulator
+        accumulator = function(accumulator, item)
+";
+
 /// `functools` module functions, each a Python-visible callable.
 ///
 /// `partial` is absent because it is exposed as a type object rather than a

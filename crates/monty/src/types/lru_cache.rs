@@ -29,6 +29,14 @@ use crate::{
     value::{EitherStr, Value},
 };
 
+/// Suspendable cache miss that stores a result only after the wrapped call succeeds.
+pub(crate) const CACHE_MISS_SOURCE: &str = r"
+def __monty_cache_miss(store, cache, key, function, args, kwargs):
+    result = function(*args, **kwargs)
+    store(cache, key, result)
+    return result
+";
+
 /// A memoizing wrapper around another callable.
 ///
 /// Owns its callable, keys, and results. Both heap cleanup and cycle tracing
@@ -203,6 +211,27 @@ pub(crate) fn bad_maxsize_error() -> RunError {
     ExcType::type_error("Expected first argument to be an integer, a callable, or None")
 }
 
+/// Private native entry for storing a successful frozen call's result.
+pub(crate) fn call_store(args: ArgValues, vm: &mut VM<'_>) -> RunResult<Value> {
+    let StoreArgs { cache, key, value } = StoreArgs::from_args(args, vm)?;
+    defer_drop!(cache, vm);
+    defer_drop!(value, vm);
+    store_result(cache, key, value, vm)?;
+    Ok(Value::None)
+}
+
+/// Arguments to the private cache insertion primitive.
+#[derive(FromArgs)]
+#[from_args(name = "store")]
+struct StoreArgs {
+    #[from_args(pos_only)]
+    cache: Value,
+    #[from_args(pos_only)]
+    key: Value,
+    #[from_args(pos_only)]
+    value: Value,
+}
+
 /// Hashes a cache key before entering the mutation-aware table probe.
 fn key_hash(key: &Value, vm: &mut VM<'_>) -> RunResult<u64> {
     key.py_hash(vm)?
@@ -212,7 +241,7 @@ fn key_hash(key: &Value, vm: &mut VM<'_>) -> RunResult<u64> {
 
 /// Stores a successful frozen call's result. Consumes the key; borrows the wrapper and value.
 /// Disabled caches deliberately skip hashing and insertion.
-pub(crate) fn store_result(cache: &Value, key: Value, value: &Value, vm: &mut VM<'_>) -> RunResult<()> {
+fn store_result(cache: &Value, key: Value, value: &Value, vm: &mut VM<'_>) -> RunResult<()> {
     let mut key_guard = DropGuard::new(key, vm);
     let (key, vm) = key_guard.as_parts_mut();
     let cache_id = match cache {

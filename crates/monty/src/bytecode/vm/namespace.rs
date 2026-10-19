@@ -363,7 +363,7 @@ impl<'h> VM<'h> {
             .find(|frame| {
                 frame
                     .function_id
-                    .is_none_or(|id| !self.interns.get_function(id).is_internal)
+                    .is_none_or(|id| !self.interns.is_internal_function(id))
             })
             .expect("frozen code has a Python caller")
     }

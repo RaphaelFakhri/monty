@@ -1,4 +1,4 @@
-//! Python implementations of interpreter functions compiled on first use.
+//! Shared compilation and dispatch for internal Python implementations.
 //!
 //! Internal functions use ordinary VM frames and suspension but are hidden from
 //! tracebacks and namespace introspection. Private native helpers arrive as
@@ -8,11 +8,11 @@ use monty_types::CompileOptions;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    args::{ArgValues, FromArgs},
+    args::ArgValues,
     bytecode::{Compiler, VM},
-    defer_drop,
     exception_private::RunResult,
     intern::{CompileInterns, FunctionId, Interns},
+    modules::functools,
     name_map::NameMap,
     parse::parse_with_interner,
     prepare::prepare_with_existing_names,
@@ -20,13 +20,16 @@ use crate::{
     value::Value,
 };
 
-/// Selects a trusted implementation whose ordinary function ID is cached per session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Identifies an internal implementation with one authoritative source definition.
+/// Qualified names persist in dumps; the registry uses compact enum keys at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum FrozenFunction {
-    /// Suspendable fold loop behind `functools.reduce`.
-    FunctoolsReduce,
     /// Store a cached call's result only after it returns successfully.
+    #[serde(rename = "functools._lru_cache_miss")]
     CacheMiss,
+    /// Suspendable fold loop behind `functools.reduce`.
+    #[serde(rename = "functools.reduce")]
+    FunctoolsReduce,
 }
 
 impl FrozenFunction {
@@ -34,7 +37,7 @@ impl FrozenFunction {
     /// The caller must admit the frame before committing the overlay and caching its ID.
     pub(crate) fn compile(self, interns: &Interns) -> RunResult<(FunctionId, CompileInterns<'_>)> {
         let source = self.source();
-        let mut overlay = CompileInterns::for_frozen(interns);
+        let mut overlay = CompileInterns::new(interns);
         let index = overlay.functions_len();
         let mut globals = NameMap::new();
         let nodes =
@@ -52,28 +55,11 @@ impl FrozenFunction {
         Ok((id, overlay))
     }
 
-    /// Self-contained bodies: any global slot would address the user's module.
+    /// Selects one self-contained function; dependencies arrive as arguments, not globals.
     fn source(self) -> &'static str {
         match self {
-            Self::FunctoolsReduce => {
-                r"
-def __monty_functools_reduce(function, iterator, accumulator, next_, stop_iteration):
-    while True:
-        try:
-            item = next_(iterator)
-        except stop_iteration:
-            return accumulator
-        accumulator = function(accumulator, item)
-"
-            }
-            Self::CacheMiss => {
-                r"
-def __monty_cache_miss(store, cache, key, function, args, kwargs):
-    result = function(*args, **kwargs)
-    store(cache, key, result)
-    return result
-"
-            }
+            Self::CacheMiss => lru_cache::CACHE_MISS_SOURCE,
+            Self::FunctoolsReduce => functools::REDUCE_SOURCE,
         }
     }
 }
@@ -90,24 +76,6 @@ pub(crate) enum FrozenFunctions {
 /// Dispatches private helpers using the same argument ownership rules as public natives.
 pub(crate) fn call_helper(function: FrozenFunctions, args: ArgValues, vm: &mut VM<'_>) -> RunResult<Value> {
     match function {
-        FrozenFunctions::Store => {
-            let StoreArgs { cache, key, value } = StoreArgs::from_args(args, vm)?;
-            defer_drop!(cache, vm);
-            defer_drop!(value, vm);
-            lru_cache::store_result(cache, key, value, vm)?;
-            Ok(Value::None)
-        }
+        FrozenFunctions::Store => lru_cache::call_store(args, vm),
     }
-}
-
-/// Arguments to the private cache insertion primitive.
-#[derive(FromArgs)]
-#[from_args(name = "store")]
-struct StoreArgs {
-    #[from_args(pos_only)]
-    cache: Value,
-    #[from_args(pos_only)]
-    key: Value,
-    #[from_args(pos_only)]
-    value: Value,
 }

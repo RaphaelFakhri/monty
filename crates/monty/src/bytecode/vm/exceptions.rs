@@ -28,7 +28,7 @@ impl VM<'_> {
     /// Returns the current function name, or `<module>` outside a function.
     fn current_frame_name(&self) -> StringId {
         match self.current_frame().function_id {
-            Some(function) => self.interns.get_function(function).name.name_id,
+            Some(func_id) => self.interns.get_function(func_id).name.name_id,
             None => self.interns.intern_static(StaticStrings::Module),
         }
     }
@@ -44,7 +44,7 @@ impl VM<'_> {
     fn current_frame_is_frozen(&self) -> bool {
         self.current_frame()
             .function_id
-            .is_some_and(|id| self.interns.get_function(id).is_internal)
+            .is_some_and(|id| self.interns.is_internal_function(id))
     }
 
     /// Attaches initial frame information to an error if it doesn't have any.

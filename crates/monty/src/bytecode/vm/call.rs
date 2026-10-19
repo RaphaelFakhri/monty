@@ -877,7 +877,6 @@ impl<'h> VM<'h> {
         }
         let (args, vm) = args_guard.into_parts();
         let func = interns.get_function(function_id);
-        assert!(func.is_internal);
         assert_eq!(func.signature.exact_positional_count(), Some(N));
         assert!(func.cell_var_slots.is_empty() && func.free_var_slots.is_empty());
         let namespace_size = func.namespace_size;

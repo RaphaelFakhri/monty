@@ -792,8 +792,8 @@ fn repl_progress_dump_load_roundtrip() {
 #[test]
 fn repl_frozen_functions_are_interned_on_demand() {
     let calls = [
-        ("FunctoolsReduce", "functools.reduce(add, [1, 2, 3])"),
-        ("CacheMiss", "cached(2, 4)"),
+        ("functools.reduce", "functools.reduce(add, [1, 2, 3])"),
+        ("functools._lru_cache_miss", "cached(2, 4)"),
     ];
     for calls in [calls, [calls[1], calls[0]]] {
         let (mut repl, _) =
@@ -809,7 +809,6 @@ fn repl_frozen_functions_are_interned_on_demand() {
             let functions = state["interns"]["functions"].as_array().unwrap();
             assert_eq!(functions.len(), index + 2);
             assert_eq!(functions[0], before["interns"]["functions"][0]);
-            assert_eq!(functions[index + 1]["I"], true);
             assert_eq!(state["interns"]["frozen_functions"][name], index + 1);
             assert_eq!(
                 state["interns"]["frozen_functions"].as_object().unwrap().len(),
@@ -826,6 +825,18 @@ fn repl_frozen_functions_are_interned_on_demand() {
                 state["interns"]["frozen_functions"]
             );
         }
+    }
+}
+
+/// Restored registry entries identify implementation frames without function-local markers.
+#[test]
+fn repl_frozen_namespace_selection_survives_dumps() {
+    let (mut repl, _) = init_repl(
+        "import functools\ncached_locals = functools.cache(locals)\ndef check():\n    marker = 42\n    assert cached_locals() == {'marker': 42}\n    assert functools.reduce(eval, ['marker', None]) == 42\ncheck()",
+    );
+    for _ in 0..2 {
+        repl = round_trip_repl(&repl);
+        feed_run_print(&mut repl, "cached_locals.cache_clear()\ncheck()").unwrap();
     }
 }
 
