@@ -9,15 +9,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     args::ArgValues,
-    bytecode::{Compiler, VM},
+    builtins::next,
+    bytecode::{CallResult, Compiler, VM},
     exception_private::RunResult,
     intern::{CompileInterns, FunctionId, Interns},
     modules::functools,
     name_map::NameMap,
     parse::parse_with_interner,
     prepare::prepare_with_existing_names,
-    types::lru_cache,
-    value::Value,
+    types::{iter, lru_cache},
 };
 
 /// Identifies an internal implementation with one authoritative source definition.
@@ -30,6 +30,12 @@ pub(crate) enum FrozenFunction {
     /// Suspendable fold loop behind `functools.reduce`.
     #[serde(rename = "functools.reduce")]
     FunctoolsReduce,
+    /// Validate the result of a suspendable user `__iter__` method.
+    #[serde(rename = "builtins.iter")]
+    Iter,
+    /// Return a default when a suspendable user `__next__` method is exhausted.
+    #[serde(rename = "builtins.next_default")]
+    NextDefault,
 }
 
 impl FrozenFunction {
@@ -60,6 +66,8 @@ impl FrozenFunction {
         match self {
             Self::CacheMiss => lru_cache::CACHE_MISS_SOURCE,
             Self::FunctoolsReduce => functools::REDUCE_SOURCE,
+            Self::Iter => iter::ITER_SOURCE,
+            Self::NextDefault => next::NEXT_DEFAULT_SOURCE,
         }
     }
 }
@@ -69,13 +77,19 @@ impl FrozenFunction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, strum::Display)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum FrozenFunctions {
+    /// Call a user `__iter__` without validating its result yet.
+    GetIter,
     /// Insert a successful result into a cache wrapper.
     Store,
+    /// Check the result returned by a user `__iter__` method.
+    ValidateIterator,
 }
 
 /// Dispatches private helpers using the same argument ownership rules as public natives.
-pub(crate) fn call_helper(function: FrozenFunctions, args: ArgValues, vm: &mut VM<'_>) -> RunResult<Value> {
+pub(crate) fn call_helper(function: FrozenFunctions, args: ArgValues, vm: &mut VM<'_>) -> RunResult<CallResult> {
     match function {
-        FrozenFunctions::Store => lru_cache::call_store(args, vm),
+        FrozenFunctions::GetIter => iter::call_get_iter(args, vm),
+        FrozenFunctions::Store => lru_cache::call_store(args, vm).map(CallResult::Value),
+        FrozenFunctions::ValidateIterator => iter::call_validate_iterator(args, vm).map(CallResult::Value),
     }
 }

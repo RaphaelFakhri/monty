@@ -93,6 +93,19 @@ pub(crate) struct BoundMethod {
     pub func: Value,
 }
 
+impl<'h> HeapObjectRead<'h, Instance> {
+    /// Advances a user iterator through class-only lookup without imposing a synchronous boundary.
+    pub(crate) fn call_next(&self, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        let class_id = self.get(vm.heap).class();
+        if let Some(member) = class_member(class_id, "__next__", vm) {
+            defer_drop!(member, vm);
+            call_member_bound(member, self.id(), ArgValues::Empty, vm)
+        } else {
+            Err(ExcType::type_error_not_iterator(&self.py_type_name(vm)))
+        }
+    }
+}
+
 impl<'h> HeapRead<'h, Instance> {
     /// Allocates an instance of the same class as this one, with no attributes
     /// and without calling `__init__` — taking a counted reference to the class.
@@ -412,35 +425,18 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Instance> {
         class_defines(self.get(vm.heap).class, "__next__", vm)
     }
 
-    /// Dispatches the class's `__iter__` and returns its result unchanged.
-    ///
-    /// No wrapper is interposed, so a self-iterator satisfies `iter(obj) is obj`
-    /// exactly as in CPython. The result must itself be an iterator, mirroring
-    /// `PyObject_GetIter`'s `PyIter_Check` — raising here rather than deferring
-    /// the failure to the first `next()`.
-    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
-        // `py_is_iterable` is the single source of truth for "does this class
-        // iterate", so an opted-out `__iter__ = None` reports not-iterable here
-        // instead of reaching the call and raising "'NoneType' object is not
-        // callable" — CPython's `slot_tp_iter` rejects it the same way.
-        let dispatched = if self.py_is_iterable(vm) {
-            instance_call_dunder_sync(self.id(), "__iter__", None, vm)?
+    /// Dispatches class-only `__iter__`; `Value::py_iter` validates the eventual result.
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        let class_id = self.get(vm.heap).class();
+        if let Some(member) = class_member(class_id, "__iter__", vm) {
+            defer_drop!(member, vm);
+            if matches!(member, Value::None) {
+                Err(ExcType::type_error_not_iterable(&self.py_type_name(vm)))
+            } else {
+                call_member_bound(member, self.id(), ArgValues::Empty, vm)
+            }
         } else {
-            None
-        };
-        let Some(iterator) = dispatched else {
-            return Err(ExcType::type_error_not_iterable(&class_name(
-                instance_class(self.id(), vm),
-                vm.heap,
-                vm.interns,
-            )));
-        };
-        if iterator.py_is_iterator(vm) {
-            Ok(iterator)
-        } else {
-            let err = ExcType::type_error_iter_returned_non_iterator(&iterator.py_type_name(vm));
-            iterator.drop_with(vm);
-            Err(err)
+            Err(ExcType::type_error_not_iterable(&self.py_type_name(vm)))
         }
     }
 
@@ -449,15 +445,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Instance> {
     /// Every other exception propagates, including an `UncatchableExc` from a
     /// resource limit — see [`RunError::is_stop_iteration`].
     fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
-        // The absent case doubles as the not-an-iterator check, halving the
-        // lookups — this runs for every item of every user iterator.
-        match instance_call_dunder_sync(self.id(), "__next__", None, vm) {
-            Ok(Some(value)) => Ok(Some(value)),
-            Ok(None) => Err(ExcType::type_error_not_iterator(&class_name(
-                instance_class(self.id(), vm),
-                vm.heap,
-                vm.interns,
-            ))),
+        match self.call_next(vm).and_then(|call| call.require_synchronous(vm)) {
+            Ok(value) => Ok(Some(value)),
             Err(e) if e.is_stop_iteration() => Ok(None),
             Err(e) => Err(e),
         }
@@ -720,7 +709,7 @@ fn call_dunder_args_sync(
 ) -> RunResult<Option<Value>> {
     let class_id = instance_class(self_id, vm);
     if let Some(func) = class_member(class_id, dunder, vm) {
-        call_dunder_member(self_id, dunder, func, args, vm).map(Some)
+        call_dunder_member(self_id, func, args, vm).map(Some)
     } else {
         args.drop_with(vm);
         Ok(None)
@@ -776,20 +765,12 @@ pub(crate) fn instance_call_copy_hook(
             arg.drop_with(vm);
             Ok(None)
         }
-        Some(func) => {
-            call_dunder_member(self_id, dunder, func, arg.map_or(ArgValues::Empty, ArgValues::One), vm).map(Some)
-        }
+        Some(func) => call_dunder_member(self_id, func, arg.map_or(ArgValues::Empty, ArgValues::One), vm).map(Some),
     }
 }
 
 /// Invokes an already-looked-up dunder member, whose reference it takes.
-fn call_dunder_member(
-    self_id: HeapId,
-    dunder: &'static str,
-    func: Value,
-    args: ArgValues,
-    vm: &mut VM<'_>,
-) -> RunResult<Value> {
+fn call_dunder_member(self_id: HeapId, func: Value, args: ArgValues, vm: &mut VM<'_>) -> RunResult<Value> {
     defer_drop!(func, vm);
     // Only a plain function binds `self` as a descriptor (CPython's method
     // lookup protocol, mirrored by `call_member_bound`); an already-bound
@@ -800,7 +781,7 @@ fn call_dunder_member(
     } else {
         args
     };
-    vm.evaluate_function(dunder, func, args)
+    vm.evaluate_function(func, args)
 }
 
 /// Whether `self_id` is an instance whose class has an `__iter__` member —
@@ -954,7 +935,7 @@ pub(crate) fn class_name<'i>(class_id: HeapId, heap: &Heap, interns: &'i Interns
 /// Calls a class member with CPython's descriptor-binding semantics: a
 /// plain user-defined function binds `self` (prepended to `args`), while any
 /// other callable value is called as-is. Shared by `py_call_attr` and the
-/// context-manager hooks (`py_enter`/`py_exit`) so dunder invocation and
+/// context-manager and iterator hooks so special-method invocation and
 /// ordinary method calls dispatch identically.
 fn call_member_bound(member: &Value, self_id: HeapId, args: ArgValues, vm: &mut VM<'_>) -> RunResult<CallResult> {
     if is_method_value(member, vm) {

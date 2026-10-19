@@ -20,7 +20,7 @@ assert functools.reduce(lambda a, b: (a, b), [1, 2, 3]) == ((1, 2), 3)
 assert functools.reduce(lambda a, b: a + [b], [1, 2], []) == [1, 2]
 
 
-# native setup and the frozen loop share the same iterator
+# Acquisition happens exactly once, with or without an initial accumulator.
 class Iterator:
     def __init__(self):
         self.iter_calls = 0
@@ -59,10 +59,16 @@ except StopIteration as exc:
 # The frozen loop uses the actual builtins, not user globals.
 original_stop_iteration = StopIteration
 original_next = next
+original_iter = iter
+original_type_error = TypeError
 next = None
+iter = None
+TypeError = None
 StopIteration = ValueError
 assert functools.reduce(lambda a, b: a + b, [1, 2, 3]) == 6
 StopIteration = original_stop_iteration
+TypeError = original_type_error
+iter = original_iter
 next = original_next
 
 
@@ -82,6 +88,45 @@ try:
     assert False, 'expected reduce to fail'
 except TypeError as exc:
     assert str(exc) == 'reduce() of empty iterable with no initial value'
+
+
+# === Acquisition errors are rewritten, advancement errors are not ===
+class FailingIterable:
+    def __init__(self, during_acquisition, error):
+        self.during_acquisition = during_acquisition
+        self.error = error
+
+    def __iter__(self):
+        if self.during_acquisition:
+            raise self.error
+        return self
+
+    def __next__(self):
+        raise self.error
+
+
+for during_acquisition in [True, False]:
+    for error in [TypeError('protocol type error'), ValueError('protocol value error')]:
+        for initial in [(), (None,)]:
+            try:
+                functools.reduce(lambda a, b: a, FailingIterable(during_acquisition, error), *initial)
+                assert False, 'expected the iterator protocol to fail'
+            except Exception as exc:
+                assert type(exc) is type(error)
+                expected = (
+                    'reduce() arg 2 must support iteration'
+                    if during_acquisition and isinstance(error, TypeError)
+                    else str(error)
+                )
+                assert str(exc) == expected
+
+try:
+    functools.reduce(lambda a, b: a, FailingIterable(True, StopIteration('acquisition stopped')))
+    assert False, 'expected acquisition StopIteration to propagate'
+except StopIteration as exc:
+    assert str(exc) == 'acquisition stopped'
+
+assert functools.reduce(lambda a, b: a, FailingIterable(False, StopIteration('done')), None) is None
 
 # the callable is never checked up front, so an empty iterable wins
 try:

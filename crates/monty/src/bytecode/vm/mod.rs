@@ -22,6 +22,7 @@ use std::{borrow::Cow, mem};
 pub(crate) use attr::PendingLookupEffect;
 pub(crate) use call::CallResult;
 pub(crate) use collections::unpack_exact;
+use exceptions::CaughtException;
 use monty_types::{InvalidInputError, MontyObject, MontyUuid, OsFunctionCall, PrintWriter, SourceRange};
 pub(crate) use namespace::{FrameNamespace, function_namespace};
 pub(crate) use recursion::{ContainsVM, RecursionToken, RunReentryGuard};
@@ -663,7 +664,7 @@ pub struct VMSnapshot {
     /// When entering an except handler, the exception is pushed onto this stack.
     /// When exiting via `ClearException`, the top is popped. This allows nested
     /// except handlers to restore the outer exception context.
-    exception_stack: Vec<Value>,
+    exception_stack: Vec<CaughtException>,
 
     /// IP of the instruction that caused the pause (for exception handling).
     instruction_ip: usize,
@@ -778,7 +779,7 @@ pub struct VM<'h> {
     /// When entering an except handler, the exception is pushed onto this stack.
     /// When exiting via `ClearException`, the top is popped. This allows nested
     /// except handlers to restore the outer exception context.
-    exception_stack: Vec<Value>,
+    exception_stack: Vec<CaughtException>,
 
     /// IP of the instruction being executed (for exception table lookup).
     ///
@@ -1703,7 +1704,7 @@ impl<'h> VM<'h> {
                 // Iteration - route through exception handling
                 Opcode::GetIter => {
                     let value = self.pop();
-                    let iterator = value.py_iter(self);
+                    let iterator = value.py_iter(self).and_then(|call| call.require_synchronous(self));
                     value.drop_with(self);
                     match iterator {
                         Ok(iterator) => self.push(iterator),
@@ -1764,10 +1765,7 @@ impl<'h> VM<'h> {
                     let (type_id, arg_count) = self.current_frame.fetch_u8_u8();
                     let arg_count = arg_count as usize;
 
-                    match self.exec_call_builtin_type(type_id, arg_count) {
-                        Ok(result) => self.push(result),
-                        Err(err) => catch!(self, err),
-                    }
+                    handle_call_result!(self, self.exec_call_builtin_type(type_id, arg_count));
                 }
                 Opcode::CallFunctionKw => {
                     // Fetch operands: pos_count, kw_count, then kw_count name indices
@@ -1936,14 +1934,7 @@ impl<'h> VM<'h> {
                 Opcode::Reraise => {
                     // Clone rather than pop: a locally caught bare raise must
                     // preserve its enclosing handler's active exception.
-                    let raised = self.exception_stack.last().map(|exc| exc.clone_with_heap(self.heap));
-                    let error = match &raised {
-                        Some(exc) => self.make_exception(exc, true), // is_raise=true for reraise
-                        // No active exception - create a RuntimeError
-                        None => {
-                            SimpleException::new_msg(ExcType::RuntimeError, "No active exception to reraise").into()
-                        }
-                    };
+                    let (error, raised) = self.reraise_exception();
                     if let Some(result) = self.handle_exception_with_value(error, raised) {
                         return Err(result);
                     }

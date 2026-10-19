@@ -1131,7 +1131,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
         )
     }
 
-    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<CallResult> {
         match self {
             Self::Str(value) => value.py_iter(vm),
             Self::Bytes(value) => value.py_iter(vm),

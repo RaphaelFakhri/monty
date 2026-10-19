@@ -275,7 +275,7 @@ impl ModuleFunctions {
             Self::Binascii(functions) => binascii::call(vm, functions, args).map(CallResult::Value),
             Self::Random(functions) => random::call(vm, functions, args),
             Self::Copy(functions) => copy::call(vm, functions, args).map(CallResult::Value),
-            Self::Frozen(functions) => frozen::call_helper(functions, args, vm).map(CallResult::Value),
+            Self::Frozen(functions) => frozen::call_helper(functions, args, vm),
             Self::Time(functions) => time::call(vm, functions, args),
             Self::Hashlib(functions) => hashlib::call(vm, functions, args).map(CallResult::Value),
             Self::Bisect(functions) => bisect::call(vm, functions, args).map(CallResult::Value),

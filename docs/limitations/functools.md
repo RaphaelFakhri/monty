@@ -22,6 +22,10 @@ These names are absent from the module namespace rather than stubbed, so they ar
 
 ## Behavioural divergences
 
+- `reduce()` consumes an extra recursion frame for the fold, including acquisition and empty-input handling.
+    User iterator methods can suspend, but native iterator adaptors retain their
+    [synchronous callback restrictions](iter.md).
+
 - **Calling a `partial` charges the native re-entry budget.** A partial stored as a class attribute binds as a bound
     method whose `__func__` is another partial, so a chain of them nests on the interpreter's own call stack without
     pushing a Python frame. Monty bounds that chain at the fixed native re-entry depth (see
@@ -30,15 +34,19 @@ These names are absent from the module namespace rather than stubbed, so they ar
     levels; CPython runs such a chain into the thousands before its own C stack gives out. Ordinary use is unaffected —
     nested `partial(partial(f, 1), 2)` is flattened at construction, and a partial passed to `map()` or `sorted(key=)`
     costs one level.
+
 - **`partial` objects have no `__dict__`.** CPython allows arbitrary attributes on one (`p.x = 1`), which Monty rejects
     with `AttributeError: 'functools.partial' object has no attribute 'x' and no __dict__ for setting new attributes`.
     Assigning to `func`, `args` or `keywords` fails in both, but CPython words it `AttributeError: readonly attribute`.
+
 - **`args` and `keywords` are rebuilt on each access.** `p.args is p.args` is `False`, where CPython returns the same
     objects every time.
     Mutating the dict from `p.keywords` therefore has no effect on what the partial passes on; CPython returns the live
     dict, so mutating it changes later calls.
+
 - **`partial` objects carry no dunder attributes.** `p.__call__` and `p.__doc__` both raise `AttributeError`, where
     CPython has a method-wrapper and the type's docstring respectively.
+
 - **A `partial` crossing the host boundary marshals as its `repr`.** Python and JavaScript hosts receive
     `MontyObject::repr("functools.partial(...)")` rather than a callable, since neither side can call back into a value
     that only exists inside the sandbox.

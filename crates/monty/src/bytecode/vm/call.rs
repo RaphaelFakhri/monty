@@ -40,6 +40,7 @@ pub(crate) enum CallResult {
     /// Call completed synchronously with a return value.
     Value(Value),
     /// A defined function became the VM's current frame.
+    /// Propagate or require synchronous completion; dropping this result does not pop the frame.
     FramePushed,
     /// External function call requested - VM should pause and return to caller.
     /// The `EitherStr` is the name of the external function (interned or heap-owned).
@@ -101,6 +102,60 @@ pub(crate) enum CallResult {
         call: OsFunctionCall,
         effect: PendingEffect,
     },
+}
+
+impl CallResult {
+    /// Completes a call at a Rust boundary that cannot yield to the host.
+    /// Python frames still run; unsupported suspensions are raised inside them and cleaned up.
+    /// Consume immediately after dispatch, before running any of the installed frame's bytecode.
+    pub(crate) fn require_synchronous(self, vm: &mut VM<'_>) -> RunResult<Value> {
+        if matches!(self, Self::FramePushed) {
+            if let Err(error) = vm.enter_run_reentry() {
+                // Dispatch already installed this frame, but it has not executed an instruction.
+                let instruction_ip = vm.instruction_ip;
+                vm.pop_frame();
+                vm.instruction_ip = instruction_ip;
+                return Err(error.into());
+            }
+            let mut guard = RunReentryGuard::new(vm);
+            self.finish_synchronously(&mut guard)
+        } else {
+            self.finish_synchronously(vm)
+        }
+    }
+
+    /// Runs under the caller's native re-entry reservation when a frame needs execution.
+    fn finish_synchronously(self, vm: &mut VM<'_>) -> RunResult<Value> {
+        match self {
+            Self::Value(value) => Ok(value),
+            // With no host to answer, `hasattr` and `getattr` see an undefined attribute.
+            Self::AttrLookup {
+                effect: Some(effect), ..
+            } => Ok(effect.apply(None, vm)),
+            Self::FramePushed => {
+                // Stop both normal returns and exception unwinding before the Rust caller's frame.
+                vm.current_frame_mut().should_return = true;
+                loop {
+                    match vm.run()? {
+                        FrameExit::Return(value) => return Ok(value),
+                        FrameExit::AttrLookup {
+                            effect: Some(effect), ..
+                        } => {
+                            let value = effect.apply(None, vm);
+                            vm.push(value);
+                        }
+                        exit => {
+                            let error = vm.unsupported_frame_exit(exit);
+                            if let Some(error) = vm.handle_exception(error) {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+            }
+            unsupported => Err(vm.unsupported_call_result(unsupported)),
+        }
+    }
 }
 
 impl<C: ContainsHeap> DropWithContext<C> for CallResult {
@@ -171,7 +226,7 @@ impl<'h> VM<'h> {
     ///
     /// Calls a builtin type constructor directly without stack manipulation for the callable.
     /// This is an optimization for type constructors like `list()`, `int()`, `str()`.
-    pub(super) fn exec_call_builtin_type(&mut self, type_id: u8, arg_count: usize) -> Result<Value, RunError> {
+    pub(super) fn exec_call_builtin_type(&mut self, type_id: u8, arg_count: usize) -> Result<CallResult, RunError> {
         // Convert u8 to Type via callable_from_u8
         if let Some(t) = Type::callable_from_u8(type_id) {
             let args = self.pop_n_args(arg_count);
@@ -406,12 +461,7 @@ impl<'h> VM<'h> {
     /// re-entry is bounded via [`enter_run_reentry`](Self::enter_run_reentry)
     /// at entry — before `call_function`, since a class-valued `__init__` can
     /// recurse back in without ever pushing a frame.
-    pub(crate) fn evaluate_function(
-        &mut self,
-        ctx: &'static str,
-        callable: &Value,
-        args: ArgValues,
-    ) -> Result<Value, RunError> {
+    pub(crate) fn evaluate_function(&mut self, callable: &Value, args: ArgValues) -> Result<Value, RunError> {
         if let Err(e) = self.enter_run_reentry() {
             // Bailing before `call_function` takes ownership of `args`, so
             // reclaim its refcounts here.
@@ -421,66 +471,22 @@ impl<'h> VM<'h> {
         let mut guard = RunReentryGuard::new(self);
         let this = &mut *guard;
 
-        match this.call_function(callable, args)? {
-            CallResult::Value(v) => Ok(v),
-            // No host can answer inside a synchronous call, so the lookup is
-            // `Undefined`: `hasattr()` is False, `getattr()` yields its default.
-            CallResult::AttrLookup {
-                effect: Some(effect), ..
-            } => Ok(effect.apply(None, this)),
-            CallResult::FramePushed => {
-                // A new frame was pushed for a defined function call - we need to run it
-                // to completion.
-                // Mark the frame as an exit point from the `run()` loop
-                this.current_frame_mut().should_return = true;
-                loop {
-                    match this.run()? {
-                        FrameExit::Return(v) => return Ok(v),
-                        // As above: the callee's `hasattr()` / `getattr()`
-                        // sees `Undefined` and continues.
-                        FrameExit::AttrLookup {
-                            effect: Some(effect), ..
-                        } => {
-                            let value = effect.apply(None, this);
-                            this.push(value);
-                        }
-                        exit => {
-                            // Raise unsupported suspensions inside the callee so its
-                            // exception handlers can observe them.
-                            let error = this.unsupported_frame_exit(ctx, exit);
-                            // The `should_return` frame stops unwinding before an
-                            // outer handler can consume this error.
-                            if let Some(error) = this.handle_exception(error) {
-                                return Err(error);
-                            }
-                        }
-                    }
-                }
-            }
-            unsupported => Err(this.unsupported_call_result(ctx, unsupported)),
-        }
+        this.call_function(callable, args)?.finish_synchronously(this)
     }
 
     /// Converts a direct call suspension into a specific synchronous-context error.
     #[cold]
-    fn unsupported_call_result(&mut self, ctx: &'static str, result: CallResult) -> RunError {
+    fn unsupported_call_result(&mut self, result: CallResult) -> RunError {
         let error = match &result {
-            CallResult::External(function_name, _) => ExcType::not_implemented(format!(
-                "{ctx}: external function '{}' is not yet supported in this context",
-                function_name.as_str(self.interns)
-            )),
-            CallResult::OsCall(function_call) => ExcType::not_implemented(format!(
-                "{ctx}: OS function '{}' is not yet supported in this context",
-                function_call.name()
-            )),
-            CallResult::OsCallWithEffect { call, .. } => ExcType::not_implemented(format!(
-                "{ctx}: OS function '{}' is not yet supported in this context",
-                call.name()
-            )),
-            CallResult::MethodCall { name, .. } => ExcType::not_implemented(format!(
-                "{ctx}: method call '{}' is not yet supported in this context",
-                name.as_str(self.interns)
-            )),
+            CallResult::External(function_name, _) => {
+                ExcType::not_implemented_synchronous_call("external function", function_name.as_str(self.interns))
+            }
+            CallResult::OsCall(call) | CallResult::OsCallWithEffect { call, .. } => {
+                ExcType::not_implemented_synchronous_call("OS function", call.name())
+            }
+            CallResult::MethodCall { name, .. } => {
+                ExcType::not_implemented_synchronous_call("method call", name.as_str(self.interns))
+            }
             // A lazy attribute lookup cannot suspend in a synchronous nested
             // context; report the attribute as missing rather than a
             // NotImplementedError, matching what an unanswered lookup raises
@@ -499,9 +505,7 @@ impl<'h> VM<'h> {
                 result.drop_with(self);
                 return error;
             }
-            CallResult::AwaitValue(_) => {
-                ExcType::not_implemented(format!("{ctx}: awaiting a value is not yet supported in this context"))
-            }
+            CallResult::AwaitValue(_) => ExcType::not_implemented("cannot await a value in this synchronous context"),
             CallResult::Value(_) | CallResult::FramePushed => unreachable!("completed calls are handled above"),
         };
         result.drop_with(self);
@@ -510,21 +514,18 @@ impl<'h> VM<'h> {
 
     /// Converts a nested VM suspension into a specific synchronous-context error.
     #[cold]
-    pub(crate) fn unsupported_frame_exit(&mut self, ctx: &'static str, exit: FrameExit) -> RunError {
+    pub(crate) fn unsupported_frame_exit(&mut self, exit: FrameExit) -> RunError {
         let error = match &exit {
             FrameExit::Return(_) => unreachable!("return exits are handled above"),
-            FrameExit::ExternalCall { function_name, .. } => ExcType::not_implemented(format!(
-                "{ctx}: external function '{}' is not yet supported in this context",
-                function_name.as_str(self.interns)
-            )),
-            FrameExit::OsCall { function_call, .. } => ExcType::not_implemented(format!(
-                "{ctx}: OS function '{}' is not yet supported in this context",
-                function_call.name()
-            )),
-            FrameExit::MethodCall { method_name, .. } => ExcType::not_implemented(format!(
-                "{ctx}: method call '{}' is not yet supported in this context",
-                method_name.as_str(self.interns)
-            )),
+            FrameExit::ExternalCall { function_name, .. } => {
+                ExcType::not_implemented_synchronous_call("external function", function_name.as_str(self.interns))
+            }
+            FrameExit::OsCall { function_call, .. } => {
+                ExcType::not_implemented_synchronous_call("OS function", function_call.name())
+            }
+            FrameExit::MethodCall { method_name, .. } => {
+                ExcType::not_implemented_synchronous_call("method call", method_name.as_str(self.interns))
+            }
             // Same as the `CallResult::AttrLookup` arm above.
             FrameExit::AttrLookup {
                 name,
@@ -540,9 +541,9 @@ impl<'h> VM<'h> {
                 exit.drop_with(self);
                 return error;
             }
-            FrameExit::ResolveFutures(_) => ExcType::not_implemented(format!(
-                "{ctx}: resolving async futures is not yet supported in this context"
-            )),
+            FrameExit::ResolveFutures(_) => {
+                ExcType::not_implemented("cannot resolve async futures in this synchronous context")
+            }
             FrameExit::NameLookup { name_id, .. } => ExcType::name_error(self.interns.get_str(*name_id)),
         };
         exit.drop_with(self);
@@ -1154,7 +1155,7 @@ impl<'h> VM<'h> {
                     // Exotic `__init__` (builtin, class, `async def`, non-callable,
                     // ...): run to completion synchronously — no pending instance is
                     // pushed — and enforce CPython's `None`-return contract.
-                    match this.evaluate_function("__init__", init_func, init_args) {
+                    match this.evaluate_function(init_func, init_args) {
                         Ok(Value::None) => Ok(CallResult::Value(Value::Ref(instance_id))),
                         Ok(result) => {
                             let type_name = result.py_type_name(this);

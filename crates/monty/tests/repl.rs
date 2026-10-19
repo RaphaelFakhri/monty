@@ -5,7 +5,7 @@
 
 use std::fmt::Write;
 
-use insta::assert_snapshot;
+use insta::{allow_duplicates, assert_snapshot};
 use monty::{
     DUMP_VERSION, Dump, DumpError, MIN_SUPPORTED_DUMP_VERSION, MontyRepl, ReplContinuationMode, ReplProgress,
     ReplStartError, Session, SessionRef, detect_repl_continuation_mode, dump,
@@ -840,14 +840,19 @@ fn repl_frozen_namespace_selection_survives_dumps() {
     }
 }
 
-/// Both frozen implementations retain a stable serialization order across repeated dump loads.
+/// Frozen implementations retain a stable serialization order across repeated dump loads.
 #[test]
 fn repl_frozen_function_dump_bytes_are_stable() {
-    let calls = ["functools.reduce(add, [1, 2, 3])", "cached(2, 4)"];
-    for calls in [calls, [calls[1], calls[0]]] {
+    let calls = [
+        "functools.reduce(add, [1, 2, 3])",
+        "cached(2, 4)",
+        "next(iter(source))",
+        "next(source, 0)",
+    ];
+    for calls in [calls, [calls[3], calls[2], calls[1], calls[0]]] {
         let (mut repl, result) = init_repl(&format!(
-            "import functools\ndef add(a, b):\n    return a + b\ncached = functools.cache(add)\n{}\n{}",
-            calls[0], calls[1]
+            "import functools\ndef add(a, b):\n    return a + b\ncached = functools.cache(add)\nclass Source:\n    def __iter__(self):\n        return self\n    def __next__(self):\n        return 6\nsource = Source()\n{}",
+            calls.join("\n")
         ));
         assert_eq!(result, MontyObject::int(6));
         let bytes = dump("repl.py", None, &[], SessionRef::Idle(&repl)).unwrap();
@@ -861,9 +866,14 @@ fn repl_frozen_function_dump_bytes_are_stable() {
 /// Rejecting a first-use frozen frame must discard its provisional code and interned names.
 #[test]
 fn repl_rejected_frozen_admission_keeps_no_products() {
-    for call in ["functools.reduce(add, [1, 2, 3])", "cached(2, 4)"] {
+    for call in [
+        "functools.reduce(add, [1, 2, 3])",
+        "cached(2, 4)",
+        "next(iter(source))",
+        "next(source, 0)",
+    ] {
         let (mut repl, _) = init_repl(&format!(
-            "import functools\ndef add(a, b):\n    return a + b\ncached = functools.cache(add)\ndef attempt():\n    try:\n        {call}\n    except RecursionError as exc:\n        return str(exc)"
+            "import functools\ndef add(a, b):\n    return a + b\ncached = functools.cache(add)\nclass Source:\n    def __iter__(self):\n        return self\n    def __next__(self):\n        return 6\nsource = Source()\ndef attempt():\n    try:\n        {call}\n    except RecursionError as exc:\n        return str(exc)"
         ));
         *repl.tracker_mut() = ResourceTracker::new(ResourceLimits::default().max_recursion_depth(1));
         let before = to_value(&repl).unwrap();
@@ -938,6 +948,412 @@ fn repl_frozen_reduce_survives_incremental_compilation_and_dumps() {
             MontyObject::int(24)
         );
     }
+}
+
+/// A user iterator with observable acquisition, advancement, and reducer calls.
+const SUSPENDABLE_ITERATOR: &str = r"
+import functools
+
+class Source:
+    def __init__(self):
+        self.iter_calls = 0
+        self.next_calls = 0
+
+    def __iter__(self):
+        self.iter_calls += 1
+        ext_fn('iter')
+        return self
+
+    def __next__(self):
+        self.next_calls += 1
+        ext_fn('next', self.next_calls)
+        if self.next_calls > 3:
+            raise StopIteration('done')
+        return self.next_calls
+
+def combine(a, b):
+    ext_fn('reduce', a, b)
+    return a + b
+
+source = Source()
+";
+
+/// Direct builtin opcodes and indirect calls both retain validation and defaults across dumps.
+#[test]
+fn repl_frozen_iteration_survives_dumps() {
+    for (get_iter, get_next) in [("iter", "next"), ("get_iter", "get_next")] {
+        let (mut repl, _) = init_repl(SUSPENDABLE_ITERATOR);
+        feed_run_print(&mut repl, "get_iter = iter\nget_next = next").unwrap();
+        let code = format!(
+            "iterator = {get_iter}(source)\nassert iterator is source\nend = []\nvalues = [{get_next}(iterator), {get_next}(iterator, end), {get_next}(iterator), {get_next}(iterator, end)]\nassert values[3] is end\n(values[:3], source.iter_calls, source.next_calls)"
+        );
+        let progress = repl.feed_start(&code, vec![], PrintWriter::Disabled).unwrap();
+        let (repl, value) = resume_iteration_events(
+            progress,
+            [
+                ("iter", vec![]),
+                ("next", vec![1]),
+                ("next", vec![2]),
+                ("next", vec![3]),
+                ("next", vec![4]),
+            ],
+        );
+        assert_eq!(
+            value,
+            MontyObject::tuple([
+                MontyObject::list([MontyObject::int(1), MontyObject::int(2), MontyObject::int(3)]),
+                MontyObject::int(1),
+                MontyObject::int(4),
+            ])
+        );
+        let mut repl = round_trip_repl(&repl);
+        assert_eq!(
+            feed_run_print(&mut repl, "next(iter([42]), None)").unwrap(),
+            MontyObject::int(42)
+        );
+    }
+}
+
+/// Reduce can suspend during acquisition, initial seeding, later advancement, and callbacks.
+#[test]
+fn repl_frozen_reduce_iterator_survives_dumps() {
+    for initial in [None, Some(10)] {
+        let (repl, _) = init_repl(SUSPENDABLE_ITERATOR);
+        let code = if let Some(initial) = initial {
+            format!("functools.reduce(combine, source, {initial})")
+        } else {
+            "functools.reduce(combine, source)".to_owned()
+        };
+        let mut events = vec![("iter", vec![])];
+        let mut accumulator = initial;
+        for item in 1..=4 {
+            events.push(("next", vec![item]));
+            if item <= 3 {
+                accumulator = Some(if let Some(accumulator) = accumulator {
+                    events.push(("reduce", vec![accumulator, item]));
+                    accumulator + item
+                } else {
+                    item
+                });
+            }
+        }
+        let progress = repl.feed_start(&code, vec![], PrintWriter::Disabled).unwrap();
+        let (mut repl, value) = resume_iteration_events(progress, events);
+        assert_eq!(value, MontyObject::int(initial.unwrap_or(0) + 6));
+        assert_eq!(
+            feed_run_print(&mut repl, "source.iter_calls").unwrap(),
+            MontyObject::int(1)
+        );
+        assert_eq!(
+            feed_run_print(&mut repl, "source.next_calls").unwrap(),
+            MontyObject::int(4)
+        );
+    }
+}
+
+/// Every pending call owns ordinary frame locals that can be abandoned or unwound after restoring.
+#[test]
+fn repl_frozen_iteration_failure_and_abandonment() {
+    let mut errors = Vec::new();
+    for expression in [
+        "iter(source)",
+        "next(source, ['fallback'])",
+        "functools.reduce(combine, source)",
+    ] {
+        let (repl, _) = init_repl(SUSPENDABLE_ITERATOR);
+        let progress = repl.feed_start(expression, vec![], PrintWriter::Disabled).unwrap();
+        let loaded = round_trip_progress(&progress);
+        let mut repl = progress.into_repl();
+        assert_eq!(feed_run_print(&mut repl, "1 + 2").unwrap(), MontyObject::int(3));
+
+        let error = loaded
+            .into_function_call()
+            .unwrap()
+            .resume(
+                ExtFunctionResult::Error(MontyException::new(ExcType::ValueError, Some("host failed".to_owned()))),
+                PrintWriter::Disabled,
+            )
+            .unwrap_err();
+        errors.push(error.error.to_string());
+        let mut repl = error.repl;
+        assert_eq!(feed_run_print(&mut repl, "1 + 2").unwrap(), MontyObject::int(3));
+    }
+    assert_snapshot!(errors.join("\n\n"), @r#"
+    Traceback (most recent call last):
+      File "<python-input-1>", line 1, in <module>
+        iter(source)
+        ~~~~~~~~~~~~
+      File "<python-input-0>", line 11, in __iter__
+        ext_fn('iter')
+        ~~~~~~~~~~~~~~
+    ValueError: host failed
+
+    Traceback (most recent call last):
+      File "<python-input-1>", line 1, in <module>
+        next(source, ['fallback'])
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~
+      File "<python-input-0>", line 16, in __next__
+        ext_fn('next', self.next_calls)
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ValueError: host failed
+
+    Traceback (most recent call last):
+      File "<python-input-1>", line 1, in <module>
+        functools.reduce(combine, source)
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+      File "<python-input-0>", line 11, in __iter__
+        ext_fn('iter')
+        ~~~~~~~~~~~~~~
+    ValueError: host failed
+    "#);
+}
+
+/// Host errors after suspension preserve the narrow acquisition and exhaustion handlers.
+#[test]
+fn repl_frozen_iteration_host_errors() {
+    let mut errors = Vec::new();
+    for (expression, response) in [
+        (
+            "iter(Broken())",
+            ExtFunctionResult::Return(MontyObject::list([MontyObject::int(1)])),
+        ),
+        (
+            "next(Broken())",
+            ExtFunctionResult::Error(MontyException::new(
+                ExcType::StopIteration,
+                Some("host stopped".to_owned()),
+            )),
+        ),
+        (
+            "next(Broken(), ['fallback'])",
+            ExtFunctionResult::Error(MontyException::new(
+                ExcType::TypeError,
+                Some("advance failed".to_owned()),
+            )),
+        ),
+        (
+            "functools.reduce(ext_fn, Broken())",
+            ExtFunctionResult::Error(MontyException::new(
+                ExcType::TypeError,
+                Some("acquisition failed".to_owned()),
+            )),
+        ),
+        (
+            "functools.reduce(ext_fn, [1, 2])",
+            ExtFunctionResult::Error(MontyException::new(
+                ExcType::StopIteration,
+                Some("callback stopped".to_owned()),
+            )),
+        ),
+    ] {
+        let (repl, _) = init_repl(
+            "import functools\nclass Broken:\n    def __iter__(self):\n        return ext_fn()\n    def __next__(self):\n        return ext_fn()",
+        );
+        let progress = repl
+            .feed_start(
+                expression,
+                vec![("ext_fn".to_owned(), MontyObject::function("ext_fn", None))],
+                PrintWriter::Disabled,
+            )
+            .unwrap();
+        let loaded = round_trip_progress(&progress);
+        drop(progress.into_repl());
+        let error = loaded
+            .into_function_call()
+            .unwrap()
+            .resume(response, PrintWriter::Disabled)
+            .unwrap_err();
+        errors.push(error.error.to_string());
+        let mut repl = error.repl;
+        assert_eq!(
+            feed_run_print(&mut repl, "list([1, 2])").unwrap(),
+            MontyObject::list([MontyObject::int(1), MontyObject::int(2)])
+        );
+    }
+    assert_snapshot!(errors.join("\n\n"), @r#"
+    Traceback (most recent call last):
+      File "<python-input-1>", line 1, in <module>
+        iter(Broken())
+        ~~~~~~~~~~~~~~
+    TypeError: iter() returned non-iterator of type 'list'
+
+    Traceback (most recent call last):
+      File "<python-input-1>", line 1, in <module>
+        next(Broken())
+        ~~~~~~~~~~~~~~
+      File "<python-input-0>", line 6, in __next__
+        return ext_fn()
+               ~~~~~~~~
+    StopIteration: host stopped
+
+    Traceback (most recent call last):
+      File "<python-input-1>", line 1, in <module>
+        next(Broken(), ['fallback'])
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+      File "<python-input-0>", line 6, in __next__
+        return ext_fn()
+               ~~~~~~~~
+    TypeError: advance failed
+
+    Traceback (most recent call last):
+      File "<python-input-1>", line 1, in <module>
+        functools.reduce(ext_fn, Broken())
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    TypeError: reduce() arg 2 must support iteration
+
+    Traceback (most recent call last):
+      File "<python-input-1>", line 1, in <module>
+        functools.reduce(ext_fn, [1, 2])
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    StopIteration: callback stopped
+    "#);
+
+    let (mut repl, _) = init_repl("end = ['fallback']");
+    repl.feed_run(
+        "class Iterator:\n    __next__ = ext_fn",
+        vec![("ext_fn".to_owned(), MontyObject::function("ext_fn", None))],
+        PrintWriter::Disabled,
+    )
+    .unwrap();
+    let progress = repl
+        .feed_start("next(Iterator(), end) is end", vec![], PrintWriter::Disabled)
+        .unwrap();
+    let call = progress.into_function_call().unwrap();
+    let progress = call
+        .resume(
+            ExtFunctionResult::Error(MontyException::new(ExcType::StopIteration, None)),
+            PrintWriter::Disabled,
+        )
+        .unwrap();
+    let (_, value) = progress.into_complete().unwrap();
+    assert_eq!(value, MontyObject::bool(true));
+}
+
+/// First and later advances distinguish host exhaustion from errors, with either initial-value form.
+#[test]
+fn repl_frozen_reduce_host_exhaustion() {
+    for initial in [None, Some(10)] {
+        for items in 0..=2 {
+            for error_type in [ExcType::StopIteration, ExcType::TypeError] {
+                let (repl, _) = init_repl(
+                    "import functools\nclass Source:\n    def __iter__(self):\n        return self\n    def __next__(self):\n        return ext_fn()",
+                );
+                let expression = if let Some(initial) = initial {
+                    format!("functools.reduce(max, Source(), {initial})")
+                } else {
+                    "functools.reduce(max, Source())".to_owned()
+                };
+                let mut progress = repl.feed_start(&expression, vec![], PrintWriter::Disabled).unwrap();
+                for item in 1..=items {
+                    let call = progress.into_function_call().unwrap();
+                    progress = call.resume(MontyObject::int(item), PrintWriter::Disabled).unwrap();
+                }
+                let loaded = round_trip_progress(&progress);
+                drop(progress.into_repl());
+                let result = loaded.into_function_call().unwrap().resume(
+                    ExtFunctionResult::Error(MontyException::new(error_type, Some("advance failed".to_owned()))),
+                    PrintWriter::Disabled,
+                );
+                let mut repl = if error_type == ExcType::StopIteration && (initial.is_some() || items > 0) {
+                    let (repl, value) = result.unwrap().into_complete().unwrap();
+                    assert_eq!(value, MontyObject::int(initial.unwrap_or(items)));
+                    repl
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.error.exc_type(), ExcType::TypeError);
+                    allow_duplicates! {
+                        if error_type == ExcType::StopIteration {
+                            assert_snapshot!(error.error.message().unwrap(), @"reduce() of empty iterable with no initial value");
+                        } else {
+                            assert_snapshot!(error.error.message().unwrap(), @"advance failed");
+                        }
+                    }
+                    error.repl
+                };
+                assert_eq!(feed_run_print(&mut repl, "1 + 2").unwrap(), MontyObject::int(3));
+            }
+        }
+    }
+}
+
+/// OS suspensions in user protocol methods preserve their conversion effects through dumps.
+#[test]
+fn repl_frozen_iteration_os_calls() {
+    let (repl, _) = init_repl(
+        r"
+from pathlib import Path
+class Iterator:
+    def __init__(self):
+        self.done = False
+    def __iter__(self):
+        assert Path('/iter').exists()
+        return self
+    def __next__(self):
+        if self.done:
+            raise StopIteration
+        self.done = True
+        return Path('/next').exists()
+",
+    );
+    let mut progress = repl
+        .feed_start(
+            "it = iter(Iterator())\n(next(it, None), next(it, None))",
+            vec![],
+            PrintWriter::Disabled,
+        )
+        .unwrap();
+    for path in ["/iter", "/next"] {
+        let loaded = round_trip_progress(&progress);
+        drop(progress.into_repl());
+        let ReplProgress::OsCall(call) = loaded else {
+            panic!("expected an OS call")
+        };
+        assert_eq!(call.function_call.name(), "Path.exists");
+        assert_eq!(
+            call.function_call.clone().to_args().args().collect::<Vec<_>>(),
+            vec![MontyObject::path(path)]
+        );
+        progress = call.resume(MontyObject::bool(true), PrintWriter::Disabled).unwrap();
+    }
+    let (_, value) = progress.into_complete().unwrap();
+    assert_eq!(
+        value,
+        MontyObject::tuple([MontyObject::bool(true), MontyObject::none()])
+    );
+}
+
+/// Native iterators need no continuation frame, even when the caller has spent its frame budget.
+#[test]
+fn repl_native_iteration_needs_no_additional_frame() {
+    let (mut repl, _) = init_repl(
+        "def consume():\n    it = iter([42])\n    assert next(it) == 42\n    assert next(it, None) is None\n    return 42",
+    );
+    *repl.tracker_mut() = ResourceTracker::new(ResourceLimits::default().max_recursion_depth(1));
+    assert_eq!(feed_run_print(&mut repl, "consume()").unwrap(), MontyObject::int(42));
+    assert!(
+        to_value(&repl).unwrap()["interns"]["frozen_functions"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Restores each suspension and discards its original before answering the expected host call.
+fn resume_iteration_events(
+    mut progress: ReplProgress,
+    events: impl IntoIterator<Item = (&'static str, Vec<i64>)>,
+) -> (MontyRepl, MontyObject) {
+    for (stage, args) in events {
+        let loaded = round_trip_progress(&progress);
+        drop(progress.into_repl());
+        let call = loaded.into_function_call().expect("expected iterator or reducer call");
+        assert_eq!(call.function_name, "ext_fn");
+        let mut expected = vec![MontyObject::string(stage)];
+        expected.extend(args.into_iter().map(MontyObject::int));
+        assert_eq!(call.args.args().collect::<Vec<_>>(), expected);
+        progress = call.resume(MontyObject::none(), PrintWriter::Disabled).unwrap();
+    }
+    progress.into_complete().expect("expected completed iteration")
 }
 
 /// Directly cached host calls retain their pending store through idle and running dumps.
@@ -2272,7 +2688,7 @@ fn call_function_that_calls_undefined_name_fails() {
       File "<python-input-0>", line 1, in call_missing
         def call_missing(): return unknown_func()
                                    ~~~~~~~~~~~~~~
-    NotImplementedError: MontyRepl::call_function: external function 'unknown_func' is not yet supported in this context
+    NotImplementedError: external function 'unknown_func' cannot suspend in this synchronous context
     "#);
 }
 

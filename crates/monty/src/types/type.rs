@@ -4,7 +4,7 @@ use num_bigint::BigInt;
 
 use crate::{
     args::{ArgValues, FromArgs, is_long_int},
-    builtins::{Builtins, BuiltinsFunctions, object_setattr::builtin_object_setattr},
+    builtins::{Builtins, BuiltinsFunctions, iter::builtin_iter, object_setattr::builtin_object_setattr},
     bytecode::{CallResult, VM},
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
@@ -765,9 +765,17 @@ impl Type {
 
     /// Calls this type as a constructor (e.g., `list(x)`, `int(x)`).
     ///
-    /// Dispatches to the appropriate type's init method for container types,
-    /// or handles primitive type conversions inline.
-    pub(crate) fn call(self, vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+    /// Iterator acquisition may suspend in user code; other constructors complete natively.
+    pub(crate) fn call(self, vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult> {
+        if self == Self::Iterator {
+            builtin_iter(vm, args)
+        } else {
+            self.call_native(vm, args).map(CallResult::Value)
+        }
+    }
+
+    /// Dispatches constructors which do not yield, including primitive conversions.
+    fn call_native(self, vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
         match self {
             // Container types - delegate to init methods
             Self::List => List::init(vm, args),
@@ -787,7 +795,6 @@ impl Type {
             Self::Time => time::init(vm, args),
             Self::TimeDelta => timedelta::init(vm, args),
             Self::TimeZone => TimeZone::init(vm, args),
-            Self::Iterator => super::iter::init(vm, args),
             Self::Path => Path::init(vm, args),
             Self::Partial => Partial::init(vm, args),
             Self::Random => Random::init(vm, args),

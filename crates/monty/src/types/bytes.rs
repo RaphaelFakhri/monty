@@ -302,8 +302,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Bytes> {
         Type::Bytes
     }
 
-    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
-        Ok(BytesIterator::from_heap(self.id(), vm))
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        Ok(CallResult::Value(BytesIterator::from_heap(self.id(), vm)))
     }
 
     fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
@@ -2028,7 +2028,7 @@ fn bytes_join<'h>(separator: &HeapRead<'h, [u8]>, iterable: Value, vm: &mut VM<'
         iterable.drop_with(vm);
         return Err(ExcType::type_error_join_not_iterable());
     }
-    let iter = iterable.into_py_iter(vm)?;
+    let iter = iterable.into_py_iter(vm)?.require_synchronous(vm)?;
     defer_drop!(iter, vm);
     let mut iter = iter.read(vm);
 
@@ -2401,8 +2401,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, BytesIterator> {
         Ok(None)
     }
 
-    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
-        Ok(self.clone_value(vm.heap))
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        Ok(CallResult::Value(self.clone_value(vm.heap)))
     }
 
     fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {

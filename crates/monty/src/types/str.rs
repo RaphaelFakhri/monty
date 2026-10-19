@@ -263,12 +263,12 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Str> {
         Type::Str
     }
 
-    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
-        Ok(StringIterator::from_heap(
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        Ok(CallResult::Value(StringIterator::from_heap(
             self.id(),
             self.get(vm.heap).as_str().is_ascii(),
             vm,
-        ))
+        )))
     }
 
     fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
@@ -569,7 +569,7 @@ fn str_join<'h>(separator: &HeapRead<'h, str>, iterable: Value, vm: &mut VM<'h>)
         iterable.drop_with(vm);
         return Err(ExcType::type_error_join_not_iterable());
     }
-    let iter = iterable.into_py_iter(vm)?;
+    let iter = iterable.into_py_iter(vm)?.require_synchronous(vm)?;
     defer_drop!(iter, vm);
     let mut iter = iter.read(vm);
 
@@ -1955,8 +1955,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, StringIterator> {
         Ok(None)
     }
 
-    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
-        Ok(self.clone_value(vm.heap))
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        Ok(CallResult::Value(self.clone_value(vm.heap)))
     }
 
     fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
