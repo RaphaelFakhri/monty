@@ -412,13 +412,17 @@ impl<'h> PyTrait<'h> for PyValue<'h> {
     fn py_pow_impl(&self, other: &Value, modulus: Option<&Value>, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         logical_forward!(self, |value| value.py_pow_impl(other, modulus, vm), {
             Self::Bool(value) => PyInt::Small(i64::from(*value)).py_pow_impl(other, modulus, vm),
-            Self::Float(value) if modulus.is_none() => float_binary(*value, other, vm, false, |base, exp| float_pow_value(base, exp, vm.heap)),
+            Self::Float(_) if modulus.is_some() => Err(ExcType::type_error_pow_modulo()),
+            Self::Float(value) => float_binary(*value, other, vm, false, |base, exp| float_pow_value(base, exp, vm.heap)),
             _ => Ok(None),
         })
     }
 
     fn py_rpow_impl(&self, other: &Value, modulus: Option<&Value>, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
-        logical_forward!(self, |value| value.py_rpow_impl(other, modulus, vm), else Ok(None))
+        logical_forward!(self, |value| value.py_rpow_impl(other, modulus, vm), {
+            Self::Float(_) if modulus.is_some() => Err(ExcType::type_error_pow_modulo()),
+            _ => Ok(None),
+        })
     }
 
     fn py_and_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
