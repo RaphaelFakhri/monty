@@ -89,7 +89,8 @@ Containers a program grows one element at a time are pre-checked as well, at the
 rather than on every push: `list.append` and `list.insert`, `deque.append` and `deque.appendleft`, `set.add`, and
 assigning a new dict key.
 So are the value buffers a single call fills: the argument pack behind `f(*args)`, the array `json.loads` parses, the
-pieces `re.split` collects, and the list `re.findall` builds for a pattern with at most one capture group.
+text `json.dumps` and `json.dump` build, the pieces `re.split` collects, and the list `re.findall` builds for a pattern
+with at most one capture group.
 A wider `findall`, and `re.finditer`, allocate an object per match and are not covered — see
 [the limitations note](limitations/resource_limits.md).
 
@@ -219,6 +220,8 @@ caps the dump's, so a worker cannot report a looser one.
 - **Mount memory.** Each [mount](filesystem.md) has its own `memory_usage_limit`, defaulting to [`DEFAULT_MEMORY_USAGE_LIMIT`](api/rust/monty-fs.md#default_memory_usage_limit), shared between
     retained overlay data and transient results.
 - **`json.loads` nesting**, capped at 200 levels independently of the recursion limit.
+- **`tomllib` nesting**, capped at 100 levels of inline arrays and tables, and at 1,000 parts per dotted key,
+    both independently of `max_recursion_depth` (see [tomllib.md](limitations/tomllib.md)).
 - **Host entropy.** Python's `AbstractOS.urandom()` raises `MemoryError` before allocating when a request exceeds
     `max_urandom_bytes`, 1 MiB by default (`OSAccess(max_urandom_bytes=...)`).
     A custom entropy callback allocates in the host process, so it must apply its own cap.

@@ -5,6 +5,7 @@
 import functools
 import hashlib
 import sys
+import tomllib
 from typing import TypedDict, assert_type
 
 
@@ -138,6 +139,9 @@ def loop_over_dict_items(mapping: dict[str, int]) -> None:
 print(sys.missing)
 hashlib.file_digest
 hashlib.sha256('text')
+tomllib.loads(b'a = 1')
+tomllib.load('pyproject.toml')
+tomllib.loads('a = 1', parse_float=float)
 
 
 # The cached-wrapper stub names its `cache_info()` return type the way typeshed

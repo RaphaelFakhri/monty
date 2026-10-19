@@ -1,4 +1,6 @@
-# run-async
+# /// monty
+# run-async = true
+# ///
 # Caching an `async def` stores the coroutine the call returns, not the value it
 # resolves to, so the second call hands back a coroutine that has already been
 # awaited. CPython behaves the same way; this is the footgun the `functools`

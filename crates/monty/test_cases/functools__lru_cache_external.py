@@ -1,4 +1,6 @@
-# call-external
+# /// monty
+# call-external = true
+# ///
 # A cached function is run as an ordinary frame, so it may suspend to the host
 # part-way through and still store its result on the way back — the counters
 # below only add up if the pending store survives the suspension.

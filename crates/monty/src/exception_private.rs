@@ -1036,6 +1036,26 @@ pub(crate) trait ExcTypeExt: Sized {
         .into()
     }
 
+    /// `ValueError: mapping pattern checks duplicate key (<repr>)`: two keys of
+    /// one mapping pattern compared equal at run time (`case {A: x, B: y}` with
+    /// `A == B`), as CPython's `MATCH_KEYS` reports it.
+    fn value_error_duplicate_mapping_key(key: &Value, vm: &mut VM<'_>) -> RunError {
+        let repr = match key.py_repr(vm) {
+            Ok(repr_value) => {
+                defer_drop!(repr_value, vm);
+                repr_value
+                    .to_str(vm)
+                    .map_or_else(|_| format!("<{}>", key.py_type_name(vm)), str::to_owned)
+            }
+            Err(err) => return err,
+        };
+        SimpleException::new_msg(
+            ExcType::ValueError,
+            format!("mapping pattern checks duplicate key ({repr})"),
+        )
+        .into()
+    }
+
     /// Creates a generic `ValueError` with a custom message.
     fn value_error(msg: impl fmt::Display) -> RunError {
         SimpleException::new_msg(ExcType::ValueError, msg).into()
@@ -1095,6 +1115,18 @@ pub(crate) trait ExcTypeExt: Sized {
     #[must_use]
     fn type_error_not_callable(type_: &str) -> RunError {
         SimpleException::new_msg(ExcType::TypeError, format!("cannot create '{type_}' instances")).into()
+    }
+
+    /// Creates a TypeError for repeating a sequence by a non-integer count.
+    ///
+    /// Matches CPython's format: `TypeError: can't multiply sequence by non-int of type '{type}'`
+    #[must_use]
+    fn type_error_multiply_sequence(type_: &str) -> RunError {
+        SimpleException::new_msg(
+            ExcType::TypeError,
+            format!("can't multiply sequence by non-int of type '{type_}'"),
+        )
+        .into()
     }
 
     /// Creates a TypeError for calling a non-callable object.
@@ -1804,6 +1836,12 @@ pub(crate) trait ExcTypeExt: Sized {
         SimpleException::new_msg(ExcType::TypeError, message).into()
     }
 
+    /// Float power slots reject a modulus before coercing the other operands.
+    #[must_use]
+    fn type_error_pow_modulo() -> RunError {
+        Self::type_error("pow() 3rd argument not allowed unless all arguments are integers")
+    }
+
     /// Creates a TypeError for unsupported unary operations.
     ///
     /// Uses CPython's format: `bad operand type for unary {op}: '{type}'`
@@ -2238,6 +2276,46 @@ pub(crate) trait ExcTypeExt: Sized {
             format!("{message}: line {line} column {column} (char {index})"),
         )
         .with_data(JsonErrorData::build(message, doc, index, line, column))
+        .into()
+    }
+
+    /// Creates a `tomllib.TOMLDecodeError`, formatted as CPython does:
+    /// `{message} (at line {line}, column {column})`, or `(at end of document)`
+    /// when `at_end` (the caller knows from the byte offset whether `index`
+    /// reached the end of `doc`, so the document is not rescanned).
+    ///
+    /// `doc` is the `\r\n`-normalised source and `index` a character offset into
+    /// it; the five fields travel in the same [`JsonErrorData`] payload as
+    /// `json.JSONDecodeError`, since the two exceptions define the same attributes.
+    #[must_use]
+    fn toml_decode_error(message: &str, doc: &str, index: usize, line: usize, column: usize, at_end: bool) -> RunError {
+        let location = if at_end {
+            "end of document".to_owned()
+        } else {
+            format!("line {line}, column {column}")
+        };
+        SimpleException::new_msg(ExcType::TomlDecodeError, format!("{message} (at {location})"))
+            .with_data(JsonErrorData::build(message, doc.as_bytes(), index, line, column))
+            .into()
+    }
+
+    /// Creates the `TypeError` used by `tomllib.loads()` for non-`str` input.
+    ///
+    /// Matches CPython's format: `Expected str object, not '{type}'`
+    #[must_use]
+    fn toml_loads_type_error(type_: &str) -> RunError {
+        SimpleException::new_msg(ExcType::TypeError, format!("Expected str object, not '{type_}'")).into()
+    }
+
+    /// Creates the `TypeError` used by `tomllib.load()` for a text-mode file.
+    ///
+    /// Matches CPython's message: ``File must be opened in binary mode, e.g. use `open('foo.toml', 'rb')` ``
+    #[must_use]
+    fn toml_load_text_mode_error() -> RunError {
+        SimpleException::new_msg(
+            ExcType::TypeError,
+            "File must be opened in binary mode, e.g. use `open('foo.toml', 'rb')`",
+        )
         .into()
     }
 

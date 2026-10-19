@@ -187,7 +187,7 @@ fn decorate(maxsize: Option<u64>, typed: bool, args: ArgValues, vm: &mut VM<'_>)
 /// Allocates a wrapper, taking ownership of `func` and rejecting one that
 /// cannot be called. `None` allocates the decorator stage.
 pub(crate) fn allocate(func: Option<Value>, maxsize: Option<u64>, typed: bool, vm: &mut VM<'_>) -> RunResult<Value> {
-    if func.as_ref().is_none_or(|func| func.is_callable(vm.heap)) {
+    if func.as_ref().is_none_or(|func| func.is_callable(vm)) {
         let cache = LruCache::new(func, maxsize, typed);
         Ok(Value::Ref(vm.heap.allocate(HeapData::LruCache(Box::new(cache)))))
     } else {

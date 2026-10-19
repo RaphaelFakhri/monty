@@ -37,6 +37,7 @@ pub(crate) mod random;
 pub(crate) mod re;
 pub(crate) mod sys;
 pub(crate) mod time;
+pub(crate) mod tomllib;
 pub(crate) mod typing;
 pub(crate) mod unicodedata;
 
@@ -95,6 +96,8 @@ pub(crate) enum StandardLib {
     /// The `csv` module: readers, writers, `DictReader` / `DictWriter` and the
     /// built-in dialects.
     Csv,
+    /// The `tomllib` module: `loads()`, `load()` and `TOMLDecodeError`.
+    Tomllib,
     /// The `gc` module exposing a single `collect()` for tests. Only present
     /// under the `test-hooks` feature so production sandboxes never see it.
     ///
@@ -129,6 +132,7 @@ impl StandardLib {
             StaticStrings::Hashlib => Some(Self::Hashlib),
             StaticStrings::Bisect => Some(Self::Bisect),
             StaticStrings::Csv => Some(Self::Csv),
+            StaticStrings::Tomllib => Some(Self::Tomllib),
             #[cfg(feature = "test-hooks")]
             StaticStrings::Gc => Some(Self::Gc),
             _ => None,
@@ -169,6 +173,7 @@ impl StandardLib {
             Self::Hashlib => hashlib::create_module(vm),
             Self::Bisect => bisect::create_module(vm),
             Self::Csv => csv::create_module(vm),
+            Self::Tomllib => tomllib::create_module(vm),
             #[cfg(feature = "test-hooks")]
             Self::Gc => gc::create_module(vm),
         }
@@ -202,6 +207,7 @@ pub(crate) enum ModuleFunctions {
     Hashlib(hashlib::HashlibFunctions),
     Bisect(bisect::BisectFunctions),
     Csv(csv::CsvFunctions),
+    Tomllib(tomllib::TomllibFunctions),
     /// `gc` module functions — only present under the `test-hooks` feature.
     /// See [`gc`] for why it is gated; as in [`StandardLib`], the gated block
     /// goes last and new variants are appended ahead of it.
@@ -238,6 +244,7 @@ impl fmt::Display for ModuleFunctions {
             Self::Hashlib(func) => write!(f, "{func}"),
             Self::Bisect(func) => write!(f, "{func}"),
             Self::Csv(func) => write!(f, "{func}"),
+            Self::Tomllib(func) => write!(f, "{func}"),
             #[cfg(feature = "test-hooks")]
             Self::Gc(func) => write!(f, "{func}"),
             #[cfg(feature = "test-hooks")]
@@ -255,7 +262,7 @@ impl ModuleFunctions {
         match self {
             Self::Asyncio(functions) => asyncio::call(vm, functions, args),
             Self::Collections(functions) => collections::call(vm, functions, args).map(CallResult::Value),
-            Self::Json(functions) => json::call(vm, functions, args).map(CallResult::Value),
+            Self::Json(functions) => json::call(vm, functions, args),
             Self::Math(functions) => math::call(vm, functions, args).map(CallResult::Value),
             Self::Os(functions) => os::call(vm, functions, args),
             Self::OsPath(functions) => os_path::call(vm, functions, args),
@@ -273,6 +280,7 @@ impl ModuleFunctions {
             Self::Hashlib(functions) => hashlib::call(vm, functions, args).map(CallResult::Value),
             Self::Bisect(functions) => bisect::call(vm, functions, args).map(CallResult::Value),
             Self::Csv(functions) => csv::call(vm, functions, args),
+            Self::Tomllib(functions) => tomllib::call(vm, functions, args),
             #[cfg(feature = "test-hooks")]
             Self::Gc(functions) => gc::call(vm, functions, args).map(CallResult::Value),
             #[cfg(feature = "test-hooks")]

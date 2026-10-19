@@ -15,6 +15,7 @@ members = [
     "crates/monty-datatest",
     "crates/monty-doctest",
     "crates/monty-bench",
+    "crates/monty-fixture",
     "crates/monty-type-checking",
     "crates/monty-typeshed",
     "crates/monty-macros",
@@ -24,7 +25,7 @@ default-members = ["crates/monty-runtime"]
 
 [workspace.package]
 edition = "2024"
-version = "1.1.0"
+version = "1.2.0"
 rust-version = "1.96"
 license = "MIT"
 authors = ["Samuel Colvin <samuel@pydantic.dev>"]
@@ -60,15 +61,15 @@ strip = false
 # rejects path-only dependencies). These versions MUST be kept in lockstep with
 # `workspace.package.version` above and bumped together on each release — see
 # RELEASING.md.
-monty = { path = "crates/monty", version = "1.1.0" }
-monty-types = { path = "crates/monty-types", version = "1.1.0" }
-monty-alloc = { path = "crates/monty-alloc", version = "1.1.0" }
-monty-fs = { path = "crates/monty-fs", version = "1.1.0" }
-monty-macros = { path = "crates/monty-macros", version = "1.1.0" }
-monty-proto = { path = "crates/monty-proto", version = "1.1.0" }
-monty-pool = { path = "crates/monty-pool", version = "1.1.0" }
-monty-type-checking = { path = "crates/monty-type-checking", version = "1.1.0" }
-monty-typeshed = { path = "crates/monty-typeshed", version = "1.1.0" }
+monty = { path = "crates/monty", version = "1.2.0" }
+monty-types = { path = "crates/monty-types", version = "1.2.0" }
+monty-alloc = { path = "crates/monty-alloc", version = "1.2.0" }
+monty-fs = { path = "crates/monty-fs", version = "1.2.0" }
+monty-macros = { path = "crates/monty-macros", version = "1.2.0" }
+monty-proto = { path = "crates/monty-proto", version = "1.2.0" }
+monty-pool = { path = "crates/monty-pool", version = "1.2.0" }
+monty-type-checking = { path = "crates/monty-type-checking", version = "1.2.0" }
+monty-typeshed = { path = "crates/monty-typeshed", version = "1.2.0" }
 # ruff, ty and related crates
 ruff_python_parser = "0.0.14"
 ruff_python_stdlib = "0.0.14"
@@ -118,6 +119,8 @@ ahash = { version = "0.8.0", features = ["serde"] }
 indexmap = "2"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
+# the `# /// monty` fixture headers (monty-fixture)
+toml = "1"
 postcard = { version = "1.1", features = ["alloc"] }
 # session dump codec: self-describing, so struct fields and enum variants evolve without a `DUMP_VERSION` bump
 minicbor-serde = { version = "0.7", default-features = false, features = ["alloc"] }

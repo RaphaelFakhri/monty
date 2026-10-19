@@ -168,7 +168,7 @@ fn call_lru_cache_factory(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> 
         }
         Value::Bool(flag) => lru_cache::allocate(None, Some(u64::from(*flag)), typed_flag, vm),
         Value::None => lru_cache::allocate(None, None, typed_flag, vm),
-        _ if maxsize.is_callable(vm.heap) => {
+        _ if maxsize.is_callable(vm) => {
             lru_cache::allocate(Some(maxsize.clone_with_heap(vm)), Some(128), typed_flag, vm)
         }
         _ => Err(lru_cache::bad_maxsize_error()),
