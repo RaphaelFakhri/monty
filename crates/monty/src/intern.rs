@@ -921,6 +921,8 @@ pub enum StaticStrings {
     Dst,
     /// Kwarg name `dst_dir_fd` — `os.rename(dst_dir_fd=...)`.
     DstDirFd,
+    /// `json.dump()` function.
+    Dump,
     /// `json.dumps()` function.
     Dumps,
     /// `__args__` of a `types.GenericAlias`.
@@ -1095,6 +1097,8 @@ pub enum StaticStrings {
     Fmod,
     /// `datetime` / `time` `fold` attribute and constructor kwarg.
     Fold,
+    /// `fp` parameter of `json.load()` / `json.dump()`.
+    Fp,
     /// `foldspaces` parameter of `base64.a85encode()` / `a85decode()`.
     #[strum(serialize = "foldspaces")]
     Foldspaces,
@@ -1426,7 +1430,9 @@ pub enum StaticStrings {
     Ljust,
     /// `lo` in the bisect module.
     Lo,
-    /// `json.loads()` function.
+    /// `json.load()` and `tomllib.load()` functions.
+    Load,
+    /// `json.loads()` and `tomllib.loads()` functions.
     Loads,
     /// `locals` parameter of eval/exec.
     Locals,
@@ -2181,6 +2187,11 @@ pub enum StaticStrings {
     TmZone,
     /// `date.today()` / `datetime.today()` classmethod.
     Today,
+    /// `tomllib.TOMLDecodeError` exception.
+    #[strum(serialize = "TOMLDecodeError")]
+    TomlDecodeError,
+    /// Module name for `import tomllib`.
+    Tomllib,
     /// Kwarg name `top` — `os.walk(top=...)`.
     Top,
     /// Kwarg name `top_down` — `Path.walk(top_down=...)`.
