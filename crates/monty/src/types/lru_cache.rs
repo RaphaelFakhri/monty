@@ -104,7 +104,7 @@ impl LruCache {
 
 /// Answers a hit natively, or transfers a miss to its frozen continuation.
 pub(crate) fn call(cache_id: HeapId, args: ArgValues, vm: &mut VM<'_>) -> RunResult<CallResult> {
-    let HeapReadOutput::LruCache(mut cache) = vm.heap.read(cache_id) else {
+    let HeapReadOutput::LruCache(cache) = vm.heap.read(cache_id) else {
         unreachable!("cache dispatch requires an LruCache")
     };
     let (func, maxsize, typed) = {
@@ -547,7 +547,7 @@ impl<C: ContainsHeap> DropWithContext<C> for CacheEntry {
 impl<'h> TableSource<'h> for HeapObjectRead<'h, LruCache> {
     type Entry = CacheEntry;
 
-    fn table<'r>(&self, vm: &'r VM<'h>) -> &'r PyHashTable<CacheEntry> {
+    fn table<'r>(&'r self, vm: &'r VM<'h>) -> &'r PyHashTable<CacheEntry> {
         &self.get(vm.heap).cache
     }
 }
