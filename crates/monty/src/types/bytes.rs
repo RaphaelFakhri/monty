@@ -1866,7 +1866,8 @@ fn bytes_center<'h>(bytes: &impl HeapView<'h, [u8]>, args: ArgValues, vm: &mut V
     } else {
         check_repeat_size(width, 1, &vm.heap.tracker)?;
         let total_pad = width - len;
-        let left_pad = total_pad / 2;
+        // CPython puts the odd fill unit on the left only when `width` is also odd.
+        let left_pad = total_pad / 2 + (total_pad & width & 1);
         let right_pad = total_pad - left_pad;
         let mut result = Vec::with_capacity(width);
         for _ in 0..left_pad {
